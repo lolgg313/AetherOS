@@ -215,8 +215,8 @@ IMAGE_FILE_MACHINE_ARM64 = 0xAA64
 
 # Directory entry indices
 DIR_EXPORT, DIR_IMPORT, DIR_RESOURCE, DIR_EXCEPTION, DIR_SECURITY, \
-DIR_BASERELOC, DIR_DEBUG, DIR_TLS, DIR_LOAD_CONFIG, DIR_BOUND_IMPORT, \
-DIR_IAT, DIR_DELAY_IMPORT, DIR_COM_DESCRIPTOR = range(13)
+DIR_BASERELOC, DIR_DEBUG, DIR_ARCHITECTURE, DIR_GLOBALPTR, DIR_TLS, DIR_LOAD_CONFIG, \
+DIR_BOUND_IMPORT, DIR_IAT, DIR_DELAY_IMPORT, DIR_COM_DESCRIPTOR = range(15)
 
 # Section characteristics
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
@@ -19896,6 +19896,15 @@ def _k32_install(k):
     def _wsaenumprot(c, protos, buf, plen):
         return 0                                    # no layered providers to report
 
+
+    # internals shared with the ntdll layer
+    k.create_file, k.write_handle, k.readfile, k.resolve = create_file, write_handle, _readfile, resolve
+    k.full_path, k.attrs_of, k.times_of, k.hstat = full_path, attrs_of, times_of, _hstat
+    k.dir_info, k.gfibhx, k.sfibh, k.closehandle = _dir_info, _gfibhx, _sfibh, _closehandle
+    k.valloc, k.vfree, k.vprot, k.vquery = _valloc, _vfree, _vprot, _vquery
+    k.setevent, k.mkdir, k.delete, k.rmdir = _setevent, _mkdir, _delete, _rmdir
+    k.get_thread_ctx, k.set_thread_ctx, k.stdin_read = _gtc2, _stc2, stdin_read
+
     if k.live:
         _kuser_install()
 
@@ -22749,6 +22758,1113 @@ def _oa_install(k):
 
 
 # ==============================================================================
+# 10h. ntdll native API (Nt*/Rtl*/Ldr*), WaitOnAddress, userenv, netapi32
+# ==============================================================================
+
+STATUS_SUCCESS, STATUS_TIMEOUT, STATUS_PENDING = 0, 0x102, 0x103
+STATUS_BUFFER_OVERFLOW, STATUS_NO_MORE_FILES = 0x80000005, 0x80000006
+STATUS_NOT_IMPLEMENTED, STATUS_INVALID_INFO_CLASS = 0xC0000002, 0xC0000003
+STATUS_INFO_LENGTH_MISMATCH, STATUS_INVALID_HANDLE = 0xC0000004, 0xC0000008
+STATUS_INVALID_PARAMETER, STATUS_NO_SUCH_FILE, STATUS_END_OF_FILE = 0xC000000D, 0xC000000F, 0xC0000011
+STATUS_NO_MEMORY, STATUS_ACCESS_DENIED, STATUS_BUFFER_TOO_SMALL = 0xC0000017, 0xC0000022, 0xC0000023
+STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_NAME_COLLISION = 0xC0000034, 0xC0000035
+STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SHARING_VIOLATION = 0xC000003A, 0xC0000043
+STATUS_NOT_SUPPORTED, STATUS_FILE_IS_A_DIRECTORY = 0xC00000BB, 0xC00000BA
+STATUS_DIRECTORY_NOT_EMPTY, STATUS_NOT_A_DIRECTORY = 0xC0000101, 0xC0000103
+STATUS_CANNOT_DELETE, STATUS_PIPE_BROKEN = 0xC0000121, 0xC000014B
+STATUS_INVALID_DEVICE_REQUEST = 0xC0000010
+_W32_TO_NT = {0: 0, 2: STATUS_OBJECT_NAME_NOT_FOUND, 3: STATUS_OBJECT_PATH_NOT_FOUND,
+              5: STATUS_ACCESS_DENIED, 6: STATUS_INVALID_HANDLE, 8: STATUS_NO_MEMORY,
+              18: STATUS_NO_MORE_FILES, 32: STATUS_SHARING_VIOLATION, 38: STATUS_END_OF_FILE,
+              80: STATUS_OBJECT_NAME_COLLISION, 87: STATUS_INVALID_PARAMETER,
+              109: STATUS_PIPE_BROKEN, 122: STATUS_BUFFER_TOO_SMALL,
+              145: STATUS_DIRECTORY_NOT_EMPTY, 183: STATUS_OBJECT_NAME_COLLISION,
+              267: STATUS_NOT_A_DIRECTORY, 234: STATUS_BUFFER_OVERFLOW, 50: STATUS_NOT_SUPPORTED}
+_NT_TO_W32 = {v: k_ for k_, v in _W32_TO_NT.items()}
+_NT_TO_W32.update({STATUS_OBJECT_NAME_NOT_FOUND: 2, STATUS_NO_SUCH_FILE: 2,
+                   STATUS_FILE_IS_A_DIRECTORY: 5, STATUS_CANNOT_DELETE: 5,
+                   STATUS_OBJECT_NAME_COLLISION: 183, STATUS_TIMEOUT: 1460,
+                   STATUS_NOT_IMPLEMENTED: 120, STATUS_INVALID_INFO_CLASS: 87,
+                   STATUS_INFO_LENGTH_MISMATCH: 24, STATUS_INVALID_DEVICE_REQUEST: 1,
+                   0xC0000024: 6, 0xC0000005: 998, 0xC000009A: 1450})
+
+
+def _nt_install(k):
+    R = k.reg
+    p = k.p
+    M_ = p.mem
+    NT = ("ntdll.dll",)
+    ps = k.ptr_size
+
+    def st_from_err():
+        return _W32_TO_NT.get(p.last_error, 0xC0000001)
+
+    def iosb_set(iosb, status, info):
+        if iosb:
+            k.wptr(iosb, status)
+            k.wptr(iosb + ps(), info)
+
+    def rptr(a):
+        return M_.read64(a) if ps() == 8 else M_.read32(a)
+
+    def ustr(u):
+        """UNICODE_STRING* -> str."""
+        if not u:
+            return ""
+        n = M_.read16(u)
+        buf = rptr(u + (8 if ps() == 8 else 4))
+        return M_.read(buf, n).decode("utf-16-le", "replace") if buf and n else ""
+
+    def objattr_path(oa):
+        root = rptr(oa + (8 if ps() == 8 else 4))
+        name = ustr(rptr(oa + (16 if ps() == 8 else 8)))
+        for pre in ("\\??\\", "\\\\?\\", "\\DosDevices\\", "\\GLOBAL??\\"):
+            if name.startswith(pre):
+                name = name[len(pre):]
+                break
+        if root:
+            meta = k.file_meta.get(root)
+            base = meta["path"] if meta else ""
+            if base:
+                name = base.rstrip("\\") + ("\\" + name if name else "")
+        return name
+
+    def nt_ret(status):
+        return status & 0xFFFFFFFF
+
+    @R("RtlNtStatusToDosError RtlNtStatusToDosErrorNoTeb", "u", dlls=NT)
+    def _rnstde(c, st):
+        if st == 0:
+            return 0
+        return _NT_TO_W32.get(st, 317 if st >> 30 == 3 else 0)
+
+    @R("RtlGetLastNtStatus", "", dlls=NT)
+    def _rglns(c):
+        return getattr(p.current_thread, "last_status", 0)
+
+    @R("RtlSetLastWin32ErrorAndNtStatusFromNtStatus", "u", "v", dlls=NT)
+    def _rslwe(c, st):
+        p.current_thread.last_status = st
+        p.last_error = _NT_TO_W32.get(st, 317 if st >> 30 == 3 else 0)
+
+    # -- strings ------------------------------------------------------------------------
+    def init_str(dst, src, wide):
+        if not src:
+            M_.write(dst, bytes(8 if ps() == 4 else 16))
+            return
+        n = len(M_.read_wstring(src, 1 << 15)) if wide else len(M_.read_cstring(src, 1 << 16))
+        unit = 2 if wide else 1
+        M_.write16(dst, n)
+        M_.write16(dst + 2, n + unit)
+        k.wptr(dst + (8 if ps() == 8 else 4), src)
+
+    @R("RtlInitUnicodeString RtlInitUnicodeStringEx", "pp", dlls=NT)
+    def _rius(c, dst, src):
+        init_str(dst, src, True)
+        return 0
+
+    @R("RtlInitAnsiString RtlInitString RtlInitAnsiStringEx", "pp", dlls=NT)
+    def _rias(c, dst, src):
+        init_str(dst, src, False)
+        return 0
+
+    def alloc_str(text, wide, dst):
+        data = text.encode("utf-16-le") if wide else text.encode("utf-8", "replace")
+        term = b"\0\0" if wide else b"\0"
+        a = p.heap_alloc(p.process_heap_handle, len(data) + len(term))
+        M_.write(a, data + term)
+        M_.write16(dst, len(data))
+        M_.write16(dst + 2, len(data) + len(term))
+        k.wptr(dst + (8 if ps() == 8 else 4), a)
+
+    @R("RtlFreeUnicodeString RtlFreeAnsiString", "p", "v", dlls=NT)
+    def _rfus(c, s_):
+        a = rptr(s_ + (8 if ps() == 8 else 4))
+        if a:
+            p.heap_free(p.process_heap_handle, a)
+
+    @R("RtlUnicodeStringToAnsiString", "ppi", dlls=NT)
+    def _rusas(c, dst, src, alloc):
+        text = ustr(src)
+        if alloc:
+            alloc_str(text, False, dst)
+        else:
+            data = text.encode("utf-8", "replace")
+            cap = M_.read16(dst + 2)
+            if len(data) + 1 > cap:
+                return STATUS_BUFFER_OVERFLOW
+            M_.write(rptr(dst + (8 if ps() == 8 else 4)), data + b"\0")
+            M_.write16(dst, len(data))
+        return 0
+
+    @R("RtlAnsiStringToUnicodeString", "ppi", dlls=NT)
+    def _rasus(c, dst, src, alloc):
+        n = M_.read16(src)
+        buf = rptr(src + (8 if ps() == 8 else 4))
+        text = M_.read(buf, n).decode("utf-8", "replace") if n else ""
+        if alloc:
+            alloc_str(text, True, dst)
+        else:
+            data = text.encode("utf-16-le")
+            if len(data) + 2 > M_.read16(dst + 2):
+                return STATUS_BUFFER_OVERFLOW
+            M_.write(rptr(dst + (8 if ps() == 8 else 4)), data + b"\0\0")
+            M_.write16(dst, len(data))
+        return 0
+
+    @R("RtlDosPathNameToNtPathName_U", "pppp", dlls=NT)
+    def _rdpnt(c, dos, nt, part, rel):
+        path = "\\??\\" + k.full_path(k.ws_(dos))
+        alloc_str(path, True, nt)
+        if part:
+            k.wptr(part, 0)
+        return 1
+
+    @R("RtlDosPathNameToNtPathName_U_WithStatus", "pppp", dlls=NT)
+    def _rdpntws(c, dos, nt, part, rel):
+        _rdpnt(c, dos, nt, part, rel)
+        return 0
+
+    @R("RtlGetFullPathName_U", "pupp", dlls=NT)
+    def _rgfpn(c, name, n, buf, part):
+        full = k.full_path(k.ws_(name))
+        data = full.encode("utf-16-le")
+        if n < len(data) + 2:
+            return len(data) + 2
+        M_.write(buf, data + b"\0\0")
+        if part:
+            idx = full.rfind("\\") + 1
+            k.wptr(part, buf + 2 * idx if idx < len(full) else 0)
+        return len(data)
+
+    # -- files ------------------------------------------------------------------------------
+    _DISP = {0: 2, 1: 3, 2: 1, 3: 4, 4: 5, 5: 2}      # NT create disposition -> Win32
+    _INFO = {0: 0, 1: 1, 2: 2, 3: 1, 4: 3, 5: 3}      # FILE_SUPERSEDED/OPENED/CREATED/OVERWRITTEN
+
+    def nt_create(c, ph, access, oa, iosb, attrs, share, disp, opts):
+        path = objattr_path(oa)
+        if not path:
+            iosb_set(iosb, STATUS_OBJECT_NAME_NOT_FOUND, 0)
+            return STATUS_OBJECT_NAME_NOT_FOUND
+        host = k.resolve(path, True)
+        if host is None:
+            return st_from_err()
+        isdir = os.path.isdir(host)
+        exists = os.path.exists(host)
+        if opts & 0x1:                                  # FILE_DIRECTORY_FILE
+            if exists and not isdir:
+                iosb_set(iosb, STATUS_NOT_A_DIRECTORY, 0)
+                return STATUS_NOT_A_DIRECTORY
+            if not exists:
+                if disp in (2, 3):
+                    if not k.mkdir(path):
+                        return st_from_err()
+                    exists = isdir = True
+                else:
+                    return STATUS_OBJECT_NAME_NOT_FOUND if os.path.isdir(os.path.dirname(host)) \
+                        else STATUS_OBJECT_PATH_NOT_FOUND
+        elif opts & 0x40 and isdir:                     # FILE_NON_DIRECTORY_FILE
+            iosb_set(iosb, STATUS_FILE_IS_A_DIRECTORY, 0)
+            return STATUS_FILE_IS_A_DIRECTORY
+        flags = 0x02000000 if isdir or opts & 0x4000 else 0
+        if opts & 0x1000:
+            flags |= 0x04000000                         # FILE_DELETE_ON_CLOSE
+        h = k.create_file(c, path, access, share, _DISP.get(disp, 3), flags)
+        if h in (M64, 0xFFFFFFFF):
+            st = st_from_err()
+            iosb_set(iosb, st, 0)
+            return st
+        k.wptr(ph, h)
+        info = 1 if exists and disp in (1, 3) else _INFO.get(disp, 1)
+        if not exists:
+            info = 2
+        iosb_set(iosb, 0, info)
+        return 0
+
+    @R("NtCreateFile ZwCreateFile", "puppppuuuupu", dlls=NT)
+    def _ntcf(c, ph, access, oa, iosb, alloc, attrs, share, disp, opts, ea, ealen):
+        return nt_create(c, ph, access, oa, iosb, attrs, share, disp, opts)
+
+    @R("NtOpenFile ZwOpenFile", "puppuu", dlls=NT)
+    def _ntof(c, ph, access, oa, iosb, share, opts):
+        return nt_create(c, ph, access, oa, iosb, 0, share, 1, opts)
+
+    @R("NtClose ZwClose", "p", dlls=NT)
+    def _ntclose(c, h):
+        return 0 if k.closehandle(c, h) else STATUS_INVALID_HANDLE
+
+    def scratch():
+        t = p.current_thread
+        a = getattr(t, "nt_scratch", 0)
+        if not a:
+            a = t.nt_scratch = p.heap_alloc(p.process_heap_handle, 64)
+        return a
+
+    def ov_from_offset(poff):
+        """NT byte offset -> a temporary OVERLAPPED (or 0 for 'current')."""
+        if not poff:
+            return 0
+        off = M_.read64(poff)
+        if off in (0xFFFFFFFFFFFFFFFE, 0xFFFFFFFFFFFFFFFF):
+            return 0
+        ov = scratch() + 16
+        M_.write(ov, bytes(32))
+        o = 16 if ps() == 8 else 8
+        M_.write32(ov + o, off & 0xFFFFFFFF)
+        M_.write32(ov + o + 4, off >> 32)
+        return ov
+
+    @R("NtWriteFile ZwWriteFile", "ppppppupp", dlls=NT)
+    def _ntwf(c, h, ev, apc, ctx, iosb, buf, n, poff, key):
+        data = M_.read(buf, n) if n else b""
+        r = k.write_handle(c, h, data, ov_from_offset(poff))
+        if r is None:
+            st = st_from_err()
+            iosb_set(iosb, st, 0)
+            return st
+        iosb_set(iosb, 0, r)
+        if ev:
+            k.setevent(c, ev)
+        return 0
+
+    @R("NtReadFile ZwReadFile", "ppppppupp", dlls=NT)
+    def _ntrf(c, h, ev, apc, ctx, iosb, buf, n, poff, key):
+        cnt = scratch()
+        ok = k.readfile(c, h, buf, n, cnt, ov_from_offset(poff))
+        got = M_.read32(cnt)
+        if not ok:
+            st = STATUS_END_OF_FILE if p.last_error == 38 else st_from_err()
+            iosb_set(iosb, st, 0)
+            return st
+        if n and got == 0 and p.handles.kind(h) == "file":
+            iosb_set(iosb, STATUS_END_OF_FILE, 0)
+            return STATUS_END_OF_FILE
+        iosb_set(iosb, 0, got)
+        if ev:
+            k.setevent(c, ev)
+        return 0
+
+    @R("NtFlushBuffersFile ZwFlushBuffersFile", "pp", dlls=NT)
+    def _ntfbf(c, h, iosb):
+        iosb_set(iosb, 0, 0)
+        return 0
+
+    _FILE_CLASS_MAP = {4: 0, 5: 1, 35: 9}           # NT class -> GetFileInformationByHandleEx
+
+    @R("NtQueryInformationFile ZwQueryInformationFile", "ppuu", dlls=NT)
+    def _ntqif(c, h, iosb, buf, n, cls):
+        kind = p.handles.kind(h)
+        if kind is None and h not in (HandleTable.STDIN_HANDLE, HandleTable.STDOUT_HANDLE,
+                                      HandleTable.STDERR_HANDLE):
+            return STATUS_INVALID_HANDLE
+        if cls == 14:                                   # FilePositionInformation
+            f = p.handles.get(h, "file")
+            pos = f.tell() if f is not None else 0
+            M_.write64(buf, pos)
+            iosb_set(iosb, 0, 8)
+            return 0
+        if cls == 16:                                   # FileModeInformation
+            M_.write32(buf, 0x20)
+            iosb_set(iosb, 0, 4)
+            return 0
+        if cls in (7, 8, 17):                           # Ea / Access / Alignment
+            M_.write32(buf, {7: 0, 8: 0x1F01FF, 17: 0}[cls])
+            iosb_set(iosb, 0, 4)
+            return 0
+        if cls == 6:                                    # FileInternalInformation
+            st, host = k.hstat(h)
+            if st is None:
+                return STATUS_INVALID_HANDLE
+            M_.write64(buf, st.st_ino & M64)
+            iosb_set(iosb, 0, 8)
+            return 0
+        if cls == 9:                                    # FileNameInformation
+            meta = k.file_meta.get(h, {})
+            name = meta.get("path", "")[2:].encode("utf-16-le")
+            data = struct.pack("<I", len(name)) + name
+            M_.write(buf, data[:n])
+            iosb_set(iosb, 0 if n >= len(data) else STATUS_BUFFER_OVERFLOW, min(n, len(data)))
+            return 0 if n >= len(data) else STATUS_BUFFER_OVERFLOW
+        if cls == 18:                                   # FileAllInformation
+            tmp = scratch()
+            st, host = k.hstat(h)
+            if st is None:
+                return STATUS_INVALID_HANDLE
+            ct, at, mt = k.times_of(st)
+            isdir = os.path.isdir(host)
+            size = 0 if isdir else st.st_size
+            data = struct.pack("<qqqqI4x", ct, at, mt, mt, k.attrs_of(host, st) or 0x80)
+            data += struct.pack("<qqIBB2x", (size + 4095) & ~4095, size, st.st_nlink, 0,
+                                1 if isdir else 0)
+            data += struct.pack("<qIIqII", st.st_ino & 0x7FFFFFFFFFFFFFFF, 0, 0x1F01FF, 0, 0x20, 0)
+            name = k.file_meta.get(h, {}).get("path", "")[2:].encode("utf-16-le")
+            data += struct.pack("<I", len(name)) + name
+            M_.write(buf, data[:n])
+            iosb_set(iosb, 0, min(n, len(data)))
+            return 0 if n >= len(data) else STATUS_BUFFER_OVERFLOW
+        wc = _FILE_CLASS_MAP.get(cls)
+        if wc is None:
+            return STATUS_INVALID_INFO_CLASS
+        if not k.gfibhx(c, h, wc, buf, n):
+            return st_from_err()
+        iosb_set(iosb, 0, {0: 40, 1: 24, 9: 8}[wc])
+        return 0
+
+    @R("NtSetInformationFile ZwSetInformationFile", "ppuu", dlls=NT)
+    def _ntsif(c, h, iosb, buf, n, cls):
+        if cls == 13:                                   # FileDispositionInformation
+            ok = k.sfibh(c, h, 4, buf, n)
+        elif cls == 64:                                 # FileDispositionInformationEx
+            flags = M_.read32(buf)
+            tmp = scratch()
+            M_.write8(tmp, 1 if flags & 1 else 0)
+            meta = k.file_meta.get(h)
+            if meta is not None and flags & 1 and flags & 2:
+                # POSIX semantics: the name goes away now
+                host = meta["host"]
+                try:
+                    if os.path.isdir(host):
+                        os.rmdir(host)
+                    else:
+                        os.unlink(host)
+                    meta["doc"] = False
+                    iosb_set(iosb, 0, 0)
+                    return 0
+                except OSError as e:
+                    import errno as _e
+                    return STATUS_DIRECTORY_NOT_EMPTY if e.errno in (_e.ENOTEMPTY, _e.EEXIST) \
+                        else STATUS_CANNOT_DELETE
+            ok = k.sfibh(c, h, 4, tmp, 1)
+        elif cls == 14:                                 # FilePositionInformation
+            f = p.handles.get(h, "file")
+            if f is None:
+                return STATUS_INVALID_HANDLE
+            f.seek(M_.read64(buf))
+            ok = True
+        elif cls == 20:                                 # FileEndOfFileInformation
+            ok = k.sfibh(c, h, 6, buf, n)
+        elif cls == 4:                                  # FileBasicInformation
+            ok = k.sfibh(c, h, 0, buf, n)
+        elif cls in (10, 65):                           # FileRenameInformation(Ex)
+            ok = k.sfibh(c, h, 3, buf, n)
+        else:
+            return STATUS_INVALID_INFO_CLASS
+        if not ok:
+            return st_from_err()
+        iosb_set(iosb, 0, 0)
+        return 0
+
+    _DIR_CLASS = {1: 14, 2: 14, 3: 10, 37: 10, 38: 14, 12: 14, 60: 19, 63: 10}
+
+    @R("NtQueryDirectoryFile ZwQueryDirectoryFile", "ppppppuuupu", dlls=NT)
+    def _ntqdf(c, h, ev, apc, ctx, iosb, buf, n, cls, single, mask, restart):
+        wc = _DIR_CLASS.get(cls)
+        if wc is None:
+            return STATUS_INVALID_INFO_CLASS
+        d = p.handles.get(h, "dir")
+        if d is None:
+            return STATUS_INVALID_HANDLE
+        if restart & 0xFF and hasattr(d, "enum"):
+            del d.enum
+        ok = k.dir_info(h, wc, buf, n)
+        if not ok:
+            st = STATUS_NO_MORE_FILES if p.last_error == 18 else (
+                STATUS_BUFFER_OVERFLOW if p.last_error == 234 else st_from_err())
+            iosb_set(iosb, st, 0)
+            return st
+        iosb_set(iosb, 0, n)
+        return 0
+
+    @R("NtQueryVolumeInformationFile ZwQueryVolumeInformationFile", "ppuu", dlls=NT)
+    def _ntqvif(c, h, iosb, buf, n, cls):
+        if cls == 1:                                    # FileFsVolumeInformation
+            label = "NOO".encode("utf-16-le")
+            data = struct.pack("<qII", 0, 0x4E4F4F21, len(label)) + b"\0\0\0\0" + label
+        elif cls in (3, 7):                             # FileFsSize / FullSize
+            try:
+                sv = os.statvfs(p.vfs.root)
+                total, free = sv.f_blocks * sv.f_frsize // 4096, sv.f_bavail * sv.f_frsize // 4096
+            except Exception:
+                total, free = 1 << 24, 1 << 23
+            data = struct.pack("<qqII", total, free, 8, 512) if cls == 3 else \
+                struct.pack("<qqqII", total, free, free, 8, 512)
+        elif cls == 4:                                  # FileFsDeviceInformation
+            kind = p.handles.kind(h)
+            dev = 0x50 if kind in ("conin", "conout") or h in (
+                HandleTable.STDIN_HANDLE, HandleTable.STDOUT_HANDLE, HandleTable.STDERR_HANDLE) \
+                else (0x11 if kind in ("pipe_r", "pipe_w") else 7)
+            data = struct.pack("<II", dev, 0)
+        elif cls == 5:                                  # FileFsAttributeInformation
+            name = "NTFS".encode("utf-16-le")
+            data = struct.pack("<IiI", 0x03E700FF, 255, len(name)) + name
+        else:
+            return STATUS_INVALID_INFO_CLASS
+        M_.write(buf, data[:n])
+        iosb_set(iosb, 0, min(n, len(data)))
+        return 0 if n >= len(data) else STATUS_BUFFER_OVERFLOW
+
+    @R("NtDeviceIoControlFile ZwDeviceIoControlFile NtFsControlFile ZwFsControlFile",
+       "pppppupupu", dlls=NT)
+    def _ntdicf(c, h, ev, apc, ctx, iosb, code, inb, inn, outb, outn):
+        iosb_set(iosb, STATUS_INVALID_DEVICE_REQUEST, 0)
+        return STATUS_INVALID_DEVICE_REQUEST
+
+    @R("NtQueryObject ZwQueryObject", "pupup", dlls=NT)
+    def _ntqo(c, h, cls, buf, n, pret):
+        kind = p.handles.kind(h)
+        if cls == 2:                                    # ObjectTypeInformation
+            tname = {"file": "File", "dir": "File", "kevent": "Event", "kmutex": "Mutant",
+                     "ksem": "Semaphore", "thread": "Thread", "process": "Process",
+                     "ktimer": "Timer", "kport": "IoCompletion", "regkey": "Key",
+                     "token": "Token"}.get(kind, "File")
+            nm = tname.encode("utf-16-le")
+            hdr = 0x68 if ps() == 8 else 0x60
+            data = bytearray(hdr) + nm + b"\0\0"
+            struct.pack_into("<HH", data, 0, len(nm), len(nm) + 2)
+            ptr_off = 8 if ps() == 8 else 4
+            if pret:
+                M_.write32(pret, len(data))
+            if n < len(data):
+                return STATUS_INFO_LENGTH_MISMATCH
+            struct.pack_into("<Q" if ps() == 8 else "<I", data, ptr_off, buf + hdr)
+            M_.write(buf, bytes(data))
+            return 0
+        if cls == 1:                                    # ObjectNameInformation
+            meta = k.file_meta.get(h)
+            name = ("\\Device\\HarddiskVolume1" + meta["path"][2:]) if meta else ""
+            nm = name.encode("utf-16-le")
+            hdr = 16 if ps() == 8 else 8
+            data = bytearray(hdr) + nm + b"\0\0"
+            struct.pack_into("<HH", data, 0, len(nm), len(nm) + 2)
+            struct.pack_into("<Q" if ps() == 8 else "<I", data, 8 if ps() == 8 else 4,
+                             buf + hdr if nm else 0)
+            if pret:
+                M_.write32(pret, len(data))
+            if n < len(data):
+                return STATUS_INFO_LENGTH_MISMATCH
+            M_.write(buf, bytes(data))
+            return 0
+        if cls == 0:                                    # ObjectBasicInformation
+            data = bytes(56)
+            if pret:
+                M_.write32(pret, 56)
+            if n < 56:
+                return STATUS_INFO_LENGTH_MISMATCH
+            M_.write(buf, data)
+            return 0
+        return STATUS_INVALID_INFO_CLASS
+
+    @R("NtDuplicateObject ZwDuplicateObject", "ppppuuu", dlls=NT)
+    def _ntdo(c, sp, h, tp, out, acc, attrs, opts):
+        fn = p.api.lookup("kernel32.dll", "DuplicateHandle")
+        tmp = scratch()
+        # DuplicateHandle(sp, h, tp, out, acc, inherit, opts) through the kernel32 handler
+        if p.handles.kind(h) is None and h not in (0xFFFFFFFE, M64 - 1, 0xFFFFFFFF, M64):
+            return STATUS_INVALID_HANDLE
+        kind = p.handles.kind(h)
+        nh = p.handles.add(p.handles.get(h), kind) if kind else h
+        if out:
+            k.wptr(out, nh)
+        if opts & 1:
+            p.handles.close(h)
+        return 0
+
+    # -- virtual memory ----------------------------------------------------------------------
+    @R("NtAllocateVirtualMemory ZwAllocateVirtualMemory", "ppppuu", dlls=NT)
+    def _ntavm(c, proc, pbase, zbits, psize, typ, prot):
+        base = rptr(pbase)
+        size = rptr(psize)
+        a = k.valloc(c, base, size, typ, prot)
+        if not a:
+            return STATUS_NO_MEMORY if p.last_error == 8 else 0xC0000018   # CONFLICTING_ADDRESSES
+        k.wptr(pbase, a)
+        k.wptr(psize, (size + (base & 0xFFF) + 0xFFF) & ~0xFFF)
+        return 0
+
+    @R("NtFreeVirtualMemory ZwFreeVirtualMemory", "pppu", dlls=NT)
+    def _ntfvm(c, proc, pbase, psize, typ):
+        ok = k.vfree(c, rptr(pbase), rptr(psize), typ)
+        return 0 if ok else 0xC000009F                  # STATUS_FREE_VM_NOT_AT_BASE
+
+    @R("NtProtectVirtualMemory ZwProtectVirtualMemory", "ppppp", dlls=NT)
+    def _ntpvm(c, proc, pbase, psize, prot, pold):
+        ok = k.vprot(c, rptr(pbase), rptr(psize), prot, pold)
+        return 0 if ok else 0xC0000045                  # STATUS_INVALID_PAGE_PROTECTION
+
+    @R("NtQueryVirtualMemory ZwQueryVirtualMemory", "ppupzp", dlls=NT)
+    def _ntqvm(c, proc, base, cls, buf, n, pret):
+        if cls != 0:
+            return STATUS_INVALID_INFO_CLASS
+        r = k.vquery(c, base, buf, n)
+        if not r:
+            return STATUS_INVALID_PARAMETER
+        if pret:
+            k.wptr(pret, r)
+        return 0
+
+    # -- synchronization ------------------------------------------------------------------
+    def timeout_ms(pt):
+        if not pt:
+            return INFINITE
+        v = _s64(M_.read64(pt))
+        if v < 0:
+            return max(0, (-v) // 10000)
+        return max(0, int((_unix_from_ft(v) - time.time()) * 1000))
+
+    @R("NtCreateEvent ZwCreateEvent", "pupui", dlls=NT)
+    def _ntce(c, ph, acc, oa, typ, init):
+        h = p.handles.add(_KEvent(typ == 0, init), "kevent")
+        k.wptr(ph, h)
+        return 0
+
+    @R("NtSetEvent ZwSetEvent", "pp", dlls=NT)
+    def _ntse(c, h, prev):
+        ev = p.handles.get(h, "kevent")
+        if ev is None:
+            return STATUS_INVALID_HANDLE
+        if prev:
+            M_.write32(prev, 1 if ev.signaled else 0)
+        ev.signaled = True
+        return 0
+
+    @R("NtResetEvent ZwResetEvent NtClearEvent ZwClearEvent", "pp", dlls=NT)
+    def _ntre(c, h, prev):
+        ev = p.handles.get(h, "kevent")
+        if ev is None:
+            return STATUS_INVALID_HANDLE
+        ev.signaled = False
+        return 0
+
+    @R("NtWaitForSingleObject ZwWaitForSingleObject", "pip", dlls=NT)
+    def _ntwfso(c, h, alert, pt):
+        return k.wait(c, [h], False, timeout_ms(pt))
+
+    @R("NtWaitForMultipleObjects ZwWaitForMultipleObjects", "upuip", dlls=NT)
+    def _ntwfmo(c, n, harr, typ, alert, pt):
+        hs = [rptr(harr + ps() * i) for i in range(min(n, 64))]
+        return k.wait(c, hs, typ == 0, timeout_ms(pt))
+
+    @R("NtDelayExecution ZwDelayExecution", "ip", dlls=NT)
+    def _ntde(c, alert, pt):
+        ms = timeout_ms(pt)
+        if ms == 0:
+            raise NOOYield()
+        k.block(c, ("sleep", time.monotonic() + ms / 1000.0), rax=0)
+
+    @R("NtYieldExecution ZwYieldExecution", "", dlls=NT)
+    def _ntye(c):
+        c.regs[RAX] = 0
+        raise NOOYield()
+
+    # keyed events (rendezvous between a waiter and a releaser on a key)
+    k.keyed = {}                                        # key -> {"waiters": [tid], "rel": n}
+
+    def keyed_wait_hook(t):
+        _kd, key, role, deadline = t.waiting_on
+        ent = k.keyed.setdefault(key, {"waiters": [], "released": set(), "releasers": 0})
+        if role == "wait":
+            if t.tid in ent["released"]:
+                ent["released"].discard(t.tid)
+                t.cpu.regs[RAX] = 0
+                return True
+        else:
+            if t.tid in ent.get("done_rel", set()):
+                ent["done_rel"].discard(t.tid)
+                t.cpu.regs[RAX] = 0
+                return True
+            if ent["waiters"]:
+                w = ent["waiters"].pop(0)
+                ent["released"].add(w)
+                t.cpu.regs[RAX] = 0
+                return True
+        if deadline is not None and time.monotonic() >= deadline:
+            if role == "wait" and t.tid in ent["waiters"]:
+                ent["waiters"].remove(t.tid)
+            t.cpu.regs[RAX] = STATUS_TIMEOUT
+            return True
+        return False
+
+    k.wait_hooks["keyed"] = keyed_wait_hook
+
+    @R("NtCreateKeyedEvent ZwCreateKeyedEvent", "pupu", dlls=NT)
+    def _ntcke(c, ph, acc, oa, flags):
+        k.wptr(ph, p.handles.add({}, "keyedevent"))
+        return 0
+
+    @R("NtOpenKeyedEvent ZwOpenKeyedEvent", "pup", dlls=NT)
+    def _ntoke(c, ph, acc, oa):
+        k.wptr(ph, p.handles.add({}, "keyedevent"))
+        return 0
+
+    def keyed(c, key, role, pt):
+        ms = timeout_ms(pt)
+        t = p.current_thread
+        ent = k.keyed.setdefault(key, {"waiters": [], "released": set(), "releasers": 0})
+        if role == "release" and ent["waiters"]:
+            w = ent["waiters"].pop(0)
+            ent["released"].add(w)
+            return 0
+        if role == "wait":
+            ent["waiters"].append(t.tid)
+        if ms == 0:
+            if role == "wait":
+                ent["waiters"].remove(t.tid)
+            return STATUS_TIMEOUT
+        deadline = None if ms == INFINITE else time.monotonic() + ms / 1000.0
+        t.state = "blocked"
+        t.waiting_on = ("keyed", key, role, deadline)
+        c.regs[RAX] = 0
+        raise NOOYield()
+
+    @R("NtWaitForKeyedEvent ZwWaitForKeyedEvent", "ppip", dlls=NT)
+    def _ntwfke(c, h, key, alert, pt):
+        return keyed(c, key, "wait", pt)
+
+    @R("NtReleaseKeyedEvent ZwReleaseKeyedEvent", "ppip", dlls=NT)
+    def _ntrke(c, h, key, alert, pt):
+        return keyed(c, key, "release", pt)
+
+    # WaitOnAddress / WakeByAddress (Rust std, C++20 atomic wait, SRW internals)
+    k.addr_waiters = {}                                 # addr -> [tid, ...]
+
+    def addr_hook(t):
+        _kd, addr, cmp_bytes, deadline = t.waiting_on
+        woken = getattr(t, "addr_woken", False)
+        if not woken:
+            try:
+                if M_.read(addr, len(cmp_bytes)) != cmp_bytes:
+                    woken = True
+            except NOOCPUFault:
+                woken = True
+        if woken:
+            t.addr_woken = False
+            lst = k.addr_waiters.get(addr)
+            if lst and t.tid in lst:
+                lst.remove(t.tid)
+            t.cpu.regs[RAX] = t.addr_ret_ok
+            return True
+        if deadline is not None and time.monotonic() >= deadline:
+            lst = k.addr_waiters.get(addr)
+            if lst and t.tid in lst:
+                lst.remove(t.tid)
+            t.cpu.regs[RAX] = t.addr_ret_timeout
+            t.last_error_pending = 1460
+            prev = p.current_thread
+            p.current_thread = t
+            p.last_error = 1460                         # ERROR_TIMEOUT
+            p.current_thread = prev
+            return True
+        return False
+
+    k.wait_hooks["addrwait"] = addr_hook
+
+    def wait_on_address(c, addr, cmp, size, ms, nt_style):
+        cmp_bytes = M_.read(cmp, size)
+        if M_.read(addr, size) != cmp_bytes:
+            return 0 if nt_style else 1
+        if ms == 0:
+            if nt_style:
+                return STATUS_TIMEOUT
+            return k.err(1460)
+        t = p.current_thread
+        k.addr_waiters.setdefault(addr, []).append(t.tid)
+        t.addr_woken = False
+        t.addr_ret_ok = 0 if nt_style else 1
+        t.addr_ret_timeout = STATUS_TIMEOUT if nt_style else 0
+        deadline = None if ms == INFINITE else time.monotonic() + ms / 1000.0
+        t.state = "blocked"
+        t.waiting_on = ("addrwait", addr, cmp_bytes, deadline)
+        raise NOOYield()
+
+    def wake_addr(addr, all_):
+        lst = k.addr_waiters.get(addr)
+        if not lst:
+            return
+        tids = list(lst) if all_ else lst[:1]
+        for t in p.threads:
+            if t.tid in tids:
+                t.addr_woken = True
+        for tid in tids:
+            lst.remove(tid)
+
+    SYN = _K32_DLLS + ("api-ms-win-core-synch-l1-2-0.dll",)
+
+    @R("WaitOnAddress", "ppzu", dlls=SYN)
+    def _woa(c, addr, cmp, size, ms):
+        return wait_on_address(c, addr, cmp, size, ms, False)
+
+    @R("WakeByAddressSingle", "p", "v", dlls=SYN)
+    def _wbas(c, addr):
+        wake_addr(addr, False)
+
+    @R("WakeByAddressAll", "p", "v", dlls=SYN)
+    def _wbaa(c, addr):
+        wake_addr(addr, True)
+
+    @R("RtlWaitOnAddress", "ppzp", dlls=NT)
+    def _rwoa(c, addr, cmp, size, pt):
+        return wait_on_address(c, addr, cmp, size, timeout_ms(pt), True)
+
+    @R("RtlWakeAddressSingle", "p", "v", dlls=NT)
+    def _rwas(c, addr):
+        wake_addr(addr, False)
+
+    @R("RtlWakeAddressAll", "p", "v", dlls=NT)
+    def _rwaa(c, addr):
+        wake_addr(addr, True)
+
+    # -- process / thread / system information ------------------------------------------------
+    @R("NtQueryInformationProcess ZwQueryInformationProcess", "pupup", dlls=NT)
+    def _ntqip(c, h, cls, buf, n, pret):
+        P = ps()
+        if cls == 0:                                    # ProcessBasicInformation
+            fmt = "<QQQQQQ" if P == 8 else "<IIIIII"
+            data = struct.pack(fmt, 0x103, p.peb_addr, 1, 8, p.pid, 0)
+        elif cls == 7:                                  # ProcessDebugPort
+            data = struct.pack("<Q" if P == 8 else "<I", 0)
+        elif cls == 26:                                 # ProcessWow64Information
+            data = struct.pack("<Q" if P == 8 else "<I", 0)
+        elif cls == 31:                                 # ProcessDebugFlags
+            data = struct.pack("<I", 1)
+        elif cls == 30:                                 # ProcessDebugObjectHandle
+            return 0xC0000353                           # STATUS_PORT_NOT_SET
+        elif cls in (27, 43):                           # ProcessImageFileName(Win32)
+            path = p.exe_win_path if cls == 43 else \
+                "\\Device\\HarddiskVolume1" + p.exe_win_path[2:]
+            nm = path.encode("utf-16-le")
+            hdr = 16 if P == 8 else 8
+            data = bytearray(hdr) + nm + b"\0\0"
+            struct.pack_into("<HH", data, 0, len(nm), len(nm) + 2)
+            struct.pack_into("<Q" if P == 8 else "<I", data, 8 if P == 8 else 4, buf + hdr)
+            data = bytes(data)
+        elif cls == 36:                                 # ProcessCookie
+            data = struct.pack("<I", 0x4E4F4F21)
+        elif cls == 22:                                 # ProcessHandleCount
+            data = struct.pack("<I", p.handles.count())
+        elif cls == 0x1D:                               # ProcessBreakOnTermination
+            data = struct.pack("<I", 0)
+        else:
+            return STATUS_INVALID_INFO_CLASS
+        if pret:
+            M_.write32(pret, len(data))
+        if n < len(data):
+            return STATUS_INFO_LENGTH_MISMATCH
+        M_.write(buf, data)
+        return 0
+
+    @R("NtSetInformationProcess ZwSetInformationProcess", "pupu", dlls=NT)
+    def _ntsip(c, h, cls, buf, n):
+        return 0
+
+    @R("NtQueryInformationThread ZwQueryInformationThread", "pupup", dlls=NT)
+    def _ntqit(c, h, cls, buf, n, pret):
+        t = p.current_thread if h in (0xFFFFFFFE, M64 - 1) else p.handles.get(h, "thread")
+        if t is None:
+            return STATUS_INVALID_HANDLE
+        P = ps()
+        if cls == 0:                                    # ThreadBasicInformation
+            fmt = "<IxxxxQQQQII" if P == 8 else "<IIIIIII"
+            code = t.exit_code if t.state == "dead" else 0x103
+            data = struct.pack(fmt, code, t.teb, p.pid, t.tid, 1, 8, 8)
+        elif cls == 9:                                  # ThreadQuerySetWin32StartAddress
+            data = struct.pack("<Q" if P == 8 else "<I", t.start or 0)
+        elif cls == 12:                                 # ThreadIsIoPending
+            data = struct.pack("<I", 0)
+        elif cls == 38:                                 # ThreadNameInformation
+            data = bytes(16 if P == 8 else 8)
+        else:
+            return STATUS_INVALID_INFO_CLASS
+        if pret:
+            M_.write32(pret, len(data))
+        if n < len(data):
+            return STATUS_INFO_LENGTH_MISMATCH
+        M_.write(buf, data)
+        return 0
+
+    @R("NtSetInformationThread ZwSetInformationThread", "pupu", dlls=NT)
+    def _ntsit(c, h, cls, buf, n):
+        return 0
+
+    @R("NtQuerySystemInformation ZwQuerySystemInformation", "pupp", dlls=NT)
+    def _ntqsi(c, cls, buf, n, pret):
+        P = ps()
+        ncpu = os.cpu_count() or 1
+        if cls == 0:                                    # SystemBasicInformation
+            data = struct.pack("<IIIIII", 0, 156250, 0x1000, 0x80000, 1, 0x7FFFF) + \
+                struct.pack("<I", 0x10000) + \
+                (struct.pack("<QQQ", 0x10000, 0x7FFFFFFEFFFF, (1 << ncpu) - 1) if P == 8 else
+                 struct.pack("<III", 0x10000, 0x7FFEFFFF, (1 << ncpu) - 1)) + struct.pack("<b", ncpu)
+            data = data.ljust(64 if P == 8 else 44, b"\0")
+        elif cls == 1:                                  # SystemProcessorInformation
+            data = struct.pack("<HHHHI", 9, 6, 0x3A09, 0, 0x2F)
+        elif cls == 3:                                  # SystemTimeOfDayInformation
+            now = _ft_from_unix(time.time())
+            data = struct.pack("<qqqII", now - int(3600 * 5e7), now, time.timezone * 10_000_000,
+                               0, 0).ljust(48, b"\0")
+        elif cls == 8:                                  # SystemProcessorPerformanceInformation
+            now = int((time.monotonic() - k.boot) * 1e7)
+            data = b"".join(struct.pack("<qqqqI4x", now // 2, now // 3, now // 10, 0, 0)
+                            for _ in range(ncpu))
+        elif cls == 5:                                  # SystemProcessInformation (just us)
+            name = os.path.basename(p.exe_win_path).encode("utf-16-le")
+            hdr = 0x100 if P == 8 else 0xB8
+            data = bytearray(hdr) + name + b"\0\0"
+            struct.pack_into("<I", data, 0, 0)          # NextEntryOffset
+            struct.pack_into("<I", data, 4, len(p.threads))
+            struct.pack_into("<HH", data, 0x38, len(name), len(name) + 2)
+            struct.pack_into("<Q" if P == 8 else "<I", data, 0x40 if P == 8 else 0x3C, buf + hdr)
+            struct.pack_into("<Q" if P == 8 else "<I", data, 0x50 if P == 8 else 0x44, p.pid)
+            data = bytes(data)
+        else:
+            return STATUS_INVALID_INFO_CLASS
+        if pret:
+            M_.write32(pret, len(data))
+        if n < len(data):
+            return STATUS_INFO_LENGTH_MISMATCH
+        M_.write(buf, data)
+        return 0
+
+    @R("NtTerminateProcess ZwTerminateProcess", "pu", dlls=NT)
+    def _nttp(c, h, code):
+        if h in (0, 0xFFFFFFFF, M64):
+            raise NOOExitProcess(code)
+        return STATUS_ACCESS_DENIED
+
+    @R("NtTerminateThread ZwTerminateThread RtlExitUserThread", "pu", dlls=NT)
+    def _nttt(c, h, code):
+        t = p.current_thread if h in (0, 0xFFFFFFFE, M64 - 1) else p.handles.get(h, "thread")
+        if t is p.current_thread:
+            raise NOOExitThread(code)
+        if t is not None:
+            t.state = "dead"
+            t.exit_code = code
+        return 0
+
+    @R("RtlExitUserProcess", "u", "v", dlls=NT)
+    def _reup(c, code):
+        raise NOOExitProcess(code)
+
+    @R("NtGetContextThread ZwGetContextThread", "pp", dlls=NT)
+    def _ntgct(c, h, ctx):
+        return 0 if k.get_thread_ctx(c, h, ctx) else STATUS_INVALID_HANDLE
+
+    @R("NtSetContextThread ZwSetContextThread", "pp", dlls=NT)
+    def _ntsct(c, h, ctx):
+        return 0 if k.set_thread_ctx(c, h, ctx) else STATUS_INVALID_HANDLE
+
+    @R("NtRaiseException ZwRaiseException", "ppi", dlls=NT)
+    def _ntre2(c, rec, ctx, first):
+        regs, eip, fl, xmm, mx = p.seh.read_context(ctx)
+        P = ps()
+        code, flags = M_.read32(rec), M_.read32(rec + 4)
+        addr = rptr(rec + (0x10 if P == 8 else 0x0C))
+        n = M_.read32(rec + (0x18 if P == 8 else 0x10))
+        params = [rptr(rec + (0x20 if P == 8 else 0x14) + P * i) for i in range(min(n, 15))]
+        p.seh.begin(p.current_thread, code, flags, addr, params, eip, regs, fl)
+        raise NOOContextSet()
+
+    @R("NtQueryPerformanceCounter ZwQueryPerformanceCounter", "pp", dlls=NT)
+    def _ntqpc2(c, out, freq):
+        M_.write64(out, int(time.perf_counter() * 10_000_000) & M64)
+        if freq:
+            M_.write64(freq, 10_000_000)
+        return 0
+
+    @R("NtQueryTimerResolution ZwQueryTimerResolution", "ppp", dlls=NT)
+    def _ntqtr(c, mx, mn, cur):
+        for a, v in ((mx, 156250), (mn, 5000), (cur, 156250)):
+            if a:
+                M_.write32(a, v)
+        return 0
+
+    @R("NtSetTimerResolution ZwSetTimerResolution", "uip", dlls=NT)
+    def _ntstr(c, want, set_, cur):
+        if cur:
+            M_.write32(cur, want or 156250)
+        return 0
+
+    # -- loader -----------------------------------------------------------------------------
+    @R("LdrLoadDll", "pppp", dlls=NT)
+    def _ldrld(c, path, flags, name, out):
+        h = p.modules.load(ustr(name))
+        if not h:
+            return 0xC0000135                          # STATUS_DLL_NOT_FOUND
+        k.wptr(out, h)
+        return 0
+
+    @R("LdrGetDllHandle", "pppp", dlls=NT)
+    def _ldrgdh(c, path, chars, name, out):
+        h = p.modules.handle_for(ustr(name))
+        if not h:
+            return 0xC0000135
+        k.wptr(out, h)
+        return 0
+
+    @R("LdrGetDllHandleEx", "upppp", dlls=NT)
+    def _ldrgdhx(c, flags, path, chars, name, out):
+        return _ldrgdh(c, path, chars, name, out)
+
+    @R("LdrGetProcedureAddress", "ppup", dlls=NT)
+    def _ldrgpa(c, h, name, ordinal, out):
+        if name:
+            n = M_.read16(name)
+            s_ = M_.read(rptr(name + (8 if ps() == 8 else 4)), n).decode("latin-1")
+            a = p.modules.resolve(h, s_, None)
+        else:
+            a = p.modules.resolve(h, None, ordinal)
+        if not a:
+            return 0xC0000139                          # STATUS_ENTRYPOINT_NOT_FOUND
+        k.wptr(out, a)
+        return 0
+
+    @R("LdrAddRefDll", "up", dlls=NT)
+    def _ldrard(c, flags, h):
+        return 0
+
+    @R("LdrUnloadDll", "p", dlls=NT)
+    def _ldrud(c, h):
+        return 0
+
+    @R("LdrRegisterDllNotification", "pppp", dlls=NT)
+    def _ldrrdn(c, flags, cb, ctx, out):
+        if out:
+            k.wptr(out, p.handles.add({}, "dllnotify"))
+        return 0
+
+    @R("LdrUnregisterDllNotification", "p", dlls=NT)
+    def _ldrudn(c, h):
+        return 0
+
+    @R("RtlImageNtHeader", "p", "p", dlls=NT)
+    def _rinh(c, base):
+        try:
+            return base + M_.read32(base + 0x3C)
+        except NOOCPUFault:
+            return 0
+
+    @R("RtlImageDirectoryEntryToData", "piup", "p", dlls=NT)
+    def _ridetd(c, base, image, entry, psize):
+        nt = base + M_.read32(base + 0x3C)
+        magic = M_.read16(nt + 24)
+        dd = nt + 24 + (112 if magic == 0x20B else 96)
+        rva, size = M_.read32(dd + 8 * entry), M_.read32(dd + 8 * entry + 4)
+        if psize:
+            M_.write32(psize, size)
+        return base + rva if rva else 0
+
+    # ---------------------------------------------------------------------------
+    # userenv / netapi32 (profile + machine info)
+    # ---------------------------------------------------------------------------
+    UE = ("userenv.dll",)
+
+    def put_cch(buf, pcch, text, wide):
+        cap = M_.read32(pcch)
+        M_.write32(pcch, len(text) + 1)
+        if not buf or cap < len(text) + 1:
+            return k.err(ERROR_INSUFFICIENT_BUFFER)
+        k.put(buf, cap, text, wide)
+        return 1
+
+    @R("GetUserProfileDirectoryA", "ppp", dlls=UE)
+    def _gupda(c, tok, buf, pcch):
+        return put_cch(buf, pcch, p.env.get("USERPROFILE", "C:\\Users\\NOO"), False)
+
+    @R("GetUserProfileDirectoryW", "ppp", dlls=UE)
+    def _gupdw(c, tok, buf, pcch):
+        return put_cch(buf, pcch, p.env.get("USERPROFILE", "C:\\Users\\NOO"), True)
+
+    @R("GetProfilesDirectoryA", "pp", dlls=UE)
+    def _gpda(c, buf, pcch):
+        return put_cch(buf, pcch, "C:\\Users", False)
+
+    @R("GetProfilesDirectoryW", "pp", dlls=UE)
+    def _gpdw(c, buf, pcch):
+        return put_cch(buf, pcch, "C:\\Users", True)
+
+    @R("GetDefaultUserProfileDirectoryW GetAllUsersProfileDirectoryW", "pp", dlls=UE)
+    def _gdupd(c, buf, pcch):
+        return put_cch(buf, pcch, "C:\\Users\\Default", True)
+
+    @R("CreateEnvironmentBlock", "ppi", dlls=UE)
+    def _ceb(c, out, tok, inherit):
+        items = sorted(p.env.items())
+        blob = "".join("%s=%s\0" % kv for kv in items) + "\0"
+        data = blob.encode("utf-16-le")
+        a = p.heap_alloc(p.process_heap_handle, len(data))
+        M_.write(a, data)
+        k.wptr(out, a)
+        return 1
+
+    @R("DestroyEnvironmentBlock", "p", dlls=UE)
+    def _deb(c, env):
+        p.heap_free(p.process_heap_handle, env)
+        return 1
+
+    NA = ("netapi32.dll", "srvcli.dll", "wkscli.dll", "netutils.dll")
+
+    def net_alloc(n):
+        a = p.heap_alloc(p.process_heap_handle, max(n, 1))
+        M_.write(a, bytes(max(n, 1)))
+        return a
+
+    @R("NetApiBufferAllocate", "up", dlls=NA)
+    def _naba(c, n, out):
+        k.wptr(out, net_alloc(n))
+        return 0
+
+    @R("NetApiBufferFree", "p", dlls=NA)
+    def _nabf(c, buf):
+        if buf:
+            p.heap_free(p.process_heap_handle, buf)
+        return 0
+
+    def wstr_alloc(text):
+        data = text.encode("utf-16-le") + b"\0\0"
+        a = net_alloc(len(data))
+        M_.write(a, data)
+        return a
+
+    @R("NetWkstaGetInfo", "pup", dlls=NA)
+    def _nwgi(c, server, level, out):
+        P = ps()
+        if level != 100:
+            return 124                                  # ERROR_INVALID_LEVEL
+        pc = wstr_alloc(p.env.get("COMPUTERNAME", "NOO-PC"))
+        grp = wstr_alloc("WORKGROUP")
+        rec = net_alloc(5 * P)
+        fmt = "<QQQQQ" if P == 8 else "<IIIII"
+        M_.write(rec, struct.pack(fmt, 500, pc, grp, 10, 0))
+        k.wptr(out, rec)
+        return 0
+
+    @R("NetServerGetInfo", "pup", dlls=NA)
+    def _nsgi(c, server, level, out):
+        P = ps()
+        if level not in (100, 101):
+            return 124
+        nm = wstr_alloc(p.env.get("COMPUTERNAME", "NOO-PC"))
+        if level == 100:
+            rec = net_alloc(2 * P)
+            M_.write(rec, struct.pack("<QQ" if P == 8 else "<II", 500, nm))
+        else:
+            rec = net_alloc(6 * P)
+            M_.write(rec, struct.pack("<QQQQQQ" if P == 8 else "<IIIIII",
+                                      500, nm, 10, 0, 0x1003, wstr_alloc("")))
+        k.wptr(out, rec)
+        return 0
+
+    @R("NetGetJoinInformation", "ppp", dlls=NA)
+    def _ngji(c, server, pname, pstatus):
+        k.wptr(pname, wstr_alloc("WORKGROUP"))
+        M_.write32(pstatus, 2)                          # NetSetupWorkgroupName
+        return 0
+
+    @R("NetUserGetInfo NetUserGetLocalGroups NetLocalGroupGetMembers", "ppup", dlls=NA)
+    def _nugi(c, server, user, level, out):
+        return 2221                                     # NERR_UserNotFound
+
+
+# ==============================================================================
 # 11. Module / DLL loader
 # ==============================================================================
 
@@ -23625,6 +24741,7 @@ class NOOProcess:
         self.cxx.install(self.k32)
         _adv_install(self.k32)
         _oa_install(self.k32)
+        _nt_install(self.k32)
         main = NOOModule(os.path.basename(self.exe_host_path).lower(), base,
                          pe.size_of_image, "pe", pe)
         self.modules.main = main
@@ -23722,6 +24839,11 @@ class NOOProcess:
             a += len(w)
         self.wenvp_addr = self._write_ptr_array(wenv_ptrs, ptr_size)
 
+        try:
+            self._init_peb(base, pe)
+        except NOOCPUFault as e:
+            self.log.warn("PEB setup incomplete: %s" % e)
+
         # CRT support cells
         self.crt_errno_addr = self.mem.alloc(0x100, MEM_READ | MEM_WRITE, tag="crt")
         self.crt_commode_addr = self.mem.alloc(8, MEM_READ | MEM_WRITE)
@@ -23775,6 +24897,114 @@ class NOOProcess:
         self.log.ok("PE loader: %s mapped at %#x, entry %#x (%d-bit)"
                     % (os.path.basename(self.exe_host_path), base, entry, self.cpu_mode))
         return self
+
+    def _init_peb(self, base, pe):
+        """PEB fields programs read directly: ProcessParameters (std handles,
+        current directory, image path, command line, environment), the loader
+        module list, process heap, OS version and processor count."""
+        m = self.mem
+        x64 = self.cpu_mode == 64
+        P = 8 if x64 else 4
+        peb = self.peb_addr
+        blob = m.alloc(0x4000, MEM_READ | MEM_WRITE, tag="process_parameters")
+        cur = [blob + 0x400]
+
+        def put_ustr(at, text):
+            data = text.encode("utf-16-le")
+            a = cur[0]
+            m.write(a, data + b"\0\0")
+            cur[0] = (a + len(data) + 2 + 7) & ~7
+            m.write16(at, len(data))
+            m.write16(at + 2, len(data) + 2)
+            (m.write64 if x64 else m.write32)(at + (8 if x64 else 4), a)
+
+        wp = m.write64 if x64 else m.write32
+        pp = blob
+        m.write32(pp, 0x400)
+        m.write32(pp + 4, 0x400)
+        m.write32(pp + 8, 0x1)                                  # PARAMS_NORMALIZED
+        if x64:
+            wp(pp + 0x20, HandleTable.STDIN_HANDLE)
+            wp(pp + 0x28, HandleTable.STDOUT_HANDLE)
+            wp(pp + 0x30, HandleTable.STDERR_HANDLE)
+            put_ustr(pp + 0x38, self.vfs.cwd.rstrip("\\") + "\\")
+            put_ustr(pp + 0x50, "C:\\Windows\\System32;C:\\Windows")
+            put_ustr(pp + 0x60, self.exe_win_path)
+            put_ustr(pp + 0x70, m.read_wstring(self.cmdline_w_addr, 0x7FF).decode(
+                "utf-16-le", "replace"))
+            put_ustr(pp + 0xB0, self.exe_win_path)
+            put_ustr(pp + 0xC0, "WinSta0\\Default")
+        else:
+            wp(pp + 0x18, HandleTable.STDIN_HANDLE)
+            wp(pp + 0x1C, HandleTable.STDOUT_HANDLE)
+            wp(pp + 0x20, HandleTable.STDERR_HANDLE)
+            put_ustr(pp + 0x24, self.vfs.cwd.rstrip("\\") + "\\")
+            put_ustr(pp + 0x30, "C:\\Windows\\System32;C:\\Windows")
+            put_ustr(pp + 0x38, self.exe_win_path)
+            put_ustr(pp + 0x40, m.read_wstring(self.cmdline_w_addr, 0x7FF).decode(
+                "utf-16-le", "replace"))
+            put_ustr(pp + 0x70, self.exe_win_path)
+            put_ustr(pp + 0x78, "WinSta0\\Default")
+        env = "".join("%s=%s\0" % kv for kv in sorted(self.env.items())) + "\0"
+        edata = env.encode("utf-16-le")
+        ea = m.alloc(len(edata) + 16, MEM_READ | MEM_WRITE, tag="environment")
+        m.write(ea, edata)
+        wp(pp + (0x80 if x64 else 0x48), ea)
+        if x64:
+            m.write64(pp + 0x3F0, len(edata))
+        # PEB proper
+        m.write8(peb + 2, 0)                                    # BeingDebugged
+        wp(peb + (0x10 if x64 else 0x08), base)
+        wp(peb + (0x20 if x64 else 0x10), pp)
+        wp(peb + (0x30 if x64 else 0x18), self.process_heap_handle)
+        ncpu = os.cpu_count() or 1
+        if x64:
+            m.write32(peb + 0xB8, ncpu)
+            m.write32(peb + 0x118, 10)
+            m.write32(peb + 0x11C, 0)
+            m.write16(peb + 0x120, 19045)
+            m.write32(peb + 0x124, 2)                           # VER_PLATFORM_WIN32_NT
+            m.write32(peb + 0x128, pe.subsystem if hasattr(pe, "subsystem") else 3)
+            m.write32(peb + 0x12C, 6)
+        else:
+            m.write32(peb + 0x64, ncpu)
+            m.write32(peb + 0xA4, 10)
+            m.write32(peb + 0xA8, 0)
+            m.write16(peb + 0xAC, 19045)
+            m.write32(peb + 0xB0, 2)
+            m.write32(peb + 0xB4, pe.subsystem if hasattr(pe, "subsystem") else 3)
+        # loader data: exe, ntdll, kernel32 (+ kernelbase)
+        ldr = cur[0]
+        cur[0] += 0x60
+        heads = [0x10, 0x20, 0x30] if x64 else [0x0C, 0x14, 0x1C]
+        m.write32(ldr, 0x58 if x64 else 0x30)
+        m.write8(ldr + 4, 1)
+        mods = [(base, base + pe.entry_rva, pe.size_of_image, self.exe_win_path)]
+        for dll in ("ntdll.dll", "kernel32.dll", "kernelbase.dll"):
+            h = self.modules.handle_for(dll)
+            if h:
+                mods.append((h, 0, 0x1000, "C:\\Windows\\System32\\" + dll))
+        esz = 0x120 if x64 else 0xA8
+        entries = []
+        for dbase, entry, size, path in mods:
+            e = cur[0]
+            cur[0] += esz
+            wp(e + (0x30 if x64 else 0x18), dbase)
+            wp(e + (0x38 if x64 else 0x1C), entry)
+            m.write32(e + (0x40 if x64 else 0x20), size)
+            put_ustr(e + (0x48 if x64 else 0x24), path)
+            put_ustr(e + (0x58 if x64 else 0x2C), path.rsplit("\\", 1)[-1])
+            m.write32(e + (0x68 if x64 else 0x34), 0x4)
+            entries.append(e)
+        for li, off in enumerate((0, 0x10, 0x20) if x64 else (0, 8, 0x10)):
+            head = ldr + heads[li]
+            chain = [head] + [e + off for e in entries] + [head]
+            for i in range(1, len(chain) - 1):
+                wp(chain[i], chain[i + 1])
+                wp(chain[i] + P, chain[i - 1])
+            wp(head, chain[1])
+            wp(head + P, chain[-2])
+        wp(peb + (0x18 if x64 else 0x0C), ldr)
 
     def _write_ptr_array(self, ptrs, ptr_size):
         addr = self.mem.alloc((len(ptrs) + 1) * ptr_size, MEM_READ | MEM_WRITE)
@@ -25155,6 +26385,7 @@ class _APIShim(WinAPI):
             _CxxEH(self.p).install(k)
             _adv_install(k)
             _oa_install(k)
+            _nt_install(k)
         except Exception:
             pass
 
