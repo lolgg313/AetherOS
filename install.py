@@ -31,11 +31,18 @@ import sys
 MIN_PYTHON = (3, 8)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Use the "py" launcher when it exists, otherwise "python". (The old
+# "py OS.py / if errorlevel 1 python OS.py" pair started the OS a SECOND time
+# whenever it exited with an error.)
 BAT_LAUNCHER = """@echo off
 rem AetherOS Desktop Edition launcher
 cd /d "%~dp0"
-py OS.py
-if errorlevel 1 python OS.py
+where py >nul 2>nul
+if %errorlevel%==0 (
+    py OS.py
+) else (
+    python OS.py
+)
 """
 
 SH_LAUNCHER = """#!/bin/sh
@@ -64,19 +71,44 @@ def have_module(name):
         return False
 
 
+def refresh_import_paths():
+    """Make packages pip just installed importable in THIS process. A
+    `pip install --user` into a user site-packages folder that did not exist
+    when Python started is not on sys.path yet, so the post-install check
+    wrongly reported the package as still missing."""
+    try:
+        import importlib
+        import site
+        user_site = site.getusersitepackages()
+        if isinstance(user_site, str) and os.path.isdir(user_site) \
+                and user_site not in sys.path:
+            site.addsitedir(user_site)
+        importlib.invalidate_caches()
+    except Exception:
+        pass
+
+
 def pip_install(package):
     say("Installing %s with pip..." % package)
-    cmd = [sys.executable, "-m", "pip", "install", "--user", package]
-    try:
-        subprocess.check_call(cmd)
-        return True
-    except subprocess.CalledProcessError:
-        # Some distros block --user outside venvs; try plain install.
+    # Inside a virtualenv --user is refused, so go straight to a plain install.
+    in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    attempts = [[sys.executable, "-m", "pip", "install", package]]
+    if not in_venv:
+        attempts.insert(0, [sys.executable, "-m", "pip", "install", "--user", package])
+    for cmd in attempts:
         try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+            subprocess.check_call(cmd)
+            refresh_import_paths()
             return True
-        except subprocess.CalledProcessError:
-            return False
+        except (subprocess.CalledProcessError, OSError):
+            continue
+    say("pip could not install %s. If pip reported an 'externally-managed-"
+        "environment'," % package)
+    say("  use your distro package (e.g. python3-%s) or a virtualenv:"
+        % package.lower())
+    say("  %s -m venv .venv  &&  .venv/bin/pip install %s"
+        % (os.path.basename(sys.executable), package))
+    return False
 
 
 def check_tkinter():
@@ -166,23 +198,41 @@ def check_noo_engine():
         return False
 
 
+def _have_qt_webengine():
+    """pywebview can also render through Qt (QtWebEngine) instead of GTK."""
+    for mod in ("PyQt6.QtWebEngineWidgets", "PyQt5.QtWebEngineWidgets",
+                "PySide6.QtWebEngineWidgets", "PySide2.QtWebEngineWidgets"):
+        if have_module(mod):
+            return mod.split(".")[0]
+    return None
+
+
 def check_linux_webview_libs():
-    """pywebview on Linux needs GTK + WebKitGTK system libraries."""
+    """pywebview on Linux needs GTK + WebKitGTK (or Qt WebEngine)."""
     if not sys.platform.startswith("linux"):
         return True
     if have_module("gi"):
-        try:
-            import gi
-            gi.require_version("WebKit2", "4.0")
-            say("GTK/WebKitGTK bindings — OK.")
-            return True
-        except Exception:
-            pass
+        import gi
+        # pywebview accepts WebKit2 4.1 (libsoup3, the only one shipped by
+        # Ubuntu 24.04+/Debian 13+) as well as the older 4.0. Checking 4.0
+        # alone reported working systems as broken.
+        for version in ("4.1", "4.0"):
+            try:
+                gi.require_version("Gtk", "3.0")
+                gi.require_version("WebKit2", version)
+                say("GTK/WebKitGTK bindings (WebKit2 %s) — OK." % version)
+                return True
+            except Exception:
+                continue
+    qt = _have_qt_webengine()
+    if qt:
+        say("Qt WebEngine (%s) — OK (pywebview will use the Qt backend)." % qt)
+        return True
     say("Linux system libraries for the native window seem to be missing.")
     say("Install them for your distro, then re-run install.py:")
     if shutil.which("apt"):
-        say("  sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-webkit2-4.0")
-        say("  (on newer Ubuntu/Debian: gir1.2-webkit2-4.1 also works)")
+        say("  sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-webkit2-4.1")
+        say("  (older Ubuntu/Debian without 4.1: use gir1.2-webkit2-4.0 instead)")
     elif shutil.which("dnf"):
         say("  sudo dnf install python3-gobject gtk3 webkit2gtk4.0")
     elif shutil.which("pacman"):
@@ -251,6 +301,11 @@ def main():
     say("Windows .exe support (icons + running, via the bundled NOO engine):")
     noo_ok = check_noo_engine()
 
+    html_ok = os.path.isfile(os.path.join(BASE_DIR, "OS.html"))
+    if not html_ok:
+        say("WARNING: OS.html was not found next to install.py. OS.py needs it")
+        say("  (the desktop UI) — copy OS.html into this folder before starting.")
+
     print("-" * 60)
     folders = create_data_folders()
     launchers = write_launchers()
@@ -258,7 +313,7 @@ def main():
     print("-" * 60)
     print("  SUMMARY")
     print("-" * 60)
-    say("Core runtime  : pywebview %s, GTK/WebKitGTK %s"
+    say("Core runtime  : pywebview %s, native web engine %s"
         % ("OK" if wv_ok else "MISSING", "OK" if gtk_ok else "MISSING"))
     say("Optional      : tkinter %s, pypdf %s, wasmtime %s"
         % ("OK" if tk_ok else "missing (folder picker off)",
