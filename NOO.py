@@ -32206,7 +32206,7 @@ def _stock_icon(which, size=32):
     def put(x, y, cr, a=255):
         if 0 <= x < size and 0 <= y < size:
             o = y * size + x
-            ic.color.px[o * 4:o * 4 + 3] = bytes(((cr >> 16) & 255, (cr >> 8) & 255, cr & 255))
+            ic.color.px[o * 4:o * 4 + 3] = bytes((cr & 255, (cr >> 8) & 255, (cr >> 16) & 255))
             ic.alpha[o] = a
 
     def disc(cx, cy, r, cr):
@@ -37325,6 +37325,7 @@ def _is_dialog_message(wm, dlg, m):
         if msg == 0x100:
             if code & (DLGC_WANTALLKEYS | DLGC_WANTMESSAGE) and vk not in ():
                 if not (vk == 0x09 and not (code & DLGC_WANTTAB) and not (code & DLGC_WANTALLKEYS)):
+                    _translate_py(wm, m)
                     _dispatch_py(wm, m)
                     return True
             if vk == 0x09 and not (code & DLGC_WANTTAB):
@@ -37359,6 +37360,7 @@ def _is_dialog_message(wm, dlg, m):
                 if btn is None or wm.enabled_chain(btn):
                     wm.send(dlg.hwnd, 0x0111, IDCANCEL, btn.hwnd if btn is not None else 0)
                 return True
+            _translate_py(wm, m)
             _dispatch_py(wm, m)
             return True
         if msg in (WM_CHAR, WM_SYSCHAR):
@@ -37392,6 +37394,7 @@ def _is_dialog_message(wm, dlg, m):
             return True
     if msg in (0x101, WM_SYSKEYUP) and m["w"] in (0x09,):
         return True
+    _translate_py(wm, m)
     _dispatch_py(wm, m)
     return True
 
@@ -37610,9 +37613,11 @@ def _wm_end_paint_py(self, w, dc):
 
 
 def _wm_begin_end_paint(self, w):
+    """DefWindowProc(WM_PAINT): BeginPaint (erasing if needed) + EndPaint."""
+    erase = w.erase
     dc = _wm_begin_paint_py(self, w)
     try:
-        if dc.paint and w.cls is not None and w.cls.brush:
+        if dc.paint and erase:
             self.send(w.hwnd, 0x0014, dc.h, 0)
     finally:
         _wm_end_paint_py(self, w, dc)
