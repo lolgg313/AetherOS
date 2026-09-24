@@ -42128,6 +42128,8 @@ def _gui_install(k):
     _sysdlls_install(k)
     _cc_install(k)
     _richedit_install(k)
+    _shell_install(k)
+    _comdlg_install(k)
 
 
 # -- displays: headless (PNG dump / scripted input), Tk, AetherOS web sessions ----------------------
@@ -47884,6 +47886,2749 @@ def _richedit_install(k):
         lambda c, h, m, wp, lp: wm.send(h & 0xFFFFFFFF, m, wp, lp))
 
 
+# ==========================================================================================
+# 10o. shell32 / shlwapi: special folders, PIDLs, file operations, Path* and Str* helpers
+# ==========================================================================================
+import ntpath as _ntp
+import fnmatch as _fnm
+
+_CSIDL = {
+    0x00: "{P}\\Desktop", 0x02: "{A}\\Microsoft\\Windows\\Start Menu\\Programs",
+    0x05: "{P}\\Documents", 0x06: "{P}\\Favorites",
+    0x07: "{A}\\Microsoft\\Windows\\Start Menu\\Programs\\Startup",
+    0x08: "{A}\\Microsoft\\Windows\\Recent", 0x09: "{A}\\Microsoft\\Windows\\SendTo",
+    0x0B: "{A}\\Microsoft\\Windows\\Start Menu", 0x0D: "{P}\\Music", 0x0E: "{P}\\Videos",
+    0x10: "{P}\\Desktop", 0x13: "{A}\\Microsoft\\Windows\\Network Shortcuts",
+    0x14: "C:\\Windows\\Fonts", 0x15: "{A}\\Microsoft\\Windows\\Templates",
+    0x16: "C:\\ProgramData\\Microsoft\\Windows\\Start Menu",
+    0x17: "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs",
+    0x18: "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup",
+    0x19: "C:\\Users\\Public\\Desktop", 0x1A: "{A}", 0x1B: "{A}\\Microsoft\\Windows\\Printer Shortcuts",
+    0x1C: "{L}", 0x1D: "{A}\\Microsoft\\Windows\\Start Menu\\Programs\\Startup",
+    0x1E: "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup",
+    0x1F: "{P}\\Favorites", 0x20: "{L}\\Microsoft\\Windows\\INetCache",
+    0x21: "{L}\\Microsoft\\Windows\\INetCookies", 0x22: "{L}\\Microsoft\\Windows\\History",
+    0x23: "C:\\ProgramData", 0x24: "C:\\Windows", 0x25: "C:\\Windows\\System32",
+    0x26: "C:\\Program Files", 0x27: "{P}\\Pictures", 0x28: "{P}",
+    0x29: "C:\\Windows\\SysWOW64", 0x2A: "C:\\Program Files (x86)",
+    0x2B: "C:\\Program Files\\Common Files", 0x2C: "C:\\Program Files (x86)\\Common Files",
+    0x2D: "C:\\ProgramData\\Microsoft\\Windows\\Templates", 0x2E: "C:\\Users\\Public\\Documents",
+    0x2F: "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Administrative Tools",
+    0x30: "{A}\\Microsoft\\Windows\\Start Menu\\Programs\\Administrative Tools",
+    0x35: "C:\\Users\\Public\\Music", 0x36: "C:\\Users\\Public\\Pictures",
+    0x37: "C:\\Users\\Public\\Videos", 0x38: "C:\\Windows\\Resources",
+    0x3B: "{L}\\Microsoft\\Windows\\Burn\\Burn",
+}
+
+_KNOWN_FOLDERS = {                                  # FOLDERID_* -> CSIDL (or literal path)
+    "3eb685db-65f9-4cf6-a03a-e3ef65729f3d": 0x1A, "f1b32785-6fba-4fcf-9d55-7b8e7f157091": 0x1C,
+    "a520a1a4-1780-4ff6-bd18-167343c5af16": "{P}\\AppData\\LocalLow",
+    "fdd39ad0-238f-46af-adb4-6c85480369c7": 0x05, "b4bfcc3a-db2c-424c-b029-7fe99a87c641": 0x10,
+    "905e63b6-c1bf-494e-b29c-65b732d3d21a": 0x26, "7c5a40ef-a0fb-4bfc-874a-c0f2e0b9fa8e": 0x2A,
+    "6d809377-6af0-444b-8957-a3773f02200e": 0x26, "f7f1ed05-9f6d-47a2-aaae-29d317c6f066": 0x2B,
+    "de974d24-d9c6-4d3e-bf91-f4455120b917": 0x2C,
+    "f38bf404-1d43-42f2-9305-67de0b28fc23": 0x24, "1ac14e77-02e7-4e5d-b744-2eb1ae5198b7": 0x25,
+    "d65231b0-b2f1-4857-a4ce-a8e7c6ea7d27": 0x29, "5e6c858f-0e22-4760-9afe-ea3317b67173": 0x28,
+    "62ab5d82-fdc1-4dc3-a9dd-070d1d495d97": 0x23, "374de290-123f-4565-9164-39c4925e467b":
+    "{P}\\Downloads", "fd228cb7-ae11-4ae3-864c-16f3910ab8fe": 0x14,
+    "33e28130-4e1e-4676-835a-98395c3bc3bb": 0x27, "4bd8d571-6d19-48d3-be97-422220080e43": 0x0D,
+    "18989b1d-99b5-455b-841c-ab7c74e4ddfc": 0x0E, "625b53c3-ab48-4ec1-ba1f-a1ef4146fc19": 0x0B,
+    "a77f5d77-2e2b-44c3-a6a2-aba601054a51": 0x02, "b97d20bb-f46a-4c97-ba10-5e3608430854": 0x07,
+    "a63293e8-664e-48db-a079-df759e0509f7": 0x15, "8983036c-27c0-404b-8f08-102d10dcfd74": 0x09,
+    "ae50c081-ebd2-438a-8655-8a092e34987a": 0x08, "1777f761-68ad-4d8a-87bd-30b759fa33dd": 0x06,
+    "352481e8-33be-4251-ba85-6007caedcf9d": 0x20, "2b0f765d-c0e9-4171-908e-08a611b84ff6": 0x21,
+    "d9dc8a3b-b784-432e-a781-5a1130a75963": 0x22, "82a5ea35-d9cd-47c5-9629-e15d2f714e6e": 0x18,
+    "0139d44e-6afe-49f2-8690-3dafcae6ffb8": 0x17, "a4115719-d62e-491d-aa7c-e74b8be3b067": 0x16,
+    "c4aa340d-f20f-4863-afef-f87ef2e6ba25": 0x19, "ed4824af-dce4-45a8-81e2-fc7965083634": 0x2E,
+    "dfdf76a2-c82a-4d63-906a-5644ac457385": "C:\\Users\\Public",
+    "3d644c9b-1fb8-4f30-9b45-f670235f79c0": "C:\\Users\\Public\\Downloads",
+    "0762d272-c50a-4bb0-a382-697dcd729b80": "C:\\Users",
+    "4c5c32ff-bb9d-43b0-b5b4-2d72e54eaaa4": "{P}\\Saved Games",
+    "56784854-c6cb-462b-8169-88e350acb882": "{P}\\Contacts",
+    "bfb9d5e0-c6a9-404c-b2b2-ae6db6af4968": "{P}\\Links",
+    "7d1d3a04-debb-4115-95cf-2f29da2920da": "{P}\\Searches",
+    "b7534046-3ecb-4c18-be4e-64cd4cb7d6ac": "C:\\$Recycle.Bin",
+    "8ad10c31-2adb-4296-a8f7-e4701232c972": 0x38,
+}
+
+
+def _shell_install(k):
+    R = k.reg
+    p = k.p
+    M_ = p.mem
+    SH = ("shell32.dll",)
+    SHL = ("shlwapi.dll",)
+    ERROR_FILE_NOT_FOUND = 2
+
+    def ps():
+        return 8 if p.cpu_mode == 64 else 4
+
+    def gs(a, wide):
+        return _gstr(M_, a, -1, wide) if a else ""
+
+    def enc(s, wide):
+        return s.encode("utf-16-le") + b"\0\0" if wide else s.encode("utf-8", "replace") + b"\0"
+
+    def ws(a, s, wide, cch=None):
+        """Write s (NUL-terminated) into a guest buffer, truncating to cch units."""
+        if not a:
+            return 0
+        if cch is not None:
+            if cch <= 0:
+                return 0
+            if wide:
+                s = s[:cch - 1]
+            else:
+                b = s.encode("utf-8", "replace")[:cch - 1]
+                M_.write(a, b + b"\0")
+                return len(b)
+        M_.write(a, enc(s, wide))
+        return len(s)
+
+    def ptr_at(a, s, idx, wide):
+        """Guest pointer to character idx of the string s stored at a."""
+        if wide:
+            return a + len(s[:idx].encode("utf-16-le"))
+        return a + len(s[:idx].encode("utf-8", "replace"))
+
+    def env(name, dflt):
+        e = getattr(p, "env", None) or {}
+        for k_, v in e.items():
+            if k_.upper() == name:
+                return v
+        return dflt
+
+    def csidl_path(csidl):
+        t = _CSIDL.get(csidl & 0xFF)
+        if t is None:
+            return None
+        prof = env("USERPROFILE", "C:\\Users\\NOO")
+        return t.replace("{P}", prof).replace(
+            "{A}", env("APPDATA", prof + "\\AppData\\Roaming")).replace(
+            "{L}", env("LOCALAPPDATA", prof + "\\AppData\\Local"))
+
+    def ensure_dir(path):
+        try:
+            host = p.vfs.resolve(path, for_write=True)
+            os.makedirs(host, exist_ok=True)
+            return True
+        except Exception:
+            return False
+
+    def is_dir(path):
+        try:
+            return os.path.isdir(p.vfs.resolve(path))
+        except Exception:
+            return False
+
+    def exists(path):
+        try:
+            return os.path.exists(p.vfs.resolve(path))
+        except Exception:
+            return False
+
+    def alloc(n):
+        return p.heap_alloc(p.process_heap_handle, n)
+
+    # ---- special folders ------------------------------------------------------------------
+    def folder_hr(csidl, create):
+        path = csidl_path(csidl)
+        if path is None:
+            return None, 0x80070057
+        if create or csidl & 0x8000 or not is_dir(path):
+            ensure_dir(path)                       # folders exist on a real Windows install
+        return path, 0
+
+    @R("SHGetFolderPathA", "piupp", dlls=SH)
+    def _SHGetFolderPathA(c, hwnd, csidl, tok, flags, out):
+        path, hr = folder_hr(csidl, False)
+        if path is None:
+            return hr
+        ws(out, path, False, 260)
+        return 0
+
+    @R("SHGetFolderPathW", "piupp", dlls=SH)
+    def _SHGetFolderPathW(c, hwnd, csidl, tok, flags, out):
+        path, hr = folder_hr(csidl, False)
+        if path is None:
+            return hr
+        ws(out, path, True, 260)
+        return 0
+
+    @R("SHGetFolderPathAndSubDirA", "piuppp", dlls=SH)
+    def _SHGetFolderPathAndSubDirA(c, hwnd, csidl, tok, flags, sub, out):
+        path, hr = folder_hr(csidl, False)
+        if path is None:
+            return hr
+        if sub:
+            path = _ntp.join(path, gs(sub, False))
+            if csidl & 0x8000:
+                ensure_dir(path)
+        ws(out, path, False, 260)
+        return 0
+
+    @R("SHGetFolderPathAndSubDirW", "piuppp", dlls=SH)
+    def _SHGetFolderPathAndSubDirW(c, hwnd, csidl, tok, flags, sub, out):
+        path, hr = folder_hr(csidl, False)
+        if path is None:
+            return hr
+        if sub:
+            path = _ntp.join(path, gs(sub, True))
+            if csidl & 0x8000:
+                ensure_dir(path)
+        ws(out, path, True, 260)
+        return 0
+
+    @R("SHGetSpecialFolderPathA", "ppii", dlls=SH)
+    def _SHGetSpecialFolderPathA(c, hwnd, out, csidl, create):
+        path, hr = folder_hr(csidl, create)
+        if path is None:
+            return 0
+        ws(out, path, False, 260)
+        return 1
+
+    @R("SHGetSpecialFolderPathW", "ppii", dlls=SH)
+    def _SHGetSpecialFolderPathW(c, hwnd, out, csidl, create):
+        path, hr = folder_hr(csidl, create)
+        if path is None:
+            return 0
+        ws(out, path, True, 260)
+        return 1
+
+    def guid_str(a):
+        d1, d2, d3 = struct.unpack("<IHH", M_.read(a, 8))
+        d4 = bytes(M_.read(a + 8, 8))
+        return "%08x-%04x-%04x-%s-%s" % (d1, d2, d3, d4[:2].hex(), d4[2:].hex())
+
+    def known_path(rfid):
+        v = _KNOWN_FOLDERS.get(guid_str(rfid)) if rfid else None
+        if v is None:
+            return None
+        if isinstance(v, int):
+            return csidl_path(v)
+        prof = env("USERPROFILE", "C:\\Users\\NOO")
+        return v.replace("{P}", prof)
+
+    @R("SHGetKnownFolderPath", "pupp", dlls=SH)
+    def _SHGetKnownFolderPath(c, rfid, flags, tok, ppsz):
+        path = known_path(rfid)
+        put_ptr(ppsz, 0)
+        if path is None:
+            return 0x80070002
+        if flags & 0x8000 or not is_dir(path):     # KF_FLAG_CREATE
+            ensure_dir(path)
+        data = enc(path, True)
+        a = alloc(len(data))
+        M_.write(a, data)
+        M_.write(ppsz, struct.pack("<Q" if ps() == 8 else "<I", a))
+        return 0
+
+    @R("SHSetKnownFolderPath", "pupp", dlls=SH)
+    def _SHSetKnownFolderPath(c, rfid, flags, tok, path):
+        return 0x80070005                            # E_ACCESSDENIED
+
+    # ---- PIDLs: one SHITEMID carrying "NOO\0" + the UTF-16 path -----------------------------
+    PIDL_TAG = b"NOO\0"
+
+    def make_pidl(path):
+        body = PIDL_TAG + path.encode("utf-16-le") + b"\0\0"
+        blob = struct.pack("<H", len(body) + 2) + body + b"\0\0"
+        a = alloc(len(blob))
+        M_.write(a, blob)
+        return a
+
+    def pidl_path(a):
+        if not a:
+            return None
+        cb = M_.read16(a) if hasattr(M_, "read16") else struct.unpack("<H", M_.read(a, 2))[0]
+        if cb == 0:
+            return csidl_path(0x00)                  # the desktop
+        body = bytes(M_.read(a + 2, cb - 2))
+        if not body.startswith(PIDL_TAG):
+            return None
+        return body[4:].decode("utf-16-le", "replace").split("\0", 1)[0]
+
+    def pidl_size(a):
+        n = 0
+        while True:
+            cb = struct.unpack("<H", M_.read(a + n, 2))[0]
+            n += 2 if cb == 0 else cb
+            if cb == 0:
+                return n
+
+    k.pidl_path = pidl_path
+    k.make_pidl = make_pidl
+
+    def put_ptr(pp, v):
+        if pp:
+            M_.write(pp, struct.pack("<Q" if ps() == 8 else "<I", v))
+
+    @R("SHGetSpecialFolderLocation", "pip", dlls=SH)
+    def _SHGetSpecialFolderLocation(c, hwnd, csidl, ppidl):
+        path, hr = folder_hr(csidl, False)
+        if path is None:
+            put_ptr(ppidl, 0)
+            return hr
+        put_ptr(ppidl, make_pidl(path))
+        return 0
+
+    @R("SHGetFolderLocation", "piupp", dlls=SH)
+    def _SHGetFolderLocation(c, hwnd, csidl, tok, res, ppidl):
+        return _SHGetSpecialFolderLocation(c, hwnd, csidl, ppidl)
+
+    @R("SHGetKnownFolderIDList", "pupp", dlls=SH)
+    def _SHGetKnownFolderIDList(c, rfid, flags, tok, ppidl):
+        path = known_path(rfid)
+        if path is None:
+            put_ptr(ppidl, 0)
+            return 0x80070002
+        put_ptr(ppidl, make_pidl(path))
+        return 0
+
+    for wide_ in (False, True):
+        def _get_path(c, pidl, out, _w=wide_):
+            path = pidl_path(pidl)
+            if path is None:
+                ws(out, "", _w, 260)
+                return 0
+            ws(out, path, _w, 260)
+            return 1
+        R("SHGetPathFromIDListW" if wide_ else "SHGetPathFromIDListA", "pp", dlls=SH)(_get_path)
+
+        def _get_path_ex(c, pidl, out, cch, flags, _w=wide_):
+            path = pidl_path(pidl)
+            if path is None or len(path) >= cch:
+                return 0
+            ws(out, path, _w, cch)
+            return 1
+        if wide_:
+            R("SHGetPathFromIDListEx", "ppuu", dlls=SH)(_get_path_ex)
+
+        def _il_create(c, path_ptr, _w=wide_):
+            return make_pidl(_ntp.normpath(gs(path_ptr, _w))) if path_ptr else 0
+        R("ILCreateFromPathW" if wide_ else "ILCreateFromPathA", "p", dlls=SH)(_il_create)
+
+    @R("SHParseDisplayName", "pppup", dlls=SH)
+    def _SHParseDisplayName(c, name, bind, ppidl, sfin, psfout):
+        path = gs(name, True)
+        if psfout:
+            M_.write32(psfout, 0)
+        if not path or not exists(path):
+            put_ptr(ppidl, 0)
+            return 0x80070002
+        put_ptr(ppidl, make_pidl(_ntp.normpath(path)))
+        return 0
+
+    @R("ILFree", "p", dlls=SH)
+    def _ILFree(c, pidl):
+        if pidl:
+            p.heap_free(p.process_heap_handle, pidl)
+        return 0
+
+    @R("ILClone", "p", dlls=SH)
+    def _ILClone(c, pidl):
+        if not pidl:
+            return 0
+        n = pidl_size(pidl)
+        a = alloc(n)
+        M_.write(a, bytes(M_.read(pidl, n)))
+        return a
+
+    @R("ILGetSize", "p", dlls=SH)
+    def _ILGetSize(c, pidl):
+        return pidl_size(pidl) if pidl else 0
+
+    @R("ILIsEqual", "pp", dlls=SH)
+    def _ILIsEqual(c, a, b):
+        return int((pidl_path(a) or "").lower() == (pidl_path(b) or "").lower())
+
+    @R("ILFindLastID ILGetNext", "p", dlls=SH)
+    def _ILFindLastID(c, pidl):
+        return pidl
+
+    # ---- directories / file operations ------------------------------------------------------
+    for wide_ in (False, True):
+        def _mkdir_ex(c, hwnd, path_ptr, sa, _w=wide_):
+            path = gs(path_ptr, _w)
+            if not path:
+                return 3                              # ERROR_PATH_NOT_FOUND
+            if exists(path):
+                return 183 if is_dir(path) else 80    # ALREADY_EXISTS / FILE_EXISTS
+            return 0 if ensure_dir(path) else 5
+        R("SHCreateDirectoryExW" if wide_ else "SHCreateDirectoryExA", "ppp", dlls=SH)(_mkdir_ex)
+    R("SHCreateDirectory", "pp", dlls=SH)(lambda c, h, path: _mkdir_ex(c, h, path, 0, True))
+
+    def multi_sz(a, wide):
+        out = []
+        if not a:
+            return out
+        while True:
+            s = gs(a, wide)
+            if not s:
+                return out
+            out.append(s)
+            a += len(enc(s, wide)) if wide else len(s.encode("utf-8", "replace")) + 1
+            if len(out) > 4096:
+                return out
+
+    def host_of(path, write=False):
+        return p.vfs.resolve(path, for_write=write)
+
+    def file_op(c, a, wide):
+        import shutil
+        P = ps()
+        func = M_.read32(a + P)
+        src = multi_sz(struct.unpack("<Q" if P == 8 else "<I", M_.read(a + 2 * P, P))[0], wide)
+        dstp = struct.unpack("<Q" if P == 8 else "<I", M_.read(a + 3 * P, P))[0]
+        dst = multi_sz(dstp, wide)
+        flags = struct.unpack("<H", M_.read(a + 4 * P, 2))[0]
+        aborted_off = 36 if P == 8 else 18              # shellapi.h is pack(1) on x86
+        M_.write32(a + aborted_off, 0)
+        multi_dest = bool(flags & 0x1)                # FOF_MULTIDESTFILES
+        try:
+            expanded = []
+            for s in src:
+                d, pat = _ntp.split(s)
+                if any(ch in pat for ch in "*?"):
+                    hd = host_of(d or ".")
+                    for nm in sorted(os.listdir(hd)):
+                        if _fnm.fnmatch(nm.lower(), pat.lower()):
+                            expanded.append(_ntp.join(d, nm))
+                else:
+                    expanded.append(s)
+            for i, s in enumerate(expanded):
+                hs = host_of(s, write=func in (1, 3, 4))
+                if not os.path.exists(hs):
+                    return 0x7C                         # DE_INVALIDFILES
+                if func == 3:                           # FO_DELETE
+                    if os.path.isdir(hs):
+                        shutil.rmtree(hs)
+                    else:
+                        os.remove(hs)
+                    continue
+                if not dst:
+                    return 0x7C
+                target = dst[i] if multi_dest and i < len(dst) else dst[0]
+                ht = host_of(target, write=True)
+                if func != 4 and os.path.isdir(ht):
+                    ht = os.path.join(ht, os.path.basename(hs))
+                if func == 2:                           # FO_COPY
+                    if os.path.isdir(hs):
+                        shutil.copytree(hs, ht, dirs_exist_ok=True)
+                    else:
+                        os.makedirs(os.path.dirname(ht) or ".", exist_ok=True)
+                        shutil.copy2(hs, ht)
+                elif func in (1, 4):                    # FO_MOVE / FO_RENAME
+                    shutil.move(hs, ht)
+            return 0
+        except NOOSandboxViolation:
+            return 0x78                                 # DE_ACCESSDENIEDSRC
+        except OSError as e:
+            p.log.warn("SHFileOperation failed: %s" % e)
+            return 0x402                                # generic "unknown error"
+
+    R("SHFileOperationA", "p", dlls=SH)(lambda c, a: file_op(c, a, False))
+    R("SHFileOperationW", "p", dlls=SH)(lambda c, a: file_op(c, a, True))
+
+    # ---- SHGetFileInfo ------------------------------------------------------------------
+    def type_name(path, isdir):
+        if isdir:
+            return "File folder"
+        ext = _ntp.splitext(path)[1].lower()
+        return {".exe": "Application", ".dll": "Application extension", ".txt": "Text Document",
+                ".ini": "Configuration settings", ".bat": "Windows Batch File",
+                ".lnk": "Shortcut", ".zip": "Compressed (zipped) Folder",
+                ".png": "PNG File", ".jpg": "JPEG image", ".bmp": "Bitmap image",
+                ".htm": "HTML Document", ".html": "HTML Document"}.get(
+            ext, (ext[1:].upper() + " File") if ext else "File")
+
+    sys_il = {}
+
+    def system_imagelist(large):
+        h = sys_il.get(large)
+        if h is None:
+            sz = 32 if large else 16
+            h = sys_il[large] = p.gdi.add(_ImageList(sz, sz, 0x20 | 1)) \
+                if getattr(p, "gdi", None) is not None else 0
+        return h
+
+    def file_info(c, path_ptr, attrs, psfi, cb, flags, wide):
+        P = ps()
+        if flags & 0x8:                                # SHGFI_PIDL
+            path = pidl_path(path_ptr) or ""
+        else:
+            path = gs(path_ptr, wide)
+        use_attr = bool(flags & 0x10)                  # SHGFI_USEFILEATTRIBUTES
+        isdir = bool(attrs & 0x10) if use_attr else is_dir(path)
+        if not use_attr and not exists(path) and not flags & 0x8:
+            return 0
+        # SHFILEINFO: hIcon, iIcon, dwAttributes, szDisplayName[260], szTypeName[80]
+        name_off = P + 8
+        type_off = name_off + (520 if wide else 260)
+        if psfi:
+            if flags & 0x100:                          # SHGFI_ICON
+                wm = getattr(p, "wm", None)
+                ic = wm.std_icons.get(32512, 0) if wm is not None else 0
+                M_.write(psfi, struct.pack("<Q" if P == 8 else "<I", ic))
+            M_.write32(psfi + P, 3 if isdir else 0)     # iIcon: folder / document
+            M_.write32(psfi + P + 4, 0x10 if isdir else 0)
+            if flags & 0x200:                          # SHGFI_DISPLAYNAME
+                ws(psfi + name_off, _ntp.basename(path.rstrip("\\")) or path, wide, 260)
+            if flags & 0x400:                          # SHGFI_TYPENAME
+                ws(psfi + type_off, type_name(path, isdir), wide, 80)
+        if flags & 0x4000:                             # SHGFI_SYSICONINDEX
+            return system_imagelist(not (flags & 0x1))
+        if flags & 0x2000:                             # SHGFI_EXETYPE
+            return 0x4550 | (0x0400 << 16) if path.lower().endswith(".exe") else 0
+        return 1
+
+    R("SHGetFileInfoA", "pupuu", "p", dlls=SH)(lambda c, a, at, s, cb, f: file_info(c, a, at, s, cb, f, False))
+    R("SHGetFileInfoW", "pupuu", "p", dlls=SH)(lambda c, a, at, s, cb, f: file_info(c, a, at, s, cb, f, True))
+
+    @R("Shell_GetImageLists", "pp", dlls=SH)
+    def _Shell_GetImageLists(c, large, small):
+        put_ptr(large, system_imagelist(True))
+        put_ptr(small, system_imagelist(False))
+        return 1
+
+    # ---- drag & drop, misc -----------------------------------------------------------------
+    R("DragAcceptFiles", "pi", dlls=SH)(lambda c, h, a: 0)
+    R("DragQueryFileA DragQueryFileW", "pupu", dlls=SH)(lambda c, h, i, buf, cch: 0)
+    R("DragFinish", "p", dlls=SH)(lambda c, h: 0)
+    R("DragQueryPoint", "pp", dlls=SH)(lambda c, h, pt: 0)
+    R("SHAddToRecentDocs", "up", dlls=SH)(lambda c, f, pv: 0)
+    R("SHChangeNotify", "iupp", dlls=SH)(lambda c, e, f, a, b: 0)
+    R("SHGetDesktopFolder", "p", dlls=SH)(lambda c, pp: (put_ptr(pp, 0), 0x80004001)[1])
+    R("SHQueryRecycleBinA SHQueryRecycleBinW", "pp", dlls=SH)(lambda c, r, i: 0)
+    R("SHEmptyRecycleBinA SHEmptyRecycleBinW", "ppu", dlls=SH)(lambda c, h, r, f: 0)
+    R("SHGetSetSettings", "pui", dlls=SH)(lambda c, a, m, s: 0)
+    R("SHGetSettings", "pu", dlls=SH)(lambda c, a, m: 0)
+    R("SHGetStockIconInfo", "uup", dlls=SH)(lambda c, i, f, s: 0x80004005)
+    R("SHAutoComplete", "pu", dlls=SHL)(lambda c, h, f: 0)
+    R("FindExecutableA FindExecutableW", "ppp", dlls=SH)(lambda c, f, d, r: 31)  # SE_ERR_NOASSOC
+
+    @R("ExtractIconA ExtractIconW", "ppu", "p", dlls=SH)
+    def _ExtractIcon(c, inst, path, idx):
+        if idx == 0xFFFFFFFF:
+            return 1
+        wm = getattr(p, "wm", None)
+        return wm.std_icons.get(32512, 0) if wm is not None and idx == 0 else 0
+
+    @R("ExtractIconExA ExtractIconExW", "pippu", dlls=SH)
+    def _ExtractIconEx(c, path, idx, large, small, n):
+        if idx == -1:
+            return 1
+        wm = getattr(p, "wm", None)
+        ic = wm.std_icons.get(32512, 0) if wm is not None else 0
+        put_ptr(large, ic)
+        put_ptr(small, ic)
+        return 1 if (large or small) else 0
+
+    @R("ExtractAssociatedIconA ExtractAssociatedIconW", "ppp", "p", dlls=SH)
+    def _ExtractAssociatedIcon(c, inst, path, idx):
+        wm = getattr(p, "wm", None)
+        return wm.std_icons.get(32512, 0) if wm is not None else 0
+
+    # ---- shlwapi Path* ---------------------------------------------------------------------
+    def reg_path(name, sig, fn, ret="i"):
+        for w_ in (False, True):
+            R(name + ("W" if w_ else "A"), sig, ret, dlls=SHL + ("kernelbase.dll",))(
+                (lambda _w: lambda c, *a: fn(_w, *a))(w_))
+
+    def canon(s):
+        if not s:
+            return "\\"
+        drive, rest = _ntp.splitdrive(s)
+        parts = []
+        for seg in rest.replace("/", "\\").split("\\"):
+            if seg == "..":
+                if parts and parts[-1] not in ("",):
+                    parts.pop()
+            elif seg != ".":
+                parts.append(seg)
+        out = "\\".join(parts)
+        if rest.startswith("\\") and not out.startswith("\\"):
+            out = "\\" + out
+        return drive + out if (drive or out) else "\\"
+
+    def _exists(w_, a):
+        return int(exists(gs(a, w_)))
+    reg_path("PathFileExists", "p", _exists)
+
+    def _isdir(w_, a):
+        return 0x10 if is_dir(gs(a, w_)) else 0
+    reg_path("PathIsDirectory", "p", _isdir)
+
+    def _isdir_empty(w_, a):
+        path = gs(a, w_)
+        try:
+            return int(is_dir(path) and not os.listdir(p.vfs.resolve(path)))
+        except Exception:
+            return 0
+    reg_path("PathIsDirectoryEmpty", "p", _isdir_empty)
+
+    def _combine(w_, dst, d, f):
+        a_, b_ = gs(d, w_), gs(f, w_)
+        if not a_ and not b_:
+            return 0
+        if b_ and (_ntp.isabs(b_) or b_[1:2] == ":"):
+            r = b_ if b_[1:2] == ":" else (_ntp.splitdrive(a_)[0] + b_)
+        else:
+            r = (a_.rstrip("\\") + "\\" + b_) if a_ and b_ else (a_ or b_)
+        ws(dst, canon(r), w_, 260)
+        return dst
+    reg_path("PathCombine", "ppp", _combine, "p")
+
+    def _append(w_, a, more):
+        s, m = gs(a, w_), gs(more, w_)
+        if m and (m[1:2] == ":"):
+            r = m
+        else:
+            r = (s.rstrip("\\") + "\\" + m.lstrip("\\")) if s and m else (s or m)
+        ws(a, canon(r) if r else r, w_, 260)
+        return 1
+    reg_path("PathAppend", "pp", _append)
+
+    def _add_bs(w_, a):
+        s = gs(a, w_)
+        if not s.endswith("\\"):
+            if len(s) + 1 >= 260:
+                return 0
+            s += "\\"
+            ws(a, s, w_)
+        return ptr_at(a, s, len(s), w_)
+    reg_path("PathAddBackslash", "p", _add_bs, "p")
+
+    def _rm_bs(w_, a):
+        s = gs(a, w_)
+        if s.endswith("\\") and not (len(s) == 3 and s[1] == ":") and s != "\\":
+            s = s[:-1]
+            ws(a, s, w_)
+            return ptr_at(a, s, len(s), w_)
+        return ptr_at(a, s, max(0, len(s) - 1), w_)
+    reg_path("PathRemoveBackslash", "p", _rm_bs, "p")
+
+    def _rm_filespec(w_, a):
+        s = gs(a, w_)
+        i = s.rfind("\\")
+        if i < 0:
+            if s[1:2] == ":":
+                ws(a, s[:2], w_)
+                return int(len(s) > 2)
+            ws(a, "", w_)
+            return int(bool(s))
+        new = s[:i + 1] if (i == 2 and s[1] == ":") or i == 0 else s[:i]
+        ws(a, new, w_)
+        return int(new != s)
+    reg_path("PathRemoveFileSpec", "p", _rm_filespec)
+
+    def _strip(w_, a):
+        s = gs(a, w_)
+        t = s.rstrip("\\")
+        i = t.rfind("\\")
+        if i >= 0:
+            ws(a, s[i + 1:], w_)
+        return 0
+    reg_path("PathStripPath", "p", _strip)
+
+    def fname_idx(s):
+        i = max(s.rfind("\\", 0, len(s) - 1), s.rfind("/", 0, len(s) - 1), s.rfind(":", 0, len(s) - 1))
+        return i + 1
+
+    def _find_name(w_, a):
+        s = gs(a, w_)
+        return ptr_at(a, s, fname_idx(s), w_) if a else 0
+    reg_path("PathFindFileName", "p", _find_name, "p")
+
+    def ext_idx(s):
+        base = fname_idx(s)
+        i = s.rfind(".")
+        return i if i >= base and " " not in s[i:] else len(s)
+
+    def _find_ext(w_, a):
+        s = gs(a, w_)
+        return ptr_at(a, s, ext_idx(s), w_) if a else 0
+    reg_path("PathFindExtension", "p", _find_ext, "p")
+
+    def _rm_ext(w_, a):
+        s = gs(a, w_)
+        ws(a, s[:ext_idx(s)], w_)
+        return 0
+    reg_path("PathRemoveExtension", "p", _rm_ext)
+
+    def _ren_ext(w_, a, e):
+        s, x = gs(a, w_), gs(e, w_)
+        r = s[:ext_idx(s)] + x
+        if len(r) >= 260:
+            return 0
+        ws(a, r, w_)
+        return 1
+    reg_path("PathRenameExtension", "pp", _ren_ext)
+
+    def _add_ext(w_, a, e):
+        s = gs(a, w_)
+        if ext_idx(s) != len(s):
+            return 0
+        x = gs(e, w_) if e else ".exe"
+        ws(a, s + x, w_)
+        return 1
+    reg_path("PathAddExtension", "pp", _add_ext)
+
+    def _is_rel(w_, a):
+        s = gs(a, w_)
+        return int(not (s.startswith("\\") or s[1:2] == ":"))
+    reg_path("PathIsRelative", "p", _is_rel)
+
+    def _is_root(w_, a):
+        s = gs(a, w_)
+        if s in ("\\",) or (len(s) == 3 and s[1:] == ":\\"):
+            return 1
+        if s.startswith("\\\\"):
+            return int(s.rstrip("\\").count("\\") <= 3)
+        return 0
+    reg_path("PathIsRoot", "p", _is_root)
+    reg_path("PathIsUNC", "p", lambda w_, a: int(gs(a, w_).startswith("\\\\")))
+    reg_path("PathIsFileSpec", "p", lambda w_, a: int(not any(ch in gs(a, w_) for ch in ":\\")))
+    reg_path("PathIsURL", "p", lambda w_, a: int("://" in gs(a, w_) or
+                                                    gs(a, w_).lower().startswith(("mailto:",
+                                                                                   "file:"))))
+    reg_path("PathIsNetworkPath", "p", lambda w_, a: int(gs(a, w_).startswith("\\\\")))
+
+    def _is_same_root(w_, a, b):
+        return int(_ntp.splitdrive(gs(a, w_))[0].lower() == _ntp.splitdrive(gs(b, w_))[0].lower())
+    reg_path("PathIsSameRoot", "pp", _is_same_root)
+
+    def _is_prefix(w_, pre, path):
+        a_, b_ = gs(pre, w_).rstrip("\\").lower(), gs(path, w_).lower()
+        return int(bool(a_) and (b_ == a_ or b_.startswith(a_ + "\\")))
+    reg_path("PathIsPrefix", "pp", _is_prefix)
+
+    def _quote(w_, a):
+        s = gs(a, w_)
+        if " " in s and not s.startswith('"'):
+            ws(a, '"' + s + '"', w_)
+            return 1
+        return 0
+    reg_path("PathQuoteSpaces", "p", _quote)
+
+    def _unquote(w_, a):
+        s = gs(a, w_)
+        if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+            ws(a, s[1:-1], w_)
+            return 1
+        return 0
+    reg_path("PathUnquoteSpaces", "p", _unquote)
+
+    def _rm_blanks(w_, a):
+        ws(a, gs(a, w_).strip(" "), w_)
+        return 0
+    reg_path("PathRemoveBlanks", "p", _rm_blanks)
+
+    def _canon(w_, dst, src):
+        ws(dst, canon(gs(src, w_)), w_, 260)
+        return 1
+    reg_path("PathCanonicalize", "pp", _canon)
+
+    def _match(w_, f, spec):
+        name = gs(f, w_).lower()
+        for pat in gs(spec, w_).lower().split(";"):
+            pat = pat.strip()
+            if pat and (_fnm.fnmatchcase(name, pat) or
+                        (pat == "*.*" and True) or
+                        _fnm.fnmatchcase(_ntp.basename(name), pat)):
+                return 1
+        return 0
+    reg_path("PathMatchSpec", "pp", _match)
+
+    def args_idx(s):
+        q = False
+        for i, ch in enumerate(s):
+            if ch == '"':
+                q = not q
+            elif ch == " " and not q:
+                return i + 1
+        return len(s)
+
+    def _get_args(w_, a):
+        s = gs(a, w_)
+        return ptr_at(a, s, args_idx(s), w_)
+    reg_path("PathGetArgs", "p", _get_args, "p")
+
+    def _rm_args(w_, a):
+        s = gs(a, w_)
+        i = args_idx(s)
+        if i < len(s) or s.endswith(" "):
+            ws(a, s[:i].rstrip(" "), w_)
+        return 0
+    reg_path("PathRemoveArgs", "p", _rm_args)
+
+    def _strip_root(w_, a):
+        s = gs(a, w_)
+        if s[1:2] == ":":
+            ws(a, s[:3] if s[2:3] == "\\" else s[:2], w_)
+            return 1
+        if s.startswith("\\"):
+            ws(a, "\\", w_)
+            return 1
+        return 0
+    reg_path("PathStripToRoot", "p", _strip_root)
+
+    def _skip_root(w_, a):
+        s = gs(a, w_)
+        if s[1:3] == ":\\":
+            return ptr_at(a, s, 3, w_)
+        if s.startswith("\\\\"):
+            parts = s.split("\\")
+            n = len("\\".join(parts[:4])) + 1
+            return ptr_at(a, s, min(n, len(s)), w_)
+        return 0
+    reg_path("PathSkipRoot", "p", _skip_root, "p")
+
+    def _drive_num(w_, a):
+        s = gs(a, w_)
+        return (ord(s[0].upper()) - 65) & 0xFFFFFFFF if s[1:2] == ":" and s[0].isalpha() \
+            else 0xFFFFFFFF
+    reg_path("PathGetDriveNumber", "p", _drive_num)
+
+    def _build_root(w_, a, n):
+        n = _s32(n)
+        if 0 <= n < 26:
+            ws(a, chr(65 + n) + ":\\", w_)
+        return a
+    reg_path("PathBuildRoot", "pi", _build_root, "p")
+
+    def _next_comp(w_, a):
+        s = gs(a, w_)
+        if not s:
+            return 0
+        i = s.find("\\")
+        return ptr_at(a, s, len(s) if i < 0 else i + 1, w_)
+    reg_path("PathFindNextComponent", "p", _next_comp, "p")
+
+    def _common_prefix(w_, a, b, out):
+        x, y = gs(a, w_).split("\\"), gs(b, w_).split("\\")
+        common = []
+        for s1, s2 in zip(x, y):
+            if s1.lower() != s2.lower():
+                break
+            common.append(s1)
+        r = "\\".join(common)
+        if len(common) == 1 and r.endswith(":"):
+            r += "\\"
+        if out:
+            ws(out, r, w_, 260)
+        return len(r)
+    reg_path("PathCommonPrefix", "ppp", _common_prefix)
+
+    def _compact_ex(w_, out, src, cch, flags):
+        s = gs(src, w_)
+        if len(s) >= cch:
+            name = s[fname_idx(s):]
+            keep = cch - 1 - 3 - len(name) - 1
+            s = (s[:max(0, keep)] + "...\\" + name) if keep > 0 else ("..." + name)[:cch - 1]
+        ws(out, s, w_, cch)
+        return 1
+    reg_path("PathCompactPathEx", "ppuu", _compact_ex)
+
+    def _rel_to(w_, out, frm, fa, to, ta):
+        f, t = gs(frm, w_), gs(to, w_)
+        if not (fa & 0x10):
+            f = _ntp.dirname(f)
+        if _ntp.splitdrive(f)[0].lower() != _ntp.splitdrive(t)[0].lower():
+            return 0
+        try:
+            r = _ntp.relpath(t, f)
+        except ValueError:
+            return 0
+        if not r.startswith(".."):
+            r = ".\\" + r
+        ws(out, r, w_, 260)
+        return 1
+    reg_path("PathRelativePathTo", "ppupu", _rel_to)
+
+    def _make_pretty(w_, a):
+        return 0
+    reg_path("PathMakePretty", "p", _make_pretty)
+
+    # ---- shlwapi Str* ----------------------------------------------------------------------
+    def reg_str(name, sig, fn, ret="i"):
+        reg_path(name, sig, fn, ret)
+
+    def cmp(a, b):
+        return (a > b) - (a < b)
+
+    reg_str("StrCmpI", "pp", lambda w_, a, b: cmp(gs(a, w_).lower(), gs(b, w_).lower()) & 0xFFFFFFFF)
+    reg_str("StrCmp", "pp", lambda w_, a, b: cmp(gs(a, w_), gs(b, w_)) & 0xFFFFFFFF)
+    reg_str("StrCmpNI", "ppi", lambda w_, a, b, n: cmp(gs(a, w_)[:n].lower(),
+                                                       gs(b, w_)[:n].lower()) & 0xFFFFFFFF)
+    reg_str("StrCmpN", "ppi", lambda w_, a, b, n: cmp(gs(a, w_)[:n], gs(b, w_)[:n]) & 0xFFFFFFFF)
+
+    def natural_key(s):
+        import re as _re
+        return [(0, int(t), "") if t.isdigit() else (1, 0, t)
+                for t in _re.split(r"(\d+)", s.lower()) if t]
+    R("StrCmpLogicalW", "pp", dlls=SHL)(
+        lambda c, a, b: cmp(natural_key(gs(a, True)), natural_key(gs(b, True))) & 0xFFFFFFFF)
+
+    def _strstr(w_, a, b, ci):
+        s, t = gs(a, w_), gs(b, w_)
+        i = (s.lower().find(t.lower()) if ci else s.find(t)) if a and b else -1
+        return ptr_at(a, s, i, w_) if i >= 0 else 0
+    reg_str("StrStrI", "pp", lambda w_, a, b: _strstr(w_, a, b, True), "p")
+    reg_str("StrStr", "pp", lambda w_, a, b: _strstr(w_, a, b, False), "p")
+
+    def _strchr(w_, a, ch, ci, rev, end=0):
+        s = gs(a, w_)
+        if end:
+            s = s[:max(0, (end - a) // (2 if w_ else 1))]
+        c_ = chr(ch & 0xFFFF)
+        hay = s.lower() if ci else s
+        c_ = c_.lower() if ci else c_
+        i = hay.rfind(c_) if rev else hay.find(c_)
+        return ptr_at(a, s, i, w_) if i >= 0 else 0
+    reg_str("StrChr", "pu", lambda w_, a, ch: _strchr(w_, a, ch, False, False), "p")
+    reg_str("StrChrI", "pu", lambda w_, a, ch: _strchr(w_, a, ch, True, False), "p")
+    reg_str("StrRChr", "ppu", lambda w_, a, e, ch: _strchr(w_, a, ch, False, True, e), "p")
+    reg_str("StrRChrI", "ppu", lambda w_, a, e, ch: _strchr(w_, a, ch, True, True, e), "p")
+
+    def _pbrk(w_, a, set_):
+        s, cs = gs(a, w_), gs(set_, w_)
+        for i, ch in enumerate(s):
+            if ch in cs:
+                return ptr_at(a, s, i, w_)
+        return 0
+    reg_str("StrPBrk", "pp", _pbrk, "p")
+
+    def _spn(w_, a, set_, inv):
+        s, cs = gs(a, w_), gs(set_, w_)
+        n = 0
+        for ch in s:
+            if (ch in cs) == inv:
+                break
+            n += 1
+        return n
+    reg_str("StrSpn", "pp", lambda w_, a, s_: _spn(w_, a, s_, False))
+    reg_str("StrCSpn", "pp", lambda w_, a, s_: _spn(w_, a, s_, True))
+
+    def _dup(w_, a):
+        data = enc(gs(a, w_), w_)
+        r = alloc(len(data))
+        M_.write(r, data)
+        return r
+    reg_str("StrDup", "p", _dup, "p")
+
+    def _shstrdup(a, pp, wide_):
+        data = enc(gs(a, wide_), True)              # always returns a wide copy
+        r = alloc(len(data))
+        M_.write(r, data)
+        put_ptr(pp, r)
+        return 0
+    R("SHStrDupA", "pp", dlls=SHL)(lambda c, a, pp: _shstrdup(a, pp, False))
+    R("SHStrDupW", "pp", dlls=SHL)(lambda c, a, pp: _shstrdup(a, pp, True))
+
+    def to_int(s):
+        s = s.lstrip(" \t")
+        neg = s.startswith("-")
+        s = s.lstrip("+-")
+        n = 0
+        for ch in s:
+            if not ch.isdigit():
+                break
+            n = n * 10 + int(ch)
+        return -n if neg else n
+    reg_str("StrToInt", "p", lambda w_, a: to_int(gs(a, w_)) & 0xFFFFFFFF)
+
+    def _to_int_ex(w_, a, flags, out):
+        s = gs(a, w_).strip()
+        try:
+            if flags & 1 and s.lower().startswith(("0x", "-0x", "+0x")):
+                v = int(s, 16)
+            else:
+                v = to_int(s)
+                if not s.lstrip("+-")[:1].isdigit():
+                    return 0
+        except ValueError:
+            return 0
+        if out:
+            M_.write32(out, v & 0xFFFFFFFF)
+        return 1
+    reg_str("StrToIntEx", "pup", _to_int_ex)
+
+    def _trim(w_, a, chars):
+        s, cs = gs(a, w_), gs(chars, w_)
+        t = s.strip(cs)
+        if t != s:
+            ws(a, t, w_)
+            return 1
+        return 0
+    reg_str("StrTrim", "pp", _trim)
+
+    def byte_size(n):
+        if n < 1024:
+            return "%d bytes" % n
+        for unit in ("KB", "MB", "GB", "TB", "PB"):
+            n /= 1024.0
+            if n < 1024 or unit == "PB":
+                return ("%.3g" % n if n < 100 else "%d" % n) + " " + unit
+        return "%d bytes" % n
+
+    R("StrFormatByteSizeW", "Qpu", "p", dlls=SHL)(
+        lambda c, n, buf, cch: (ws(buf, byte_size(n), True, cch), buf)[1])
+    R("StrFormatByteSize64A", "Qpu", "p", dlls=SHL)(
+        lambda c, n, buf, cch: (ws(buf, byte_size(n), False, cch), buf)[1])
+
+    @R("StrFormatByteSizeA", "upu", "p", dlls=SHL)
+    def _fmt_bytes_a(c, n, buf, cch):
+        ws(buf, byte_size(n), False, cch)
+        return buf
+
+    R("StrFormatKBSizeW", "Qpu", "p", dlls=SHL)(
+        lambda c, n, buf, cch: (ws(buf, "{:,} KB".format((n + 1023) // 1024), True, cch), buf)[1])
+    R("StrFormatKBSizeA", "Qpu", "p", dlls=SHL)(
+        lambda c, n, buf, cch: (ws(buf, "{:,} KB".format((n + 1023) // 1024), False, cch), buf)[1])
+
+    reg_str("ChrCmpI", "uu", lambda w_, a, b: int(chr(a & 0xFFFF).lower() != chr(b & 0xFFFF).lower()))
+    R("IsCharSpaceW", "u", dlls=SHL)(lambda c, ch: int(chr(ch & 0xFFFF).isspace()))
+    R("IsCharSpaceA", "u", dlls=SHL)(lambda c, ch: int(chr(ch & 0xFF).isspace()))
+
+    @R("StrCpyW", "pp", "p", dlls=SHL)
+    def _StrCpyW(c, d, s):
+        ws(d, gs(s, True), True)
+        return d
+
+    @R("StrCpyNW", "ppi", "p", dlls=SHL)
+    def _StrCpyNW(c, d, s, n):
+        ws(d, gs(s, True), True, n)
+        return d
+
+    @R("StrCatW", "pp", "p", dlls=SHL)
+    def _StrCatW(c, d, s):
+        ws(d, gs(d, True) + gs(s, True), True)
+        return d
+
+    @R("StrCatBuffW", "ppi", "p", dlls=SHL)
+    def _StrCatBuffW(c, d, s, n):
+        ws(d, gs(d, True) + gs(s, True), True, n)
+        return d
+
+    @R("StrCatBuffA", "ppi", "p", dlls=SHL)
+    def _StrCatBuffA(c, d, s, n):
+        ws(d, gs(d, False) + gs(s, False), False, n)
+        return d
+
+    R("AssocQueryStringA AssocQueryStringW", "uupppp", dlls=SHL)(
+        lambda c, f, t, a, e, o, pc: 0x80070483)             # HRESULT(ERROR_NO_ASSOCIATION)
+    R("SHLoadIndirectString", "pupp", dlls=SHL)(lambda c, s, o, n, r: 0x80004001)
+    R("PathCchCanonicalize", "pup", dlls=("api-ms-win-core-path-l1-1-0.dll", "kernelbase.dll"))(
+        lambda c, out, cch, src: (ws(out, canon(gs(src, True)), True, cch), 0)[1])
+    R("PathCchCombine", "pupp", dlls=("api-ms-win-core-path-l1-1-0.dll", "kernelbase.dll"))(
+        lambda c, out, cch, a, b: (_combine(True, out, a, b), 0)[1] if cch else 0x80070057)
+
+
+# ==========================================================================================
+# 10p. comdlg32 + SHBrowseForFolder: common dialogs built from real windows (so they render
+#      in every display and can be driven by scripts), browsing only the guest filesystem
+# ==========================================================================================
+_CD_BASIC_COLORS = [
+    0x8080FF, 0x80FFFF, 0x80FF80, 0x80FF00, 0xFFFF80, 0xFF8000, 0xC080FF, 0xFF80FF,
+    0x0000FF, 0x00FFFF, 0x00FF80, 0x40FF00, 0xFFFF00, 0xC08000, 0xC08080, 0xFF00FF,
+    0x404080, 0x4080FF, 0x00FF00, 0x808000, 0x804000, 0xFF8080, 0x400080, 0x8000FF,
+    0x000080, 0x0080FF, 0x008000, 0x408000, 0xFF0000, 0xA00000, 0x800080, 0xFF0080,
+    0x000040, 0x004080, 0x004000, 0x404000, 0x800000, 0x400000, 0x400040, 0x800040,
+    0x000000, 0x008080, 0x408080, 0x808080, 0x808040, 0xC0C0C0, 0x400040, 0xFFFFFF]
+
+
+def _comdlg_install(k):
+    p = k.p
+    wm = p.wm
+    M_ = p.mem
+    R = k.reg
+    CD = ("comdlg32.dll",)
+    SH = ("shell32.dll",)
+    import ntpath as ntp
+    import fnmatch as fnm
+
+    state = {"err": 0, "last_dir": None}
+
+    def P():
+        return wm.ps
+
+    def rp(a):
+        return wm.rp(a)
+
+    def gs(a, wide):
+        return _gstr(M_, a, -1, wide) if a else ""
+
+    def enc(s, wide):
+        return s.encode("utf-16-le") + b"\0\0" if wide else s.encode("utf-8", "replace") + b"\0"
+
+    def set_err(e):
+        state["err"] = e
+        return 0
+
+    # ---- dialog scaffolding ---------------------------------------------------------------
+    def new_dialog(owner, title, cw, ch):
+        fo = _GFontObj(-11, face="MS Shell Dlg")
+        hfont = wm.gdi.add(fo)
+        tmp = _Wnd(0)
+        tmp.style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME
+        tmp.exstyle = WS_EX_DLGMODALFRAME
+        L = _nc_layout(wm, tmp)
+        W, H = cw + 2 * L["b"], ch + 2 * L["b"] + L["cap"]
+        ow = wm.wnd(owner)
+        if ow is not None and ow.style & WS_VISIBLE:
+            t = wm.top(ow)
+            x, y = t.x + (t.w - W) // 2, t.y + (t.h - H) // 2
+        else:
+            x, y = (wm.gdi.screen.w - W) // 2, (wm.gdi.screen.h - H) // 2
+        x = max(0, min(x, wm.gdi.screen.w - W))
+        y = max(0, min(y, wm.gdi.screen.h - H))
+        wm.dlg_pending = {"proc": 0, "font": hfont, "base": (6, 13), "wide": True}
+        try:
+            hwnd = wm.create(WS_EX_DLGMODALFRAME, wm.find_class("#32770"), title,
+                             WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME, x, y, W, H,
+                             owner if ow is not None else 0, 0, 0, 0, True)
+        finally:
+            wm.dlg_pending = None
+        w = wm.wnd(hwnd)
+        if w is not None:
+            w.py["dlg"] = True
+            wm.send(hwnd, WM_SETFONT, hfont, 0)
+        return hwnd, w, hfont
+
+    def ctl(dlg, cls, text, style, x, y, cx, cy, cid, ex=0):
+        h = wm.create(ex, wm.find_class(cls), text, WS_CHILD | WS_VISIBLE | style, x, y, cx, cy,
+                      dlg, cid, 0, 0, True)
+        f = wm.wnd(dlg).font if wm.wnd(dlg) is not None else 0
+        if h and f:
+            wm.send(h, WM_SETFONT, f, 0)
+        return h
+
+    def child(dlg, cid):
+        d = wm.wnd(dlg)
+        if d is None:
+            return None
+        for c in d.children:
+            if c.id == cid:
+                return c
+        return None
+
+    def send_s(h, msg, wp, s):
+        mark = wm.scratch_mark()
+        try:
+            return wm.send(h, msg, wp, wm.scratch(enc(s, True)))
+        finally:
+            wm.scratch_release(mark)
+
+    def set_text(h, s):
+        return send_s(h, 0x000C, 0, s)
+
+    def get_text(h):
+        c = wm.wnd(h)
+        return c.text if c is not None else ""
+
+    def run_modal(hwnd, w, owner, proc, hfont, focus=None):
+        addr = wm.register_pyproc(proc)
+        _dlg_set_proc(wm, w, addr)
+        wm.send(hwnd, WM_INITDIALOG, focus or 0, 0)
+        wm.show(w, 1)
+        f = wm.wnd(focus) if focus else None
+        if f is None:
+            f = _dlg_next_tab(wm, w, None, False)
+        if f is not None:
+            _dlg_set_focus(wm, w, f)
+        ow = wm.wnd(owner)
+        try:
+            return _dialog_modal(wm, hwnd, owner if ow is not None else 0)
+        finally:
+            wm.gdi.objs.pop(hfont, None)
+            wm.pyprocs.pop(addr, None)
+
+    def nm_code(lp):
+        return _s32(M_.read32(lp + (16 if P() == 8 else 8)))
+
+    def nm_id(lp):
+        return rp(lp + P()) & 0xFFFFFFFF
+
+    def headless_cancel(what):
+        disp = wm.ensure_display()
+        if disp is None or disp.auto_answer():
+            p.log.info("[GUI] %s: no interactive display — cancelled" % what)
+            return True
+        return False
+
+    def msgbox(owner, text, caption, style):
+        return _message_box(wm, owner, text, caption, style)
+
+    # ---- guest filesystem helpers -----------------------------------------------------------
+    def host(path):
+        try:
+            return p.vfs.resolve(path)
+        except Exception:
+            return None
+
+    def is_dir(path):
+        h = host(path)
+        return bool(h) and os.path.isdir(h)
+
+    def exists(path):
+        h = host(path)
+        return bool(h) and os.path.exists(h)
+
+    def listdir(path):
+        h = host(path)
+        try:
+            names = os.listdir(h) if h else []
+        except OSError:
+            names = []
+        dirs, files = [], []
+        for n in names:
+            (dirs if os.path.isdir(os.path.join(h, n)) else files).append(n)
+        key = str.lower
+        return sorted(dirs, key=key), sorted(files, key=key)
+
+    def drives():
+        root = getattr(p.vfs, "root", None)
+        out = []
+        try:
+            for n in sorted(os.listdir(root)):
+                if len(n) == 1 and n.isalpha() and os.path.isdir(os.path.join(root, n)):
+                    out.append(n.upper() + ":\\")
+        except (OSError, TypeError):
+            pass
+        return out or ["C:\\"]
+
+    def norm(path):
+        path = path.replace("/", "\\")
+        d, rest = ntp.splitdrive(path)
+        if not d:
+            return path
+        parts = [x for x in rest.split("\\") if x and x != "."]
+        out = []
+        for x in parts:
+            if x == "..":
+                if out:
+                    out.pop()
+            else:
+                out.append(x)
+        return d.upper() + "\\" + "\\".join(out)
+
+    def cwd():
+        try:
+            return p.vfs.getcwd()
+        except Exception:
+            return "C:\\"
+
+    # ---- icons for list/tree views ---------------------------------------------------------
+    icons = {}
+
+    def small_icons():
+        h = icons.get("il")
+        if h is None or wm.gdi.get(h, "imagelist") is None:
+            s = _Surf(48, 16, b"\xc0\xc0\xc0\x00")
+            clip = [(0, 0, 48, 16)]
+
+            def r(l, t, rr, b, cr):
+                _fill(s, clip, l, t, rr, b, _cr_pix(cr))
+            # 0: folder
+            r(1, 3, 7, 5, 0x0080C0)
+            r(1, 4, 15, 14, 0x0080C0)
+            r(2, 6, 14, 13, 0x40D0FF)
+            # 1: document
+            r(19, 1, 29, 15, 0x404040)
+            r(20, 2, 28, 14, 0xFFFFFF)
+            for yy in (5, 7, 9, 11):
+                r(22, yy, 27, yy + 1, 0xA0A0A0)
+            # 2: drive
+            r(33, 5, 47, 12, 0x404040)
+            r(34, 6, 46, 11, 0xC8C8C8)
+            r(43, 8, 45, 9, 0x00C000)
+            il = _ImageList(16, 16, 0x21)
+            il.add_surface(s, key=b"\xc0\xc0\xc0")
+            h = icons["il"] = wm.gdi.add(il)
+        return h
+
+    # ---- list view / tree view helpers -----------------------------------------------------
+    def lv_clear(h):
+        wm.send(h, 0x1009, 0, 0)                                  # LVM_DELETEALLITEMS
+
+    def lv_add(h, i, text, img, param):
+        mark = wm.scratch_mark()
+        try:
+            t = wm.scratch(enc(text, True))
+            if P() == 8:
+                it = struct.pack("<IiiII4xQiiq", 0x1 | 0x2 | 0x4, i, 0, 0, 0, t, 0, img, param)
+            else:
+                it = struct.pack("<IiiIIIiiI", 0x1 | 0x2 | 0x4, i, 0, 0, 0, t, 0, img,
+                                 param & 0xFFFFFFFF)
+            return _s32(wm.send(h, 0x104D, 0, wm.scratch(it + bytes(32))) & 0xFFFFFFFF)
+        finally:
+            wm.scratch_release(mark)
+
+    def lv_selected(h):
+        out = []
+        i = -1
+        while True:
+            i = _s32(wm.send(h, 0x100C, i & 0xFFFFFFFF, 2) & 0xFFFFFFFF)   # LVNI_SELECTED
+            if i < 0:
+                return out
+            out.append(i)
+
+    def lv_param(h, i):
+        mark = wm.scratch_mark()
+        try:
+            if P() == 8:
+                a = wm.scratch(struct.pack("<Iii", 0x4, i, 0) + bytes(60))
+                wm.send(h, 0x104B, 0, a)
+                return struct.unpack("<q", M_.read(a + 40, 8))[0]
+            a = wm.scratch(struct.pack("<Iii", 0x4, i, 0) + bytes(48))
+            wm.send(h, 0x104B, 0, a)
+            return _s32(M_.read32(a + 32))
+        finally:
+            wm.scratch_release(mark)
+
+    def tv_insert(h, parent, text, param, kids, img=0):
+        mark = wm.scratch_mark()
+        try:
+            t = wm.scratch(enc(text, True))
+            TVI_LAST = (-0xFFFE) & (M64 if P() == 8 else 0xFFFFFFFF)
+            mask = 0x1 | 0x2 | 0x4 | 0x20 | 0x40                   # TEXT PARAM ... CHILDREN
+            if P() == 8:
+                s = struct.pack("<QQ", parent, TVI_LAST) + struct.pack(
+                    "<IIQIIQiiiiQ", mask, 0, 0, 0, 0, t, 0, img, img, 1 if kids else 0, param)
+            else:
+                # x86 TVITEM: mask, hItem, state, stateMask, pszText, cchTextMax, iImage,
+                # iSelectedImage, cChildren, lParam
+                s = struct.pack("<II", parent, TVI_LAST) + struct.pack(
+                    "<IIIIIiiiiI", mask, 0, 0, 0, t, 0, img, img, 1 if kids else 0,
+                    param & 0xFFFFFFFF)
+            return wm.send(h, 0x1132, 0, wm.scratch(s + bytes(16)))  # TVM_INSERTITEMW
+        finally:
+            wm.scratch_release(mark)
+
+    def nm_tv_item(lp):
+        """(hItem, lParam) of NMTREEVIEW.itemNew."""
+        if P() == 8:
+            base = 24 + 8 + 56
+            return struct.unpack("<Q", M_.read(base + lp + 8, 8))[0], \
+                struct.unpack("<q", M_.read(base + lp + 48, 8))[0]
+        base = 12 + 4 + 40
+        return M_.read32(lp + base + 4), _s32(M_.read32(lp + base + 36))
+
+    # =====================================================================================
+    # GetOpenFileName / GetSaveFileName
+    # =====================================================================================
+    def ofn_layout():
+        if P() == 8:
+            return {"owner": 8, "filter": 24, "cfilter": 32, "fidx": 44, "file": 48, "nfile": 56,
+                    "ftitle": 64, "nftitle": 72, "idir": 80, "title": 88, "flags": 96,
+                    "foff": 100, "fext": 102, "defext": 104}
+        return {"owner": 4, "filter": 12, "cfilter": 16, "fidx": 24, "file": 28, "nfile": 32,
+                "ftitle": 36, "nftitle": 40, "idir": 44, "title": 48, "flags": 52,
+                "foff": 56, "fext": 58, "defext": 60}
+
+    def parse_filter(a, wide):
+        out = []
+        if not a:
+            return out
+        items = []
+        while len(items) < 256:
+            s = gs(a, wide)
+            if not s:
+                break
+            items.append(s)
+            a += len(enc(s, wide))
+        for i in range(0, len(items) - 1, 2):
+            out.append((items[i], items[i + 1]))
+        return out
+
+    def file_dialog(c, ofn, wide, save):
+        state["err"] = 0
+        if not ofn:
+            return set_err(0x0002)                              # CDERR_INITIALIZATION
+        L = ofn_layout()
+        owner = rp(ofn + L["owner"]) & 0xFFFFFFFF
+        flags = M_.read32(ofn + L["flags"])
+        filters = parse_filter(rp(ofn + L["filter"]), wide) or [("All Files (*.*)", "*.*")]
+        fidx = max(1, min(M_.read32(ofn + L["fidx"]) or 1, len(filters)))
+        fbuf, nfile = rp(ofn + L["file"]), M_.read32(ofn + L["nfile"])
+        title = gs(rp(ofn + L["title"]), wide) or ("Save As" if save else "Open")
+        defext = gs(rp(ofn + L["defext"]), wide)
+        init_file = gs(fbuf, wide) if fbuf else ""
+        idir = gs(rp(ofn + L["idir"]), wide)
+        multi = bool(flags & 0x200)
+        if flags & 0x60:
+            p.log.info("[GUI] %s: hook/template customisation ignored" % title)
+        start = None
+        if init_file and ("\\" in init_file or ":" in init_file):
+            d = ntp.dirname(init_file)
+            if d and is_dir(d):
+                start, init_file = norm(d), ntp.basename(init_file)
+        if start is None and idir and is_dir(idir):
+            start = norm(idir)
+        if start is None:
+            start = state["last_dir"] if state["last_dir"] and is_dir(state["last_dir"]) \
+                else norm(cwd())
+        if any(ch in init_file for ch in "*?"):
+            init_file = ""
+        if headless_cancel(title):
+            return 0
+        st = {"dir": start, "entries": [], "fidx": fidx, "pattern": None, "result": None}
+
+        hwnd, w, hfont = new_dialog(owner, title, 440, 300)
+        if w is None:
+            return set_err(0x0002)
+        ctl(hwnd, "Static", "Look &in:", 0, 8, 12, 60, 14, 0x443)
+        cmb_dir = ctl(hwnd, "ComboBox", "", 3 | WS_VSCROLL | WS_TABSTOP, 72, 8, 280, 200, 0x471)
+        ctl(hwnd, "Button", "Up", WS_TABSTOP, 360, 8, 40, 22, 0x4A0)
+        lv_style = 3 | 0x8 | (0 if multi else 0x4) | WS_TABSTOP | WS_BORDER
+        lst = ctl(hwnd, "SysListView32", "", lv_style, 8, 38, 424, 176, 0x460, WS_EX_CLIENTEDGE)
+        wm.send(lst, 0x1003, 1, small_icons())                    # LVM_SETIMAGELIST small
+        ctl(hwnd, "Static", "File &name:", 0, 8, 227, 88, 14, 0x442)
+        edt = ctl(hwnd, "Edit", init_file, 0x80 | WS_TABSTOP, 100, 223, 240, 22, 0x480,
+                  WS_EX_CLIENTEDGE)
+        ctl(hwnd, "Button", "&Save" if save else "&Open", 1 | WS_TABSTOP, 352, 222, 80, 24, IDOK)
+        ctl(hwnd, "Static", "Files of &type:", 0, 8, 258, 88, 14, 0x441)
+        cmb_ft = ctl(hwnd, "ComboBox", "", 3 | WS_VSCROLL | WS_TABSTOP, 100, 254, 240, 200, 0x470)
+        ctl(hwnd, "Button", "Cancel", WS_TABSTOP, 352, 253, 80, 24, IDCANCEL)
+        for desc, _pat in filters:
+            send_s(cmb_ft, 0x143, 0, desc)                         # CB_ADDSTRING
+        wm.send(cmb_ft, 0x14E, fidx - 1, 0)                        # CB_SETCURSEL
+        w.py["defid"] = IDOK
+
+        def patterns():
+            pat = st["pattern"] or filters[st["fidx"] - 1][1]
+            return [x.strip().lower() for x in pat.split(";") if x.strip()]
+
+        def matches(name):
+            n = name.lower()
+            for pt in patterns():
+                if pt in ("*.*", "*") or fnm.fnmatchcase(n, pt):
+                    return True
+            return False
+
+        def refresh():
+            d = st["dir"]
+            dirs, files = listdir(d)
+            ents = [(n, True) for n in dirs] + [(n, False) for n in files if matches(n)]
+            st["entries"] = ents
+            lv_clear(lst)
+            for i, (n, isd) in enumerate(ents):
+                lv_add(lst, i, n, 0 if isd else 1, i)
+            # the "Look in" chain: drives + every ancestor of the current directory
+            wm.send(cmb_dir, 0x14B, 0, 0)                          # CB_RESETCONTENT
+            chain = []
+            cur = d
+            while True:
+                chain.append(cur)
+                parent = ntp.dirname(cur.rstrip("\\"))
+                parent = parent + "\\" if parent.endswith(":") else parent
+                if not parent or parent == cur:
+                    break
+                cur = parent
+            chain.reverse()
+            items = []
+            for dr in drives():
+                items.append(dr)
+                if chain and chain[0].upper() == dr.upper():
+                    items.extend(chain[1:])
+            st["chain"] = items
+            for it in items:
+                depth = 0 if len(it) <= 3 else it.rstrip("\\").count("\\")
+                send_s(cmb_dir, 0x143, 0, "  " * depth + (it if len(it) <= 3 else ntp.basename(it)))
+            try:
+                wm.send(cmb_dir, 0x14E, items.index(d), 0)
+            except ValueError:
+                pass
+
+        def navigate(d):
+            d = norm(d)
+            if not is_dir(d):
+                return False
+            st["dir"] = d
+            refresh()
+            return True
+
+        def pick_name_from_list():
+            sel = lv_selected(lst)
+            files = [st["entries"][i][0] for i in sel if i < len(st["entries"]) and
+                     not st["entries"][i][1]]
+            if not files:
+                return
+            if len(files) == 1:
+                set_text(edt, files[0])
+            else:
+                set_text(edt, " ".join('"%s"' % f for f in files))
+
+        def finish(names):
+            d = st["dir"]
+            if len(names) == 1:
+                full = names[0]
+                out = full
+                foff = len(ntp.dirname(full).rstrip("\\")) + 1 if "\\" in full else 0
+                if len(full) >= 3 and full[1:3] == ":\\" and full.count("\\") == 1:
+                    foff = 3
+            else:
+                out = d.rstrip("\\") + "\0" + "\0".join(ntp.basename(n) for n in names)
+                foff = len(d.rstrip("\\")) + 1
+            data_len = len(out) + 2 if len(names) > 1 else len(out) + 1
+            if fbuf and nfile < data_len:
+                if nfile >= 2:
+                    M_.write(fbuf, struct.pack("<H", data_len & 0xFFFF))
+                return "small"
+            if fbuf:
+                M_.write(fbuf, enc(out, wide) + ((b"\0\0" if wide else b"\0") if len(names) > 1
+                                                  else b""))
+            first = names[0]
+            base = ntp.basename(first)
+            dot = base.rfind(".")
+            fext = (foff + dot + 1) if dot > 0 and len(names) == 1 else (len(out) if
+                                                                          len(names) == 1 else 0)
+            M_.write(ofn + L["foff"], struct.pack("<HH", foff & 0xFFFF, fext & 0xFFFF))
+            M_.write32(ofn + L["fidx"], st["fidx"])
+            ft, nft = rp(ofn + L["ftitle"]), M_.read32(ofn + L["nftitle"])
+            if ft and nft:
+                t_ = base[:nft - 1]
+                M_.write(ft, enc(t_, wide))
+            if not (flags & 0x8):                                   # !OFN_NOCHANGEDIR
+                try:
+                    p.vfs.setcwd(d)
+                except Exception:
+                    pass
+            state["last_dir"] = d
+            return "ok"
+
+        def accept():
+            text = get_text(edt).strip()
+            if not text:
+                sel = lv_selected(lst)
+                if sel and st["entries"][sel[0]][1]:
+                    navigate(ntp.join(st["dir"], st["entries"][sel[0]][0]))
+                return
+            if any(ch in text for ch in "*?") and '"' not in text:
+                st["pattern"] = text
+                refresh()
+                set_text(edt, "")
+                return
+            if multi and '"' in text:
+                names = [x for x in text.split('"') if x.strip()]
+            else:
+                names = [text.strip('"')]
+            full = []
+            for n in names:
+                q = n if (n[1:2] == ":" or n.startswith("\\")) else ntp.join(st["dir"], n)
+                full.append(norm(q if q[1:2] == ":" else st["dir"][:2] + q))
+            if len(full) == 1 and is_dir(full[0]):
+                navigate(full[0])
+                set_text(edt, "")
+                return
+            for i, f in enumerate(full):
+                base = ntp.basename(f)
+                if defext and "." not in base and not (exists(f)):
+                    full[i] = f = f + "." + defext.lstrip(".")
+                    base = ntp.basename(f)
+                parent = ntp.dirname(f)
+                if flags & 0x800 or save:                           # OFN_PATHMUSTEXIST
+                    if not is_dir(parent if not parent.endswith(":") else parent + "\\"):
+                        msgbox(hwnd, "%s\nPath does not exist.\nCheck the path and try again."
+                               % f, title, 0x30)
+                        return
+                if not save and flags & 0x1000 and not exists(f):    # OFN_FILEMUSTEXIST
+                    msgbox(hwnd, "%s\nFile not found.\nCheck the file name and try again."
+                           % base, title, 0x30)
+                    return
+                if save and flags & 0x2 and exists(f):              # OFN_OVERWRITEPROMPT
+                    if msgbox(hwnd, "%s already exists.\nDo you want to replace it?" % base,
+                              "Confirm Save As", 0x34) != IDYES:
+                        return
+                if save and flags & 0x2000 and not exists(f):       # OFN_CREATEPROMPT
+                    if msgbox(hwnd, "%s does not exist.\nDo you want to create it?" % base,
+                              title, 0x34) != IDYES:
+                        return
+            st["dir"] = norm(ntp.dirname(full[0]) or st["dir"])
+            r = finish(full)
+            if r == "small":
+                st["result"] = 0
+                set_err(0x3003)                                    # FNERR_BUFFERTOOSMALL
+            else:
+                st["result"] = 1
+            _end_dialog(wm, hwnd, st["result"])
+
+        def proc(h, msg, wp, lp, wide_):
+            if msg == WM_INITDIALOG:
+                refresh()
+                return 1
+            if msg == 0x0111:
+                cid, code = wp & 0xFFFF, (wp >> 16) & 0xFFFF
+                if cid == IDOK:
+                    accept()
+                    return 1
+                if cid == IDCANCEL:
+                    _end_dialog(wm, h, 0)
+                    return 1
+                if cid == 0x4A0 and code == 0:                     # Up one level
+                    parent = ntp.dirname(st["dir"].rstrip("\\"))
+                    navigate(parent + "\\" if parent.endswith(":") else parent or st["dir"])
+                    return 1
+                if cid == 0x470 and code == 1:                     # file type changed
+                    st["fidx"] = (wm.send(cmb_ft, 0x147, 0, 0) & 0xFFFF) + 1
+                    st["pattern"] = None
+                    refresh()
+                    return 1
+                if cid == 0x471 and code == 1:                     # look-in changed
+                    i = _s32(wm.send(cmb_dir, 0x147, 0, 0) & 0xFFFFFFFF)
+                    if 0 <= i < len(st.get("chain", [])):
+                        navigate(st["chain"][i])
+                    return 1
+                return 0
+            if msg == 0x004E and nm_id(lp) == 0x460:
+                code = nm_code(lp)
+                if code == -101:                                   # LVN_ITEMCHANGED
+                    pick_name_from_list()
+                elif code in (-3, -4):                             # NM_DBLCLK / NM_RETURN
+                    sel = lv_selected(lst)
+                    if sel and sel[0] < len(st["entries"]):
+                        n, isd = st["entries"][sel[0]]
+                        if isd:
+                            navigate(ntp.join(st["dir"], n))
+                            set_text(edt, "")
+                        else:
+                            set_text(edt, n)
+                            accept()
+                elif code == -155:                                 # LVN_KEYDOWN
+                    vk = M_.read16(lp + (24 if P() == 8 else 12)) if hasattr(M_, "read16") else \
+                        struct.unpack("<H", M_.read(lp + (24 if P() == 8 else 12), 2))[0]
+                    if vk == 0x08:
+                        wm.send(h, 0x0111, 0x4A0, 0)
+                return 0
+            return 0
+
+        res = run_modal(hwnd, w, owner, proc, hfont, focus=edt)
+        return 1 if res == 1 and st["result"] == 1 else 0
+
+    R("GetOpenFileNameA", "p", dlls=CD)(lambda c, a: file_dialog(c, a, False, False))
+    R("GetOpenFileNameW", "p", dlls=CD)(lambda c, a: file_dialog(c, a, True, False))
+    R("GetSaveFileNameA", "p", dlls=CD)(lambda c, a: file_dialog(c, a, False, True))
+    R("GetSaveFileNameW", "p", dlls=CD)(lambda c, a: file_dialog(c, a, True, True))
+    R("CommDlgExtendedError", "", dlls=CD)(lambda c: state["err"])
+
+    def _file_title(c, path, buf, cb, wide):
+        s = gs(path, wide)
+        if not s or any(ch in s for ch in "*?<>|"):
+            return -1 & 0xFFFF
+        t = ntp.basename(s)
+        n = len(t) + 1
+        if not buf or cb < n:
+            return n
+        M_.write(buf, enc(t, wide))
+        return 0
+
+    R("GetFileTitleA", "ppu", dlls=CD)(lambda c, a, b, n: _file_title(c, a, b, n, False))
+    R("GetFileTitleW", "ppu", dlls=CD)(lambda c, a, b, n: _file_title(c, a, b, n, True))
+
+    # =====================================================================================
+    # ChooseColor
+    # =====================================================================================
+    def swatch_proc(hwnd, msg, wp, lp, wide):
+        w = wm.wnd(hwnd)
+        if w is None:
+            return 0
+        if msg in (0x000F, WM_PRINTCLIENT):
+            def draw(pt):
+                W_, H_ = w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]
+                pt.fill_brush(0, 0, W_, H_, wm.gdi.sys_brush(COLOR_BTNFACE).h)
+                sel = w.py.get("sel")
+                _draw_edge(pt, (1, 1, W_ - 1, H_ - 1), 10, 15)
+                col = w.py.get("color", 0)
+                b = _GBrush(0, col)
+                hb = wm.gdi.add(b)
+                pt.fill_brush(3, 3, W_ - 3, H_ - 3, hb)
+                wm.gdi.objs.pop(hb, None)
+                if sel:
+                    _focus_rect(pt, 0, 0, W_, H_)
+            _ctl_paint(wm, w, draw, wp if msg == WM_PRINTCLIENT else 0)
+            return 0
+        if msg in (0x0201, 0x0203):
+            par = w.parent
+            if par is not None:
+                wm.send(par.hwnd, 0x0111, (w.id & 0xFFFF) | ((0 if msg == 0x0201 else 5) << 16),
+                        hwnd)
+            return 0
+        if msg == 0x0014:
+            return 1
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+
+    wm.py_class("NooColorSwatch", swatch_proc, style=0x8 | 1 | 2)
+
+    def choose_color(c, cc, wide):
+        state["err"] = 0
+        if not cc:
+            return set_err(0x0002)
+        o_owner, o_rgb, o_cust, o_flags = (8, 24, 32, 40) if P() == 8 else (4, 12, 16, 20)
+        owner = rp(cc + o_owner) & 0xFFFFFFFF
+        rgb = M_.read32(cc + o_rgb) & 0xFFFFFF
+        cust_ptr = rp(cc + o_cust)
+        flags = M_.read32(cc + o_flags)
+        if not (flags & 1):                                        # !CC_RGBINIT
+            rgb = 0
+        cust = [M_.read32(cust_ptr + 4 * i) & 0xFFFFFF for i in range(16)] if cust_ptr \
+            else [0xFFFFFF] * 16
+        if headless_cancel("ChooseColor"):
+            return 0
+        hwnd, w, hfont = new_dialog(owner, "Color", 440, 260)
+        if w is None:
+            return set_err(0x0002)
+        st = {"rgb": rgb, "sel": None, "cust_i": 0}
+        ctl(hwnd, "Static", "&Basic colors:", 0, 8, 6, 200, 14, 0xFFFF)
+        sw = []
+        for i, col in enumerate(_CD_BASIC_COLORS):
+            x, y = 8 + (i % 8) * 26, 22 + (i // 8) * 22
+            h = ctl(hwnd, "NooColorSwatch", "", WS_TABSTOP if i == 0 else 0, x, y, 24, 20,
+                    0x1000 + i)
+            cw = wm.wnd(h)
+            if cw is not None:
+                cw.py["color"] = col
+            sw.append(h)
+        ctl(hwnd, "Static", "&Custom colors:", 0, 8, 162, 200, 14, 0xFFFF)
+        for i in range(16):
+            x, y = 8 + (i % 8) * 26, 178 + (i // 8) * 22
+            h = ctl(hwnd, "NooColorSwatch", "", 0, x, y, 24, 20, 0x1100 + i)
+            cw = wm.wnd(h)
+            if cw is not None:
+                cw.py["color"] = cust[i]
+            sw.append(h)
+        prev = ctl(hwnd, "NooColorSwatch", "", 0, 230, 22, 96, 70, 0x2C5)
+        ctl(hwnd, "Static", "Color|Solid", 0, 230, 96, 96, 14, 0xFFFF)
+        edits = {}
+        for j, (lab, cid) in enumerate((("&Red:", 0x2C2), ("&Green:", 0x2C3), ("Bl&ue:", 0x2C4))):
+            ctl(hwnd, "Static", lab, 0, 340, 24 + j * 28, 44, 14, 0xFFFF)
+            edits[cid] = ctl(hwnd, "Edit", "", 0x2000 | WS_TABSTOP, 386, 20 + j * 28, 44, 22, cid,
+                             WS_EX_CLIENTEDGE)
+        ctl(hwnd, "Button", "&Add to Custom Colors", WS_TABSTOP, 230, 120, 200, 24, 0x2C8)
+        ctl(hwnd, "Button", "OK", 1 | WS_TABSTOP, 230, 226, 96, 24, IDOK)
+        ctl(hwnd, "Button", "Cancel", WS_TABSTOP, 334, 226, 96, 24, IDCANCEL)
+        w.py["defid"] = IDOK
+        busy = [False]
+
+        def show_rgb(from_edits=False):
+            pw = wm.wnd(prev)
+            if pw is not None:
+                pw.py["color"] = st["rgb"]
+                wm.invalidate(pw, None, True)
+            if not from_edits:
+                busy[0] = True
+                try:
+                    for cid, shift in ((0x2C2, 0), (0x2C3, 8), (0x2C4, 16)):
+                        set_text(edits[cid], str((st["rgb"] >> shift) & 255))
+                finally:
+                    busy[0] = False
+
+        def select(hsw):
+            for h in sw:
+                x = wm.wnd(h)
+                if x is not None and x.py.get("sel"):
+                    x.py["sel"] = False
+                    wm.invalidate(x, None, True)
+            x = wm.wnd(hsw)
+            if x is not None:
+                x.py["sel"] = True
+                wm.invalidate(x, None, True)
+                st["rgb"] = x.py.get("color", 0)
+                show_rgb()
+
+        def proc(h, msg, wp, lp, wide_):
+            if msg == WM_INITDIALOG:
+                show_rgb()
+                for hs in sw:
+                    x = wm.wnd(hs)
+                    if x is not None and x.py.get("color") == st["rgb"] and x.id < 0x1100:
+                        x.py["sel"] = True
+                        break
+                return 1
+            if msg == 0x0111:
+                cid, code = wp & 0xFFFF, (wp >> 16) & 0xFFFF
+                if 0x1000 <= cid < 0x1110:
+                    select(lp & 0xFFFFFFFF)
+                    if code == 5:
+                        wm.send(h, 0x0111, IDOK, 0)
+                    return 1
+                if cid in edits and code == 0x300 and not busy[0]:  # EN_CHANGE
+                    vals = []
+                    for eid in (0x2C2, 0x2C3, 0x2C4):
+                        try:
+                            vals.append(max(0, min(255, int(get_text(edits[eid]) or 0))))
+                        except ValueError:
+                            vals.append(0)
+                    st["rgb"] = vals[0] | (vals[1] << 8) | (vals[2] << 16)
+                    show_rgb(True)
+                    return 1
+                if cid == 0x2C8:                                    # add to custom colors
+                    i = st["cust_i"] % 16
+                    cust[i] = st["rgb"]
+                    x = wm.wnd(sw[48 + i])
+                    if x is not None:
+                        x.py["color"] = st["rgb"]
+                        wm.invalidate(x, None, True)
+                    st["cust_i"] += 1
+                    return 1
+                if cid == IDOK:
+                    _end_dialog(wm, h, 1)
+                    return 1
+                if cid == IDCANCEL:
+                    _end_dialog(wm, h, 0)
+                    return 1
+            return 0
+
+        res = run_modal(hwnd, w, owner, proc, hfont)
+        if res != 1:
+            return 0
+        M_.write32(cc + o_rgb, st["rgb"])
+        if cust_ptr:
+            for i in range(16):
+                M_.write32(cust_ptr + 4 * i, cust[i])
+        return 1
+
+    R("ChooseColorA", "p", dlls=CD)(lambda c, a: choose_color(c, a, False))
+    R("ChooseColorW", "p", dlls=CD)(lambda c, a: choose_color(c, a, True))
+
+    # =====================================================================================
+    # ChooseFont
+    # =====================================================================================
+    FACES = ["Arial", "Consolas", "Courier New", "Lucida Console", "Microsoft Sans Serif",
+             "MS Sans Serif", "MS Shell Dlg", "Segoe UI", "Tahoma", "Times New Roman",
+             "Verdana"]
+    SIZES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 22, 24, 26, 28, 36, 48, 72]
+    STYLES = ["Regular", "Italic", "Bold", "Bold Italic"]
+
+    def choose_font(c, cf, wide):
+        state["err"] = 0
+        if not cf:
+            return set_err(0x0002)
+        if P() == 8:
+            O = {"owner": 8, "lf": 24, "pt": 32, "flags": 36, "rgb": 40, "type": 88, "min": 92,
+                 "max": 96}
+        else:
+            O = {"owner": 4, "lf": 12, "pt": 16, "flags": 20, "rgb": 24, "type": 48, "min": 52,
+                 "max": 56}
+        owner = rp(cf + O["owner"]) & 0xFFFFFFFF
+        lfp = rp(cf + O["lf"])
+        flags = M_.read32(cf + O["flags"])
+        if not lfp:
+            return set_err(0x0002)
+        face, size, style = "Tahoma", 9, 0
+        underline = strike = False
+        if flags & 0x40:                                           # CF_INITTOLOGFONTSTRUCT
+            lf = _read_logfont(M_, lfp, wide)
+            face = lf[13] if len(lf) > 13 and lf[13] else face
+            if lf[0]:
+                size = max(1, round(abs(lf[0]) * 72 / 96))
+            style = (2 if lf[4] >= 600 else 0) | (1 if lf[5] else 0)
+            underline, strike = bool(lf[6]), bool(lf[7])
+        if headless_cancel("ChooseFont"):
+            return 0
+        hwnd, w, hfont = new_dialog(owner, "Font", 430, 290)
+        if w is None:
+            return set_err(0x0002)
+        ctl(hwnd, "Static", "&Font:", 0, 8, 8, 160, 14, 0x440)
+        e_face = ctl(hwnd, "Edit", face, 0x80 | WS_TABSTOP, 8, 24, 170, 22, 0x480, WS_EX_CLIENTEDGE)
+        l_face = ctl(hwnd, "ListBox", "", 0x1 | WS_VSCROLL | WS_TABSTOP | 0x100, 8, 48, 170,
+                     120, 0x470, WS_EX_CLIENTEDGE)
+        ctl(hwnd, "Static", "Font st&yle:", 0, 186, 8, 110, 14, 0x441)
+        l_style = ctl(hwnd, "ListBox", "", 0x1 | WS_TABSTOP, 186, 24, 110, 144, 0x471,
+                      WS_EX_CLIENTEDGE)
+        ctl(hwnd, "Static", "&Size:", 0, 304, 8, 50, 14, 0x442)
+        e_size = ctl(hwnd, "Edit", str(size), 0x2000 | WS_TABSTOP, 304, 24, 50, 22, 0x481,
+                     WS_EX_CLIENTEDGE)
+        l_size = ctl(hwnd, "ListBox", "", 0x1 | WS_VSCROLL | WS_TABSTOP, 304, 48, 50, 120, 0x472,
+                     WS_EX_CLIENTEDGE)
+        ctl(hwnd, "Button", "OK", 1 | WS_TABSTOP, 362, 24, 60, 24, IDOK)
+        ctl(hwnd, "Button", "Cancel", WS_TABSTOP, 362, 54, 60, 24, IDCANCEL)
+        effects = bool(flags & 0x100)
+        chk_s = chk_u = 0
+        if effects:
+            ctl(hwnd, "Button", "Effects", 7, 8, 176, 170, 64, 0xFFFF)
+            chk_s = ctl(hwnd, "Button", "Stri&keout", 3 | WS_TABSTOP, 18, 194, 140, 18, 0x410)
+            chk_u = ctl(hwnd, "Button", "&Underline", 3 | WS_TABSTOP, 18, 214, 140, 18, 0x411)
+            wm.send(chk_s, 0xF1, 1 if strike else 0, 0)
+            wm.send(chk_u, 0xF1, 1 if underline else 0, 0)
+        ctl(hwnd, "Button", "Sample", 7, 186, 176, 236, 64, 0xFFFF)
+        sample = ctl(hwnd, "Static", "AaBbYyZz", 0x1 | 0x200, 196, 192, 216, 42, 0x444)
+        for f in FACES:
+            send_s(l_face, 0x180, 0, f)                            # LB_ADDSTRING
+        for s_ in STYLES:
+            send_s(l_style, 0x180, 0, s_)
+        for z in SIZES:
+            send_s(l_size, 0x180, 0, str(z))
+        w.py["defid"] = IDOK
+        st = {"face": face, "size": size, "style": style, "sample_font": 0}
+
+        def lb_sel(h):
+            return _s32(wm.send(h, 0x188, 0, 0) & 0xFFFFFFFF)       # LB_GETCURSEL
+
+        def sync_lists():
+            fl = [f.lower() for f in FACES]
+            if st["face"].lower() in fl:
+                wm.send(l_face, 0x186, fl.index(st["face"].lower()), 0)
+            wm.send(l_style, 0x186, st["style"], 0)
+            if st["size"] in SIZES:
+                wm.send(l_size, 0x186, SIZES.index(st["size"]), 0)
+
+        def update_sample():
+            old = st["sample_font"]
+            fo = _GFontObj(-round(st["size"] * 96 / 72), weight=700 if st["style"] & 2 else 400,
+                           italic=1 if st["style"] & 1 else 0,
+                           underline=1 if chk_u and wm.send(chk_u, 0xF0, 0, 0) & 1 else 0,
+                           strike=1 if chk_s and wm.send(chk_s, 0xF0, 0, 0) & 1 else 0,
+                           face=st["face"])
+            st["sample_font"] = wm.gdi.add(fo)
+            wm.send(sample, WM_SETFONT, st["sample_font"], 1)
+            if old:
+                wm.gdi.objs.pop(old, None)
+
+        def proc(h, msg, wp, lp, wide_):
+            if msg == WM_INITDIALOG:
+                sync_lists()
+                update_sample()
+                return 1
+            if msg == 0x0111:
+                cid, code = wp & 0xFFFF, (wp >> 16) & 0xFFFF
+                if cid == 0x470 and code == 1:
+                    i = lb_sel(l_face)
+                    if 0 <= i < len(FACES):
+                        st["face"] = FACES[i]
+                        set_text(e_face, FACES[i])
+                        update_sample()
+                    return 1
+                if cid == 0x471 and code == 1:
+                    i = lb_sel(l_style)
+                    if 0 <= i < 4:
+                        st["style"] = i
+                        update_sample()
+                    return 1
+                if cid == 0x472 and code == 1:
+                    i = lb_sel(l_size)
+                    if 0 <= i < len(SIZES):
+                        st["size"] = SIZES[i]
+                        set_text(e_size, str(SIZES[i]))
+                        update_sample()
+                    return 1
+                if cid == 0x481 and code == 0x300:
+                    try:
+                        v = int(get_text(e_size) or 0)
+                    except ValueError:
+                        v = 0
+                    if 1 <= v <= 1638:
+                        st["size"] = v
+                        update_sample()
+                    return 1
+                if cid == 0x480 and code == 0x300:
+                    t = get_text(e_face).strip()
+                    if t:
+                        st["face"] = t
+                    return 1
+                if cid in (0x410, 0x411):
+                    update_sample()
+                    return 0
+                if cid == IDOK:
+                    st["underline"] = bool(chk_u and wm.send(chk_u, 0xF0, 0, 0) & 1)
+                    st["strike"] = bool(chk_s and wm.send(chk_s, 0xF0, 0, 0) & 1)
+                    _end_dialog(wm, h, 1)
+                    return 1
+                if cid == IDCANCEL:
+                    _end_dialog(wm, h, 0)
+                    return 1
+            return 0
+
+        res = run_modal(hwnd, w, owner, proc, hfont)
+        if st["sample_font"]:
+            wm.gdi.objs.pop(st["sample_font"], None)
+        if res != 1:
+            return 0
+        height = -round(st["size"] * 96 / 72)
+        weight = 700 if st["style"] & 2 else 400
+        lf_head = struct.pack("<iiiiiBBBBBBBB", height, 0, 0, 0, weight,
+                              1 if st["style"] & 1 else 0, 1 if st.get("underline") else 0,
+                              1 if st.get("strike") else 0, 1, 0, 0, 0, 0)
+        M_.write(lfp, lf_head)
+        facedata = st["face"][:31]
+        M_.write(lfp + 28, (facedata.encode("utf-16-le") + b"\0\0") if wide
+                 else (facedata.encode("utf-8", "replace")[:31] + b"\0"))
+        M_.write32(cf + O["pt"], st["size"] * 10)
+        ftype = 0x2000 | (0x100 if st["style"] & 2 else 0) | (0x200 if st["style"] & 1 else 0) | \
+            (0x400 if not st["style"] else 0)
+        M_.write(cf + O["type"], struct.pack("<H", ftype))
+        return 1
+
+    R("ChooseFontA", "p", dlls=CD)(lambda c, a: choose_font(c, a, False))
+    R("ChooseFontW", "p", dlls=CD)(lambda c, a: choose_font(c, a, True))
+
+    # =====================================================================================
+    # Find / Replace (modeless)
+    # =====================================================================================
+    def find_replace(c, fr, wide, replace):
+        state["err"] = 0
+        if not fr:
+            return set_err(0x0002)
+        if P() == 8:
+            O = {"owner": 8, "flags": 24, "find": 32, "repl": 40, "flen": 48, "rlen": 50}
+        else:
+            O = {"owner": 4, "flags": 12, "find": 16, "repl": 20, "flen": 24, "rlen": 26}
+        owner = rp(fr + O["owner"]) & 0xFFFFFFFF
+        if wm.wnd(owner) is None:
+            return set_err(0x0002)
+        flags = M_.read32(fr + O["flags"])
+        fptr, rptr = rp(fr + O["find"]), rp(fr + O["repl"])
+        flen, rlen = struct.unpack("<HH", M_.read(fr + O["flen"], 4))
+        msgid = wm.msg_names.get("COMMDLG_FINDREPLACE")
+        if msgid is None:
+            msgid = wm.msg_names["COMMDLG_FINDREPLACE"] = wm.next_msg_id
+            wm.next_msg_id += 1
+        title = "Replace" if replace else "Find"
+        hwnd, w, hfont = new_dialog(owner, title, 360, 130 if replace else 96)
+        if w is None:
+            return 0
+        w.py["modeless_font"] = hfont
+        ctl(hwnd, "Static", "Fi&nd what:", 0, 8, 12, 80, 14, 0xFFFF)
+        e_find = ctl(hwnd, "Edit", gs(fptr, wide), 0x80 | WS_TABSTOP, 92, 8, 170, 22, 0x480,
+                     WS_EX_CLIENTEDGE)
+        y = 38
+        e_repl = 0
+        if replace:
+            ctl(hwnd, "Static", "Re&place with:", 0, 8, 42, 80, 14, 0xFFFF)
+            e_repl = ctl(hwnd, "Edit", gs(rptr, wide), 0x80 | WS_TABSTOP, 92, 38, 170, 22, 0x481,
+                         WS_EX_CLIENTEDGE)
+            y = 68
+        chx1 = 0
+        if not flags & 0x10000:                                    # !FR_HIDEWHOLEWORD
+            chx1 = ctl(hwnd, "Button", "Match &whole word only", 3 | WS_TABSTOP, 8, y, 170, 18,
+                       0x410)
+            wm.send(chx1, 0xF1, 1 if flags & 2 else 0, 0)
+        chx2 = ctl(hwnd, "Button", "Match &case", 3 | WS_TABSTOP, 8, y + 22, 170, 18, 0x411)
+        wm.send(chx2, 0xF1, 1 if flags & 4 else 0, 0)
+        r_up = r_down = 0
+        if not replace and not flags & 0x4000:                     # !FR_HIDEUPDOWN
+            ctl(hwnd, "Button", "Direction", 7, 172, y - 6, 96, 48, 0xFFFF)
+            r_up = ctl(hwnd, "Button", "&Up", 9 | WS_TABSTOP | WS_GROUP, 178, y + 12, 38, 18, 0x420)
+            r_down = ctl(hwnd, "Button", "&Down", 9, 218, y + 12, 48, 18, 0x421)
+            wm.send(r_down if flags & 1 else r_up, 0xF1, 1, 0)
+        ctl(hwnd, "Button", "&Find Next", 1 | WS_TABSTOP, 272, 8, 80, 24, IDOK)
+        if replace:
+            ctl(hwnd, "Button", "&Replace", WS_TABSTOP, 272, 36, 80, 24, 0x400)
+            ctl(hwnd, "Button", "Replace &All", WS_TABSTOP, 272, 64, 80, 24, 0x401)
+            ctl(hwnd, "Button", "Cancel", WS_TABSTOP, 272, 92, 80, 24, IDCANCEL)
+        else:
+            ctl(hwnd, "Button", "Cancel", WS_TABSTOP, 272, 36, 80, 24, IDCANCEL)
+        w.py["defid"] = IDOK
+
+        def store_and_notify(action):
+            t = get_text(e_find)
+            if fptr and flen:
+                data = enc(t, wide)
+                lim = flen * (2 if wide else 1)
+                M_.write(fptr, data[:lim - (2 if wide else 1)] + (b"\0\0" if wide else b"\0"))
+            if replace and rptr and rlen:
+                data = enc(get_text(e_repl), wide)
+                lim = rlen * (2 if wide else 1)
+                M_.write(rptr, data[:lim - (2 if wide else 1)] + (b"\0\0" if wide else b"\0"))
+            f = M_.read32(fr + O["flags"]) & ~(0x8 | 0x10 | 0x20 | 0x40 | 0x7)
+            if chx1 and wm.send(chx1, 0xF0, 0, 0) & 1:
+                f |= 2
+            if wm.send(chx2, 0xF0, 0, 0) & 1:
+                f |= 4
+            if replace or not r_down or wm.send(r_down, 0xF0, 0, 0) & 1:
+                f |= 1
+            M_.write32(fr + O["flags"], f | action)
+            if wm.wnd(owner) is not None:
+                wm.send(owner, msgid, 0, fr)
+
+        def proc(h, msg, wp, lp, wide_):
+            if msg == 0x0111:
+                cid = wp & 0xFFFF
+                if cid == IDOK:
+                    store_and_notify(0x8)                          # FR_FINDNEXT
+                    return 1
+                if cid == 0x400:
+                    store_and_notify(0x10)                         # FR_REPLACE
+                    return 1
+                if cid == 0x401:
+                    store_and_notify(0x20)                         # FR_REPLACEALL
+                    return 1
+                if cid == IDCANCEL:
+                    store_and_notify(0x40)                         # FR_DIALOGTERM
+                    wm.destroy(wm.wnd(h))
+                    return 1
+            if msg == 0x0002:                                      # WM_DESTROY
+                wm.gdi.objs.pop(hfont, None)
+            return 0
+
+        addr = wm.register_pyproc(proc)
+        _dlg_set_proc(wm, w, addr)
+        wm.show(w, 1)
+        _dlg_set_focus(wm, w, wm.wnd(e_find))
+        return hwnd
+
+    R("FindTextA", "p", "p", dlls=CD)(lambda c, a: find_replace(c, a, False, False))
+    R("FindTextW", "p", "p", dlls=CD)(lambda c, a: find_replace(c, a, True, False))
+    R("ReplaceTextA", "p", "p", dlls=CD)(lambda c, a: find_replace(c, a, False, True))
+    R("ReplaceTextW", "p", "p", dlls=CD)(lambda c, a: find_replace(c, a, True, True))
+
+    # ---- printing: no printers are installed ------------------------------------------------
+    R("PrintDlgA PrintDlgW PageSetupDlgA PageSetupDlgW", "p", dlls=CD)(
+        lambda c, a: set_err(0x1008))                              # PDERR_NODEFAULTPRN
+    R("PrintDlgExA PrintDlgExW", "p", dlls=CD)(lambda c, a: 0x80004005)
+
+    # =====================================================================================
+    # SHBrowseForFolder
+    # =====================================================================================
+    def browse_folder(c, bi, wide):
+        if not bi:
+            return 0
+        if P() == 8:
+            O = {"owner": 0, "root": 8, "disp": 16, "title": 24, "flags": 32, "fn": 40, "lp": 48,
+                 "img": 56}
+        else:
+            O = {"owner": 0, "root": 4, "disp": 8, "title": 12, "flags": 16, "fn": 20, "lp": 24,
+                 "img": 28}
+        owner = rp(bi + O["owner"]) & 0xFFFFFFFF
+        root_pidl = rp(bi + O["root"])
+        disp_ptr = rp(bi + O["disp"])
+        text = gs(rp(bi + O["title"]), wide)
+        flags = M_.read32(bi + O["flags"])
+        cb = rp(bi + O["fn"])
+        cb_data = rp(bi + O["lp"])
+        root_path = k.pidl_path(root_pidl) if root_pidl and hasattr(k, "pidl_path") else None
+        if headless_cancel("SHBrowseForFolder"):
+            return 0
+        new_style = bool(flags & 0x40)
+        hwnd, w, hfont = new_dialog(owner, "Browse For Folder", 320, 360)
+        if w is None:
+            return 0
+        ctl(hwnd, "Static", text, 0, 10, 8, 300, 34, 0x3742)
+        status = ctl(hwnd, "Static", "", 0, 10, 42, 300, 14, 0x3743) if flags & 0x4 else 0
+        tv = ctl(hwnd, "SysTreeView32", "", 0x1 | 0x2 | 0x4 | 0x20 | WS_TABSTOP, 10, 60, 300, 206,
+                 0x3741, WS_EX_CLIENTEDGE)
+        wm.send(tv, 0x1109, 0, small_icons())                      # TVM_SETIMAGELIST
+        edit = 0
+        if flags & 0x10:                                           # BIF_EDITBOX
+            ctl(hwnd, "Static", "Folder:", 0, 10, 276, 50, 14, 0xFFFF)
+            edit = ctl(hwnd, "Edit", "", 0x80 | WS_TABSTOP, 62, 272, 248, 22, 0x3744,
+                       WS_EX_CLIENTEDGE)
+        if new_style and not flags & 0x200:
+            ctl(hwnd, "Button", "&Make New Folder", WS_TABSTOP, 10, 326, 120, 24, 0x3746)
+        ok = ctl(hwnd, "Button", "OK", 1 | WS_TABSTOP, 150, 326, 76, 24, IDOK)
+        ctl(hwnd, "Button", "Cancel", WS_TABSTOP, 234, 326, 76, 24, IDCANCEL)
+        w.py["defid"] = IDOK
+        st = {"nodes": {}, "filled": set(), "sel": None, "result": None}
+
+        def fill(hitem, path):
+            if hitem in st["filled"]:
+                return
+            st["filled"].add(hitem)
+            dirs, files = listdir(path)
+            for d in dirs:
+                full = ntp.join(path, d)
+                sub_dirs, sub_files = listdir(full)
+                kids = bool(sub_dirs) or bool(flags & 0x4000 and sub_files)
+                h = tv_insert(tv, hitem, d, len(st["nodes"]) + 1, kids, 0)
+                st["nodes"][h] = full
+            if flags & 0x4000:                                     # BIF_BROWSEINCLUDEFILES
+                for f in files:
+                    h = tv_insert(tv, hitem, f, len(st["nodes"]) + 1, False, 1)
+                    st["nodes"][h] = ntp.join(path, f)
+
+        def select_path(path):
+            path = norm(path)
+            prev_best = None
+            for _ in range(64):
+                for h_, pth in list(st["nodes"].items()):
+                    if pth.lower().rstrip("\\") == path.lower().rstrip("\\"):
+                        wm.send(tv, 0x110B, 9, h_)                 # TVM_SELECTITEM caret
+                        return True
+                # descend from the deepest known ancestor
+                best = None
+                for h_, pth in st["nodes"].items():
+                    if path.lower().startswith(pth.lower().rstrip("\\") + "\\") and \
+                            (best is None or len(pth) > len(st["nodes"][best])):
+                        best = h_
+                if best is None or best == prev_best:
+                    return False
+                fill(best, st["nodes"][best])
+                wm.send(tv, 0x1102, 2, best)                       # TVM_EXPAND
+                prev_best = best
+            return False
+
+        def callback(msg, lp_):
+            if cb:
+                p.call_guest(cb, [hwnd, msg, lp_, cb_data])
+
+        def proc(h, msg, wp, lp, wide_):
+            if msg == WM_INITDIALOG:
+                roots = [root_path] if root_path else drives()
+                for r_ in roots:
+                    hi = tv_insert(tv, 0, r_, len(st["nodes"]) + 1, True, 2 if len(r_) <= 3 else 0)
+                    st["nodes"][hi] = norm(r_) if len(r_) > 3 else r_
+                    fill(hi, st["nodes"][hi])
+                    wm.send(tv, 0x1102, 2, hi)
+                start = state.get("last_browse") or norm(cwd())
+                select_path(start)
+                callback(1, 0)                                     # BFFM_INITIALIZED
+                return 1
+            if msg == 0x004E and nm_id(lp) == 0x3741:
+                code = nm_code(lp)
+                if code in (-405, -454):                           # TVN_ITEMEXPANDING A/W
+                    hi, _prm = nm_tv_item(lp)
+                    if hi in st["nodes"]:
+                        fill(hi, st["nodes"][hi])
+                    return 0
+                if code in (-402, -451):                           # TVN_SELCHANGED A/W
+                    hi, _prm = nm_tv_item(lp)
+                    st["sel"] = st["nodes"].get(hi)
+                    if st["sel"] and edit:
+                        set_text(edit, ntp.basename(st["sel"].rstrip("\\")) or st["sel"])
+                    if cb and st["sel"] and hasattr(k, "make_pidl"):
+                        pid = k.make_pidl(st["sel"])
+                        callback(2, pid)                           # BFFM_SELCHANGED
+                        p.heap_free(p.process_heap_handle, pid)
+                    return 0
+                return 0
+            if msg in (0x466, 0x467):                              # BFFM_SETSELECTIONA/W
+                path = gs(lp, msg == 0x467) if wp else (k.pidl_path(lp) if hasattr(
+                    k, "pidl_path") else None)
+                if path:
+                    select_path(path)
+                return 1
+            if msg == 0x465:                                       # BFFM_ENABLEOK
+                ow_ = wm.wnd(ok)
+                if ow_ is not None:
+                    if lp:
+                        ow_.style &= ~WS_DISABLED
+                    else:
+                        ow_.style |= WS_DISABLED
+                    wm.invalidate(ow_, None, True)
+                return 1
+            if msg in (0x464, 0x468):                              # BFFM_SETSTATUSTEXTA/W
+                if status:
+                    set_text(status, gs(lp, msg == 0x468))
+                return 1
+            if msg == 0x469:                                       # BFFM_SETOKTEXT
+                set_text(ok, gs(lp, True))
+                return 1
+            if msg == 0x46A:                                       # BFFM_SETEXPANDED
+                path = gs(lp, True) if wp else None
+                if path:
+                    select_path(path)
+                return 1
+            if msg == 0x0111:
+                cid = wp & 0xFFFF
+                if cid == IDOK:
+                    sel = st["sel"]
+                    if edit:
+                        t = get_text(edit).strip()
+                        if t and sel and ntp.basename(sel.rstrip("\\")) != t:
+                            cand = t if t[1:2] == ":" else ntp.join(sel, t)
+                            if is_dir(cand):
+                                sel = norm(cand)
+                            elif flags & 0x20 and cb:              # BIF_VALIDATE
+                                callback(3 if not wide else 4, 0)
+                                return 1
+                    if not sel:
+                        return 1
+                    if flags & 0x1 and not (len(sel) >= 3 and sel[1] == ":"):
+                        return 1
+                    st["result"] = sel
+                    _end_dialog(wm, h, 1)
+                    return 1
+                if cid == IDCANCEL:
+                    _end_dialog(wm, h, 0)
+                    return 1
+                if cid == 0x3746 and st["sel"]:                    # make new folder
+                    base = ntp.join(st["sel"], "New folder")
+                    name, n = base, 2
+                    while exists(name):
+                        name = "%s (%d)" % (base, n)
+                        n += 1
+                    try:
+                        os.makedirs(p.vfs.resolve(name, for_write=True), exist_ok=True)
+                    except Exception:
+                        return 1
+                    sel_h = [h_ for h_, pth in st["nodes"].items() if pth == st["sel"]]
+                    if sel_h:
+                        nh = tv_insert(tv, sel_h[0], ntp.basename(name), len(st["nodes"]) + 1,
+                                       False, 0)
+                        st["nodes"][nh] = name
+                        wm.send(tv, 0x1102, 2, sel_h[0])
+                        wm.send(tv, 0x110B, 9, nh)
+                    return 1
+            return 0
+
+        res = run_modal(hwnd, w, owner, proc, hfont, focus=tv)
+        if res != 1 or not st["result"]:
+            return 0
+        path = st["result"]
+        state["last_browse"] = path
+        if disp_ptr:
+            name = ntp.basename(path.rstrip("\\")) or path
+            M_.write(disp_ptr, enc(name[:259], wide))
+        M_.write32(bi + O["img"], 0)
+        return k.make_pidl(path) if hasattr(k, "make_pidl") else 0
+
+    R("SHBrowseForFolderA", "p", "p", dlls=SH)(lambda c, a: browse_folder(c, a, False))
+    R("SHBrowseForFolderW SHBrowseForFolder", "p", "p", dlls=SH)(
+        lambda c, a: browse_folder(c, a, True))
+
+    # =====================================================================================
+    # Vista-style COM dialogs: FileOpenDialog / FileSaveDialog + IShellItem(Array)
+    # =====================================================================================
+    G = _guid_from_str
+    IID_ISHELLITEM = G("{43826d1e-e718-42ee-bc55-a1e261c37bfe}")
+    IID_ISHELLITEM2 = G("{7e9fb0d3-919f-4307-ab2e-9b1860310c93}")
+    IID_ISHELLITEMARRAY = G("{b63ea76d-1f85-456f-a19c-48159efa858b}")
+    IID_IMODALWINDOW = G("{b4db1657-70d7-485e-8e3e-6fcb5a5c1802}")
+    IID_IFILEDIALOG = G("{42f85136-db7e-439c-85f1-e4075d135fc8}")
+    IID_IFILEOPENDIALOG = G("{d57c7288-d4ad-4768-be02-9d969532d960}")
+    IID_IFILESAVEDIALOG = G("{84bccd23-5fde-4cdb-aea4-af64b83d78ab}")
+    CLSID_FILEOPENDIALOG = G("{dc1c5a9c-e88a-4dde-a5a1-60f82a20aef7}")
+    CLSID_FILESAVEDIALOG = G("{c0b4e2f3-ba21-4773-8dba-335ec946eb8b}")
+    CLSID_SHELLITEM = G("{9ac9fbe1-e0a2-4ad6-b4ee-e212013ea917}")
+    E_NOTIMPL, E_FAIL, E_CANCELLED = 0x80004001, 0x80004005, 0x800704C7
+    UNK = ("QueryInterface", "AddRef", "Release")
+
+    def put_ptr(pp, v):
+        if pp:
+            M_.write(pp, struct.pack("<Q" if P() == 8 else "<I", v & (M64 if P() == 8 else
+                                                                      0xFFFFFFFF)))
+
+    def co_str(s):
+        data = s.encode("utf-16-le") + b"\0\0"
+        a = p.heap_alloc(p.process_heap_handle, len(data))
+        M_.write(a, data)
+        return a
+
+    def meth(argc, fn):
+        """COM method taking argc arguments including `this` (x86 callee cleanup is sized
+        from the highest argument read, so touch the last one first)."""
+        def impl(p_, entry, cpu):
+            cpu.get_arg(argc - 1)
+            return fn(entry, *[cpu.get_arg(i) for i in range(1, argc)])
+        return impl
+
+    def new_obj(cls, clsid, data, iid):
+        entry = p._com_build_object(cls, clsid)
+        entry["data"].update(data)
+        ptr = p._com_qi(entry, iid)
+        if not ptr:
+            p.com_objects.pop(entry["id"], None)
+            return 0, E_NOINTERFACE
+        entry["refs"] += 1
+        return ptr, S_OK
+
+    def obj_of(ptr):
+        for e in p.com_objects.values():
+            if ptr in e["ifaces"].values():
+                return e
+        return None
+
+    # ---- IShellItem ----------------------------------------------------------------------
+    def si_display(entry, sigdn, ppsz):
+        path = entry["data"]["path"]
+        put_ptr(ppsz, 0)
+        sigdn &= 0xFFFFFFFF
+        if sigdn in (0x80058000, 0x80028000, 0x8004C000, 0x80048000):   # file system paths
+            s = path
+        elif sigdn == 0x80068000:                                        # SIGDN_URL
+            s = "file:///" + path.replace("\\", "/")
+        else:
+            s = ntp.basename(path.rstrip("\\")) or path
+        put_ptr(ppsz, co_str(s))
+        return S_OK
+
+    def si_attrs(entry, mask, pattrs):
+        path = entry["data"]["path"]
+        a = 0x40000000 | 0x00400000                      # SFGAO_FILESYSTEM | SFGAO_STREAM
+        if is_dir(path):
+            a = 0x40000000 | 0x20000000 | 0x80000000    # FILESYSTEM | FOLDER | HASSUBFOLDER
+        if pattrs:
+            M_.write32(pattrs, a & mask)
+        return S_OK if (a & mask) == mask else S_FALSE
+
+    def si_parent(entry, ppsi):
+        path = entry["data"]["path"].rstrip("\\")
+        parent = ntp.dirname(path)
+        if not parent or parent == path or len(path) <= 2:
+            put_ptr(ppsi, 0)
+            return E_FAIL
+        ptr, hr = make_item(parent + ("\\" if parent.endswith(":") else ""), IID_ISHELLITEM)
+        put_ptr(ppsi, ptr)
+        return hr
+
+    def si_compare(entry, other, hint, porder):
+        o = obj_of(other)
+        a = entry["data"]["path"].lower()
+        b = o["data"]["path"].lower() if o is not None and "path" in o["data"] else ""
+        r = (a > b) - (a < b)
+        if porder:
+            M_.write32(porder, r & 0xFFFFFFFF)
+        return S_OK if r == 0 else S_FALSE
+
+    si_methods = UNK + ("BindToHandler", "GetParent", "GetDisplayName", "GetAttributes", "Compare")
+    SHELLITEM_CLS = {
+        "name": "ShellItem",
+        "iids": {IID_ISHELLITEM: si_methods, IID_ISHELLITEM2: si_methods},
+        "impl": {"BindToHandler": meth(5, lambda e, *a: (put_ptr(a[3], 0), E_NOTIMPL)[1]),
+                 "GetParent": meth(2, si_parent),
+                 "GetDisplayName": meth(3, si_display),
+                 "GetAttributes": meth(3, si_attrs),
+                 "Compare": meth(4, si_compare)},
+    }
+
+    def make_item(path, iid):
+        return new_obj(SHELLITEM_CLS, CLSID_SHELLITEM, {"path": path}, iid)
+
+    # ---- IShellItemArray -----------------------------------------------------------------
+    def sia_item(entry, i, ppsi):
+        paths = entry["data"]["paths"]
+        if not 0 <= i < len(paths):
+            put_ptr(ppsi, 0)
+            return E_INVALIDARG_COM
+        ptr, hr = make_item(paths[i], IID_ISHELLITEM)
+        put_ptr(ppsi, ptr)
+        return hr
+
+    def sia_count(entry, pn):
+        if pn:
+            M_.write32(pn, len(entry["data"]["paths"]))
+        return S_OK
+
+    SHELLITEMARRAY_CLS = {
+        "name": "ShellItemArray",
+        "iids": {IID_ISHELLITEMARRAY: UNK + ("BindToHandler", "GetPropertyStore",
+                                             "GetPropertyDescriptionList", "GetAttributes",
+                                             "GetCount", "GetItemAt", "EnumItems")},
+        "impl": {"BindToHandler": meth(5, lambda e, *a: (put_ptr(a[3], 0), E_NOTIMPL)[1]),
+                 "GetPropertyStore": meth(4, lambda e, *a: (put_ptr(a[2], 0), E_NOTIMPL)[1]),
+                 "GetPropertyDescriptionList": meth(4, lambda e, *a: (put_ptr(a[2], 0),
+                                                                     E_NOTIMPL)[1]),
+                 "GetAttributes": meth(4, lambda e, *a: (M_.write32(a[2], 0) if a[2] else None,
+                                                         S_OK)[1]),
+                 "GetCount": meth(2, sia_count),
+                 "GetItemAt": meth(3, sia_item),
+                 "EnumItems": meth(2, lambda e, pp: (put_ptr(pp, 0), E_NOTIMPL)[1])},
+    }
+
+    # ---- IFileDialog -----------------------------------------------------------------------
+    def fd(entry):
+        d = entry["data"]
+        if "types" not in d:
+            d.update({"types": [], "tindex": 1, "opts": 0x800 | 0x40 | 0x8, "folder": None,
+                      "dfolder": None, "name": "", "title": "", "defext": "", "results": []})
+            if entry["clsid"] == CLSID_FILEOPENDIALOG:
+                d["opts"] |= 0x1000
+            else:
+                d["opts"] |= 0x2
+        return d
+
+    def fd_show(entry, owner):
+        d = fd(entry)
+        save = entry["clsid"] == CLSID_FILESAVEDIALOG
+        folder = d["folder"] or d["dfolder"]
+        if d["opts"] & 0x20:                                       # FOS_PICKFOLDERS
+            if folder:
+                state["last_browse"] = folder
+            blk = p.heap_alloc(p.process_heap_handle, 64 + 520)
+            M_.write(blk, bytes(64 + 520))
+            title_p = co_str(d["title"] or "Select Folder")
+            L = 8 if P() == 8 else 4
+            M_.write(blk, struct.pack("<Q" if L == 8 else "<I", owner))
+            M_.write(blk + 2 * L, struct.pack("<Q" if L == 8 else "<I", blk + 64))
+            M_.write(blk + 3 * L, struct.pack("<Q" if L == 8 else "<I", title_p))
+            M_.write32(blk + 4 * L, 0x1 | 0x40)                     # RETURNONLYFSDIRS | NEW
+            pidl = browse_folder(None, blk, True)
+            path = k.pidl_path(pidl) if pidl else None
+            p.heap_free(p.process_heap_handle, blk)
+            p.heap_free(p.process_heap_handle, title_p)
+            if not path:
+                return E_CANCELLED
+            d["results"] = [path]
+            return S_OK
+        # build an OPENFILENAMEW and reuse the classic dialog
+        L = ofn_layout()
+        size = 152 if P() == 8 else 88
+        nmax = 32768
+        spec = "".join("%s\0%s\0" % (n, s) for n, s in d["types"]) + "\0" if d["types"] else ""
+        fbuf = p.heap_alloc(p.process_heap_handle, nmax * 2)
+        M_.write(fbuf, enc(d["name"], True))
+        ofn = p.heap_alloc(p.process_heap_handle, size)
+        M_.write(ofn, bytes(size))
+        M_.write32(ofn, size)
+        allocs = [fbuf, ofn]
+
+        def sp(off, s):
+            if s:
+                a = co_str(s)
+                allocs.append(a)
+                M_.write(ofn + off, struct.pack("<Q" if P() == 8 else "<I", a))
+        M_.write(ofn + L["owner"], struct.pack("<Q" if P() == 8 else "<I", owner))
+        if spec:
+            a = p.heap_alloc(p.process_heap_handle, len(spec) * 2 + 4)
+            M_.write(a, spec.encode("utf-16-le") + b"\0\0")
+            allocs.append(a)
+            M_.write(ofn + L["filter"], struct.pack("<Q" if P() == 8 else "<I", a))
+        M_.write32(ofn + L["fidx"], d["tindex"])
+        M_.write(ofn + L["file"], struct.pack("<Q" if P() == 8 else "<I", fbuf))
+        M_.write32(ofn + L["nfile"], nmax)
+        sp(L["idir"], folder)
+        sp(L["title"], d["title"])
+        sp(L["defext"], d["defext"])
+        o = d["opts"]
+        M_.write32(ofn + L["flags"], (o & (0x2 | 0x8 | 0x800 | 0x1000 | 0x2000)) |
+                   (0x200 | 0x80000 if o & 0x200 else 0))
+        try:
+            ok = file_dialog(None, ofn, True, save)
+            if not ok:
+                return E_CANCELLED
+            d["tindex"] = M_.read32(ofn + L["fidx"])
+            raw = bytes(M_.read(fbuf, nmax * 2)).decode("utf-16-le", "replace")
+            parts = raw.split("\0")
+            if len(parts) > 2 and parts[1]:
+                dir_ = parts[0]
+                names = []
+                for s in parts[1:]:
+                    if not s:
+                        break
+                    names.append(ntp.join(dir_, s))
+                d["results"] = names
+            else:
+                d["results"] = [parts[0]]
+            d["name"] = ntp.basename(d["results"][0])
+            return S_OK
+        finally:
+            for a in allocs:
+                p.heap_free(p.process_heap_handle, a)
+
+    def fd_set_types(entry, n, specs):
+        d = fd(entry)
+        d["types"] = []
+        L = 2 * P()
+        for i in range(n):
+            nm, sp_ = rp(specs + i * L), rp(specs + i * L + P())
+            d["types"].append((gs(nm, True), gs(sp_, True)))
+        return S_OK
+
+    def fd_item_path(psi):
+        o = obj_of(psi)
+        if o is not None and "path" in o["data"]:
+            return o["data"]["path"]
+        return None
+
+    def fd_get_result(entry, ppsi):
+        d = fd(entry)
+        if not d["results"]:
+            put_ptr(ppsi, 0)
+            return E_UNEXPECTED
+        ptr, hr = make_item(d["results"][0], IID_ISHELLITEM)
+        put_ptr(ppsi, ptr)
+        return hr
+
+    def fd_get_results(entry, ppenum):
+        d = fd(entry)
+        if not d["results"]:
+            put_ptr(ppenum, 0)
+            return E_UNEXPECTED
+        ptr, hr = new_obj(SHELLITEMARRAY_CLS, CLSID_SHELLITEM, {"paths": list(d["results"])},
+                          IID_ISHELLITEMARRAY)
+        put_ptr(ppenum, ptr)
+        return hr
+
+    def fd_set(key):
+        def f(entry, v):
+            fd(entry)[key] = gs(v, True)
+            return S_OK
+        return f
+
+    def fd_set_folder(key):
+        def f(entry, psi):
+            path = fd_item_path(psi)
+            if path:
+                fd(entry)[key] = path
+            return S_OK
+        return f
+
+    def fd_get_folder(entry, ppsi):
+        d = fd(entry)
+        path = (ntp.dirname(d["results"][0]) if d["results"] else None) or d["folder"] or \
+            d["dfolder"] or norm(cwd())
+        ptr, hr = make_item(path, IID_ISHELLITEM)
+        put_ptr(ppsi, ptr)
+        return hr
+
+    def fd_get_name(entry, ppsz):
+        put_ptr(ppsz, co_str(fd(entry)["name"]))
+        return S_OK
+
+    def fd_opts(entry, v):
+        fd(entry)["opts"] = v
+        return S_OK
+
+    def fd_get_opts(entry, pv):
+        if pv:
+            M_.write32(pv, fd(entry)["opts"])
+        return S_OK
+
+    def fd_tindex(entry, i):
+        fd(entry)["tindex"] = max(1, i)
+        return S_OK
+
+    def fd_get_tindex(entry, pi):
+        if pi:
+            M_.write32(pi, fd(entry)["tindex"])
+        return S_OK
+
+    def fd_advise(entry, sink, pcookie):
+        if pcookie:
+            M_.write32(pcookie, 1)
+        return S_OK
+
+    FD_METHODS = UNK + ("Show", "SetFileTypes", "SetFileTypeIndex", "GetFileTypeIndex",
+                        "Advise", "Unadvise", "SetOptions", "GetOptions", "SetDefaultFolder",
+                        "SetFolder", "GetFolder", "GetCurrentSelection", "SetFileName",
+                        "GetFileName", "SetTitle", "SetOkButtonLabel", "SetFileNameLabel",
+                        "GetResult", "AddPlace", "SetDefaultExtension", "Close",
+                        "SetClientGuid", "ClearClientData", "SetFilter")
+    FD_IMPL = {
+        "Show": meth(2, lambda e, owner: fd_show(e, owner & 0xFFFFFFFF)),
+        "SetFileTypes": meth(3, fd_set_types),
+        "SetFileTypeIndex": meth(2, fd_tindex),
+        "GetFileTypeIndex": meth(2, fd_get_tindex),
+        "Advise": meth(3, fd_advise),
+        "Unadvise": meth(2, lambda e, c_: S_OK),
+        "SetOptions": meth(2, fd_opts),
+        "GetOptions": meth(2, fd_get_opts),
+        "SetDefaultFolder": meth(2, fd_set_folder("dfolder")),
+        "SetFolder": meth(2, fd_set_folder("folder")),
+        "GetFolder": meth(2, fd_get_folder),
+        "GetCurrentSelection": meth(2, fd_get_result),
+        "SetFileName": meth(2, fd_set("name")),
+        "GetFileName": meth(2, fd_get_name),
+        "SetTitle": meth(2, fd_set("title")),
+        "SetOkButtonLabel": meth(2, lambda e, s: S_OK),
+        "SetFileNameLabel": meth(2, lambda e, s: S_OK),
+        "GetResult": meth(2, fd_get_result),
+        "AddPlace": meth(3, lambda e, psi, fdap: S_OK),
+        "SetDefaultExtension": meth(2, fd_set("defext")),
+        "Close": meth(2, lambda e, hr: S_OK),
+        "SetClientGuid": meth(2, lambda e, g: S_OK),
+        "ClearClientData": meth(1, lambda e: S_OK),
+        "SetFilter": meth(2, lambda e, f: S_OK),
+        "GetResults": meth(2, fd_get_results),
+        "GetSelectedItems": meth(2, fd_get_results),
+        "SetSaveAsItem": meth(2, lambda e, psi: (fd(e).__setitem__(
+            "name", ntp.basename(fd_item_path(psi) or "")), S_OK)[1]),
+        "SetProperties": meth(2, lambda e, s: S_OK),
+        "SetCollectedProperties": meth(3, lambda e, lst, app: S_OK),
+        "GetProperties": meth(2, lambda e, pp: (put_ptr(pp, 0), E_NOTIMPL)[1]),
+        "ApplyProperties": meth(5, lambda e, *a: E_NOTIMPL),
+    }
+    p.com_classes[CLSID_FILEOPENDIALOG] = {
+        "name": "FileOpenDialog",
+        "iids": {IID_IFILEOPENDIALOG: FD_METHODS + ("GetResults", "GetSelectedItems"),
+                 IID_IFILEDIALOG: FD_METHODS, IID_IMODALWINDOW: UNK + ("Show",)},
+        "impl": FD_IMPL}
+    p.com_classes[CLSID_FILESAVEDIALOG] = {
+        "name": "FileSaveDialog",
+        "iids": {IID_IFILESAVEDIALOG: FD_METHODS + ("SetSaveAsItem", "SetProperties",
+                                                    "SetCollectedProperties", "GetProperties",
+                                                    "ApplyProperties"),
+                 IID_IFILEDIALOG: FD_METHODS, IID_IMODALWINDOW: UNK + ("Show",)},
+        "impl": FD_IMPL}
+
+    # ---- shell item factories ----------------------------------------------------------
+    def riid_of(a):
+        return bytes(M_.read(a, 16)) if a else IID_ISHELLITEM
+
+    @R("SHCreateItemFromParsingName", "pppp", dlls=SH)
+    def _SHCreateItemFromParsingName(c, name, pbc, riid, ppv):
+        put_ptr(ppv, 0)
+        path = gs(name, True)
+        if not path or not exists(path):
+            return 0x80070002
+        ptr, hr = make_item(norm(path) if path[1:2] == ":" else path, riid_of(riid))
+        put_ptr(ppv, ptr)
+        return hr
+
+    @R("SHCreateItemFromIDList", "ppp", dlls=SH)
+    def _SHCreateItemFromIDList(c, pidl, riid, ppv):
+        put_ptr(ppv, 0)
+        path = k.pidl_path(pidl) if pidl else None
+        if not path:
+            return E_INVALIDARG_COM
+        ptr, hr = make_item(path, riid_of(riid))
+        put_ptr(ppv, ptr)
+        return hr
+
+    @R("SHCreateShellItem", "pppp", dlls=SH)
+    def _SHCreateShellItem(c, parent, psf, pidl, ppsi):
+        return _SHCreateItemFromIDList(c, pidl, 0, ppsi)
+
+    @R("SHGetIDListFromObject", "pp", dlls=SH)
+    def _SHGetIDListFromObject(c, punk, ppidl):
+        path = fd_item_path(punk)
+        put_ptr(ppidl, k.make_pidl(path) if path else 0)
+        return S_OK if path else E_NOINTERFACE
+
+    @R("SHGetNameFromIDList", "pup", dlls=SH)
+    def _SHGetNameFromIDList(c, pidl, sigdn, ppsz):
+        path = k.pidl_path(pidl) if pidl else None
+        if not path:
+            put_ptr(ppsz, 0)
+            return E_INVALIDARG_COM
+        return si_display({"data": {"path": path}}, sigdn, ppsz)
+
+    @R("SHCreateItemInKnownFolder", "puppp", dlls=SH)
+    def _SHCreateItemInKnownFolder(c, kfid, flags, name, riid, ppv):
+        put_ptr(ppv, 0)
+        return E_NOTIMPL
+
+    # ---- IMalloc (SHGetMalloc / CoGetMalloc): the task allocator over the process heap ------
+    IID_IMALLOC = G("{00000002-0000-0000-C000-000000000046}")
+    CLSID_NOO_MALLOC = G("{4e4f4f4d-414c-4c4f-4300-000000000001}")
+    HEAP = lambda: p.process_heap_handle                                       # noqa: E731
+    MALLOC_CLS = {
+        "name": "TaskAllocator",
+        "iids": {IID_IMALLOC: UNK + ("Alloc", "Realloc", "Free", "GetSize", "DidAlloc",
+                                     "HeapMinimize")},
+        "impl": {"Alloc": meth(2, lambda e, n: p.heap_alloc(HEAP(), n)),
+                 "Realloc": meth(3, lambda e, pv, n: p.heap_realloc(HEAP(), pv, n) if pv
+                                 else p.heap_alloc(HEAP(), n)),
+                 "Free": meth(2, lambda e, pv: (p.heap_free(HEAP(), pv) if pv else None, 0)[1]),
+                 "GetSize": meth(2, lambda e, pv: p.heap_size(HEAP(), pv) if pv else
+                                 0xFFFFFFFF),
+                 "DidAlloc": meth(2, lambda e, pv: 1 if pv else 0xFFFFFFFF),
+                 "HeapMinimize": meth(1, lambda e: 0)},
+    }
+    malloc_obj = {}
+
+    def get_malloc(c, dummy, pp):
+        ptr = malloc_obj.get("ptr")
+        if ptr is None or obj_of(ptr) is None:
+            ptr, _hr = new_obj(MALLOC_CLS, CLSID_NOO_MALLOC, {}, IID_IMALLOC)
+            obj_of(ptr)["refs"] = 1 << 20                          # never destroyed
+            malloc_obj["ptr"] = ptr
+        put_ptr(pp, ptr)
+        return S_OK
+
+    R("SHGetMalloc", "p", dlls=SH)(lambda c, pp: get_malloc(c, 0, pp))
+    R("CoGetMalloc", "up", dlls=("ole32.dll",))(get_malloc)
+
+    @R("CoTaskMemRealloc", "pp", "p", dlls=("ole32.dll",))
+    def _CoTaskMemRealloc(c, pv, n):
+        if not pv:
+            return p.heap_alloc(HEAP(), n)
+        if not n:
+            p.heap_free(HEAP(), pv)
+            return 0
+        return p.heap_realloc(HEAP(), pv, n)
+
+
 # Bitmap glyphs rasterized from the DejaVu fonts (c) Bitstream / DejaVu
 # authors (Bitstream Vera / DejaVu license); regenerate with tools/mkfonts.py
 _NOO_FONT_B64 = (
@@ -50450,6 +53195,8 @@ class NOOProcess:
                 entry["refs"] += 1
                 return S_OK
             return E_NOINTERFACE
+        if mname in ("AddRef", "Release"):
+            cpu.get_arg(0)                 # x86: stdcall pops `this` (cleanup = args read)
         if mname == "AddRef":
             entry["refs"] += 1
             return entry["refs"]
