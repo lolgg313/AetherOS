@@ -12692,6 +12692,7 @@ class _SEH:
         self.ret_thunk = 0
         self.uw_thunk = 0
         self.states = {}            # tid -> list of dispatch states (stack)
+        self.frame_hooks = []       # fn(thread, walk_ctx) -> True if it replaced the frame
 
     # -- thunks ---------------------------------------------------------------------
     def install_thunks(self):
@@ -12926,6 +12927,9 @@ class _SEH:
                 continue
             if ph == "default":
                 self._pop_state(t, s)
+                if s["code"] == 0xE06D7363:
+                    self.p.log.error("unhandled C++ exception — std::terminate() -> abort()")
+                    raise NOOExitProcess(3)
                 self.p.log.error("unhandled exception 0x%08X at %#x — process terminated"
                                  % (s["code"], self._rec_address(s["rec"])))
                 try:
@@ -12981,6 +12985,9 @@ class _SEH:
         """The walk reached one of our dispatcher thunks (a fault or an unwind
         started inside a handler): continue from the context the enclosing
         dispatch was started for, like ntdll's dispatcher frames do."""
+        for hook in self.frame_hooks:
+            if hook(t, w):
+                return True
         if w["rip"] not in (self.ret_thunk, self.uw_thunk) or not w["rip"]:
             return False
         lst = self.states.get(t.tid, [])
@@ -13093,7 +13100,7 @@ class _SEH:
         raise NOOContextSet()
 
     # -- x86 RtlUnwind ---------------------------------------------------------------------
-    def rtl_unwind32(self, cpu, target_frame, target_ip, rec_ptr, retval):
+    def rtl_unwind32(self, cpu, target_frame, target_ip, rec_ptr, retval, on_finish=None):
         p = self.p
         t = p.current_thread
         m = p.mem
@@ -13118,7 +13125,7 @@ class _SEH:
                               (0 if target_frame else EXCEPTION_EXIT_UNWIND), ret, [])
         u = {"kind": "u32", "target": target_frame, "target_ip": target_ip or ret,
              "retval": retval, "ctx": ctx, "rec": rec, "sp": base - 0x40, "resume_sp": resume_sp,
-             "dctx": rec + 0x60}
+             "dctx": rec + 0x60, "on_finish": on_finish}
         self._push_state(t, u)
         self._unwind32_next(t, u)
         raise NOOContextSet()
@@ -13138,6 +13145,8 @@ class _SEH:
             return self._unwind32_next(t, u)
         # finished: continue at the target with EAX = return value
         self._pop_state(t, u)
+        if u.get("on_finish") is not None:
+            return u["on_finish"](t, u)
         self.load_context(cpu, u["ctx"])
         cpu.eip = u["target_ip"]
         cpu.regs[RAX] = u["retval"] & 0xFFFFFFFF
@@ -13155,7 +13164,8 @@ class _SEH:
         raise NOOContextSet()
 
     # -- x64 RtlUnwindEx ---------------------------------------------------------------------
-    def rtl_unwind64(self, cpu, target_frame, target_ip, rec_ptr, retval, orig_ctx):
+    def rtl_unwind64(self, cpu, target_frame, target_ip, rec_ptr, retval, orig_ctx,
+                     on_finish=None):
         p = self.p
         t = p.current_thread
         m = p.mem
@@ -13179,7 +13189,7 @@ class _SEH:
         m.write(rec, bytes(data))
         u = {"kind": "u64", "target": target_frame, "target_ip": target_ip, "retval": retval,
              "ctx": ctx, "rec": rec, "dctx": dctx, "sp": base - 0x80,
-             "w": {"regs": regs, "rip": ret}, "depth": 0}
+             "w": {"regs": regs, "rip": ret}, "depth": 0, "on_finish": on_finish}
         self._push_state(t, u)
         self._unwind64_next(t, u)
         raise NOOContextSet()
@@ -13238,7 +13248,10 @@ class _SEH:
         if fin == "ctx":
             regs, eip, fl, xmm, mx = self.read_context(u["ctx"])
         else:
-            regs = fin["regs"]
+            regs = list(fin["regs"])
+            eip = fin["rip"]
+        if u.get("on_finish") is not None:
+            return u["on_finish"](t, u, regs, eip)
         for i in range(16):
             cpu.regs[i] = regs[i] & M64
         cpu.eip = u["target_ip"]
@@ -19027,6 +19040,914 @@ def _k32_install(k):
 
 
 # ==============================================================================
+# 10e. MSVC exception runtime (vcruntime140 / msvcrt): C++ EH + x86 C SEH
+# ==============================================================================
+
+CXX_EXCEPTION = 0xE06D7363           # 'msc' | 0xE0000000
+_CXX_MAGICS = (0x19930520, 0x19930521, 0x19930522)
+HT_CONST, HT_VOLATILE, HT_UNALIGNED, HT_REFERENCE = 1, 2, 4, 8
+CT_SIMPLE, CT_BYREFONLY, CT_VIRTBASE = 1, 2, 4
+_FH4_NEG = (1, 2, 1, 3, 1, 2, 1, 4, 1, 2, 1, 3, 1, 2, 1, 5)
+
+
+class _CxxEH:
+    """The MSVC C++ exception model on top of NOO's SEH dispatcher.
+
+    _CxxThrowException raises 0xE06D7363; __CxxFrameHandler3/4 find try
+    blocks from the function's EH tables, unwind the stack (running local
+    destructors through the compiler's unwind funclets), build the catch
+    object and run the catch funclet on the guest thread. Catch funclets
+    return into an internal thunk that resumes the parent function at the
+    continuation address, so nested throws and rethrows inside catch blocks
+    dispatch naturally. x86 frames also get _except_handler3/4 (C SEH)."""
+
+    def __init__(self, proc):
+        self.p = proc
+        self.pending = {}          # tid -> catch chosen in the search phase
+        self.active = {}           # tid -> [catch records currently executing]
+        self.in_flight = {}        # tid -> uncaught exception count
+        self.catch_ret = 0
+        self.cache = {}            # (kind, addr) -> parsed EH tables
+
+    # -- memory helpers ------------------------------------------------------------
+    def _x64(self):
+        return self.p.cpu_mode == 64
+
+    def u32(self, a):
+        return self.p.mem.read32(a)
+
+    def s32(self, a):
+        return _s32(self.p.mem.read32(a))
+
+    def ptr(self, a):
+        return self.p.mem.read64(a) if self._x64() else self.p.mem.read32(a)
+
+    def wptr(self, a, v):
+        if self._x64():
+            self.p.mem.write64(a, v & M64)
+        else:
+            self.p.mem.write32(a, v & 0xFFFFFFFF)
+
+    def _abs(self, v, base):
+        """x64 tables hold image-relative offsets, x86 tables absolute VAs."""
+        if not v:
+            return 0
+        return (base + v) & M64 if self._x64() else v
+
+    # -- FuncInfo (FH3 layout, x86 and x64) ------------------------------------------
+    def funcinfo3(self, fi, base):
+        key = ("fi3", fi)
+        info = self.cache.get(key)
+        if info is not None:
+            return info
+        m = self.p.mem
+        if self._x64():
+            magic, max_state, d_uw, n_try, d_try, n_ip, d_ip, d_help, d_es = \
+                struct.unpack("<IiIIIIIiI", m.read(fi, 36))
+        else:
+            magic, max_state, d_uw, n_try, d_try, n_ip, d_ip, d_es = \
+                struct.unpack("<IiIIIIII", m.read(fi, 32))
+            d_help = 0
+        magic &= 0x1FFFFFFF
+        ehflags = 0
+        if magic >= 0x19930522:
+            ehflags = m.read32(fi + (36 if self._x64() else 32))
+        umap = []
+        uw = self._abs(d_uw, base)
+        for i in range(max(0, min(max_state, 1 << 16))):
+            to, act = struct.unpack("<iI", m.read(uw + 8 * i, 8))
+            umap.append((to, ("funclet", self._abs(act, base)) if act else None))
+        tries = []
+        tb = self._abs(d_try, base)
+        hsize = 20 if self._x64() else 16
+        for i in range(min(n_try, 1 << 12)):
+            lo, hi, chigh, nc, harr = struct.unpack("<iiiiI", m.read(tb + 20 * i, 20))
+            harr = self._abs(harr, base)
+            hs = []
+            for j in range(min(nc, 256)):
+                if self._x64():
+                    adj, td, disp, h, frame = struct.unpack("<IIiIi", m.read(harr + hsize * j, 20))
+                else:
+                    adj, td, disp, h = struct.unpack("<IIiI", m.read(harr + hsize * j, 16))
+                    frame = 0
+                hs.append({"adj": adj, "td": self._abs(td, base), "disp": disp,
+                           "handler": self._abs(h, base), "frame": frame, "cont": ()})
+            tries.append({"low": lo, "high": hi, "catch_high": chigh, "handlers": hs})
+        ipmap = []
+        if self._x64() and d_ip:
+            ip = base + d_ip
+            for i in range(min(n_ip, 1 << 16)):
+                a, st = struct.unpack("<Ii", m.read(ip + 8 * i, 8))
+                ipmap.append((base + a, st))
+        info = {"kind": 3, "magic": magic, "umap": umap, "tries": tries, "ipmap": ipmap,
+                "ehs": bool(ehflags & 1), "base": base, "is_catch": False, "frame": 0,
+                "id": ("fi3", fi)}
+        self.cache[key] = info
+        return info
+
+    # -- FuncInfo4 (x64 __CxxFrameHandler4 compressed tables) --------------------------
+    def _uns(self, a):
+        m = self.p.mem
+        b0 = m.read8(a)
+        n = _FH4_NEG[b0 & 0xF]
+        if n == 5:
+            return m.read32(a + 1), a + 5
+        raw = int.from_bytes(m.read(a, n), "little")
+        v = ((raw << (8 * (4 - n))) & 0xFFFFFFFF) >> (32 - 7 * n)
+        return v, a + n
+
+    def _int(self, a):
+        return _s32(self.p.mem.read32(a)), a + 4
+
+    def funcinfo4(self, fi, base, func_start):
+        key = ("fi4", fi, func_start)
+        info = self.cache.get(key)
+        if info is not None:
+            return info
+        m = self.p.mem
+        hdr = m.read8(fi)
+        a = fi + 1
+        d_uw = d_try = frame = 0
+        if hdr & 4:
+            _bbt, a = self._uns(a)
+        if hdr & 8:
+            d_uw, a = self._int(a)
+        if hdr & 0x10:
+            d_try, a = self._int(a)
+        d_ip, a = self._int(a)
+        if hdr & 1:
+            frame, a = self._uns(a)
+        # unwind map: entries addressed by byte offset; toState via back offsets
+        umap = []
+        if d_uw:
+            a = base + d_uw
+            n, a = self._uns(a)
+            starts = {}
+            raw = []
+            for i in range(min(n, 1 << 16)):
+                off = a
+                starts[off] = i
+                nt, a = self._uns(a)
+                typ, nxt = nt & 3, nt >> 2
+                act = obj = 0
+                if typ in (1, 2):
+                    act, a = self._int(a)
+                    obj, a = self._uns(a)
+                elif typ == 3:
+                    act, a = self._int(a)
+                raw.append((off, typ, nxt, act, obj))
+            for off, typ, nxt, act, obj in raw:
+                to = starts.get(off - nxt, -1) if nxt else -1
+                if typ == 0:
+                    umap.append((to, None))
+                elif typ == 3:
+                    umap.append((to, ("funclet", base + act)))
+                else:
+                    umap.append((to, ("dtor" if typ == 1 else "dtor_ptr", base + act, obj)))
+        tries = []
+        if d_try:
+            a = base + d_try
+            n, a = self._uns(a)
+            for i in range(min(n, 1 << 12)):
+                lo, a = self._uns(a)
+                hi, a = self._uns(a)
+                chigh, a = self._uns(a)
+                harr, a = self._int(a)
+                hs = []
+                b = base + harr
+                nh, b = self._uns(b)
+                for j in range(min(nh, 256)):
+                    hh = m.read8(b)
+                    b += 1
+                    adj = td = disp = 0
+                    if hh & 1:
+                        adj, b = self._uns(b)
+                    if hh & 2:
+                        td, b = self._int(b)
+                    if hh & 4:
+                        disp, b = self._uns(b)
+                    h, b = self._int(b)
+                    conts = []
+                    for _k in range((hh >> 4) & 3):
+                        if hh & 8:
+                            c, b = self._int(b)
+                            conts.append(base + c)
+                        else:
+                            c, b = self._uns(b)
+                            conts.append(func_start + c)
+                    hs.append({"adj": adj, "td": base + td if td else 0, "disp": disp,
+                               "handler": base + h, "frame": 0, "cont": tuple(conts)})
+                tries.append({"low": lo, "high": hi, "catch_high": chigh, "handlers": hs})
+        ipmap = []
+        if d_ip:
+            a = base + d_ip
+            if hdr & 2:                              # separated code segments
+                ns, a = self._uns(a)
+                seg_map = 0
+                for _i in range(min(ns, 256)):
+                    seg_rva, a = self._int(a)
+                    seg_ip, a = self._int(a)
+                    if base + seg_rva == func_start:
+                        seg_map = seg_ip
+                a = base + seg_map if seg_map else 0
+            if a:
+                n, a = self._uns(a)
+                ip = func_start
+                for i in range(min(n, 1 << 16)):
+                    d, a = self._uns(a)
+                    st, a = self._uns(a)
+                    ip += d
+                    ipmap.append((ip, st - 1))
+        info = {"kind": 4, "magic": 0x19930522, "umap": umap, "tries": tries,
+                "ipmap": ipmap, "ehs": bool(hdr & 0x20), "base": base,
+                "is_catch": bool(hdr & 1), "frame": frame,
+                "id": ("fi4", base + d_uw if d_uw else fi, base + d_try if d_try else fi)}
+        self.cache[key] = info
+        return info
+
+    # -- states --------------------------------------------------------------------
+    @staticmethod
+    def state_from_pc(info, pc):
+        st = -1
+        for ip, s in info["ipmap"]:
+            if pc < ip:
+                break
+            st = s
+        return st
+
+    @staticmethod
+    def enclosing(info, t):
+        um = info["umap"]
+        lo = t["low"]
+        return um[lo][0] if 0 <= lo < len(um) else -1
+
+    def _find_active(self, tid, frame, info):
+        for ac in reversed(self.active.get(tid, [])):
+            if ac["frame"] == frame and ac["info"]["id"] == info["id"]:
+                return ac
+        return None
+
+    # -- throw info ------------------------------------------------------------------
+    def throw_info(self, rec):
+        """-> dict(obj, ti, attrs, dtor, cts) for a C++ exception record."""
+        m = self.p.mem
+        ps = 8 if self._x64() else 4
+        base_off = 0x20 if ps == 8 else 0x14
+        n = m.read32(rec + (0x18 if ps == 8 else 0x10))
+        if m.read32(rec) != CXX_EXCEPTION or n < 3:
+            return None
+        magic = self.ptr(rec + base_off)
+        if magic not in _CXX_MAGICS:
+            return None
+        obj = self.ptr(rec + base_off + ps)
+        ti = self.ptr(rec + base_off + 2 * ps)
+        tib = self.ptr(rec + base_off + 3 * ps) if ps == 8 and n >= 4 else 0
+        if not ti:
+            return None
+        attrs, dtor, _fwd, cta = struct.unpack("<IIII", m.read(ti, 16))
+        dtor = self._abs(dtor, tib)
+        cta = self._abs(cta, tib)
+        cts = []
+        cnt = m.read32(cta)
+        for i in range(min(cnt, 64)):
+            ct = self._abs(m.read32(cta + 4 + 4 * i), tib)
+            props, td, mdisp, pdisp, vdisp, size, copy = struct.unpack("<IIiiiiI", m.read(ct, 28))
+            cts.append({"props": props, "td": self._abs(td, tib), "pmd": (mdisp, pdisp, vdisp),
+                        "size": size, "copy": self._abs(copy, tib)})
+        return {"obj": obj, "ti": ti, "attrs": attrs, "dtor": dtor, "cts": cts}
+
+    def td_name(self, td):
+        ps = 8 if self._x64() else 4
+        try:
+            return self.p.mem.read_cstring(td + 2 * ps, 512)
+        except NOOCPUFault:
+            return b""
+
+    def match(self, h, ex):
+        """-> (True, catchable type or None) when handler h catches ex."""
+        if not h["td"] or not self.td_name(h["td"]):
+            return True, None                        # catch (...)
+        if ex is None:
+            return False, None
+        hname = self.td_name(h["td"])
+        for ct in ex["cts"]:
+            if ct["td"] != h["td"] and self.td_name(ct["td"]) != hname:
+                continue
+            if ct["props"] & CT_BYREFONLY and not h["adj"] & HT_REFERENCE:
+                continue
+            if (ex["attrs"] & 1 and not h["adj"] & HT_CONST) or \
+                    (ex["attrs"] & 2 and not h["adj"] & HT_VOLATILE) or \
+                    (ex["attrs"] & 4 and not h["adj"] & HT_UNALIGNED):
+                continue
+            return True, ct
+        return False, None
+
+    def adjust(self, p_, pmd):
+        mdisp, pdisp, vdisp = pmd
+        r = p_ + mdisp
+        if pdisp >= 0:
+            vb = self.ptr(p_ + pdisp)
+            r += _s32(self.p.mem.read32(vb + vdisp)) + pdisp
+        return r & (M64 if self._x64() else 0xFFFFFFFF)
+
+    # -- guest calls -------------------------------------------------------------------
+    def thiscall(self, fn, this, args=(), sp=None):
+        if self._x64():
+            return self.p.call_guest(fn, [this] + list(args), sp=sp)
+        return self.p.call_guest(fn, list(args), regs={RCX: this}, sp=sp)
+
+    def destroy(self, ex, sp=None):
+        if ex and ex.get("dtor") and ex.get("obj"):
+            try:
+                self.thiscall(ex["dtor"], ex["obj"], sp=sp)
+            except (NOOCPUFault, NOOInternalError) as e:
+                self.p.log.warn("exception object destructor failed: %s" % e)
+
+    def build_catch_object(self, h, ct, ex, dest, sp=None):
+        if not h["td"] or not h["disp"] or ex is None or ct is None:
+            return
+        m = self.p.mem
+        ps = 8 if self._x64() else 4
+        obj = ex["obj"]
+        if h["adj"] & HT_REFERENCE:
+            self.wptr(dest, self.adjust(obj, ct["pmd"]))
+        elif ct["props"] & CT_SIMPLE:
+            m.write(dest, m.read(obj, ct["size"]))
+            if ct["size"] == ps and (ct["pmd"][0] or ct["pmd"][1] >= 0):
+                v = self.ptr(dest)
+                if v:
+                    self.wptr(dest, self.adjust(v, ct["pmd"]))
+        else:
+            src = self.adjust(obj, ct["pmd"])
+            if ct["copy"]:
+                self.thiscall(ct["copy"], dest, [src, 1] if ct["props"] & CT_VIRTBASE else [src],
+                              sp=sp)
+            else:
+                m.write(dest, m.read(src, ct["size"]))
+
+    def unwind_to(self, info, frame, cur, target, x86_rn=0, sp=None):
+        """Run unwind actions from state cur down to target (exclusive)."""
+        um = info["umap"]
+        guard = 0
+        while cur != target and 0 <= cur < len(um) and guard < 100000:
+            guard += 1
+            to, act = um[cur]
+            if x86_rn:
+                self.p.mem.write32(x86_rn + 8, to & 0xFFFFFFFF)
+            if act is not None:
+                try:
+                    if act[0] == "funclet":
+                        if self._x64():
+                            self.p.call_guest(act[1], [frame, frame], sp=sp)
+                        else:
+                            self.p.call_guest(act[1], [], regs={RBP: x86_rn + 12}, sp=sp)
+                    elif act[0] == "dtor":
+                        self.thiscall(act[1], frame + act[2], sp=sp)
+                    else:
+                        self.thiscall(act[1], self.ptr(frame + act[2]), sp=sp)
+                except (NOOCPUFault, NOOInternalError) as e:
+                    self.p.log.warn("C++ unwind action failed: %s" % e)
+            cur = to
+
+    # =================================================================================
+    # x64: __CxxFrameHandler3 / __CxxFrameHandler4
+    # =================================================================================
+    def _x64_frame(self, info, rec, est, dc):
+        """-> (parent establisher frame, current state, in catch funclet?)."""
+        m = self.p.mem
+        pc = m.read64(dc)
+        fe = m.read64(dc + 16)
+        begin = info["base"] + m.read32(fe) if fe else 0
+        st = self.state_from_pc(info, pc)
+        if info["kind"] == 4:
+            if info["is_catch"]:
+                return m.read64(est + info["frame"]), st, True
+        else:
+            for tb in info["tries"]:
+                for h in tb["handlers"]:
+                    if h["handler"] == begin:
+                        return m.read64(est + h["frame"]), st, True
+        return est, st, False
+
+    def frame_handler64(self, cpu, rec, est, ctx, dc, kind):
+        m = self.p.mem
+        p = self.p
+        t = p.current_thread
+        flags = m.read32(rec + 4)
+        base = m.read64(dc + 8)
+        hdata = m.read64(dc + 56)
+        fe = m.read64(dc + 16)
+        if kind == 4:
+            info = self.funcinfo4(base + m.read32(hdata), base, base + m.read32(fe))
+        else:
+            info = self.funcinfo3(base + m.read32(hdata), base)
+        frame, st, in_funclet = self._x64_frame(info, rec, est, dc)
+        ex = self.throw_info(rec)
+        pend = self.pending.get(t.tid)
+        is_target = bool(flags & EXCEPTION_TARGET_UNWIND) and pend is not None and \
+            pend.get("unwind_frame") == est
+        if in_funclet:
+            acf = self._find_active(t.tid, frame, info)
+        else:
+            acf = None
+            ac = self._find_active(t.tid, frame, info)
+            if ac is not None:
+                st = self.enclosing(info, ac["try"])
+        if flags & (EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND):
+            if is_target:
+                target = pend["try"]["low"]
+            elif in_funclet and acf is not None:
+                target = self.enclosing(info, acf["try"])     # leave the catch body
+            else:
+                target = -1
+            self.unwind_to(info, frame, st, target)
+            if not is_target:
+                # leaving a catch block by an exception ends it (the record
+                # stays until the walk has passed its parent frame)
+                done = acf if in_funclet else self._find_active(t.tid, frame, info)
+                if done is not None:
+                    self._end_catch(t, done, ex, remove=not in_funclet)
+            return 1
+        if ex is None and (info["ehs"] or info["magic"] < 0x19930520):
+            return 1
+        for tb in info["tries"]:
+            if not tb["low"] <= st <= tb["high"]:
+                continue
+            for h in tb["handlers"]:
+                ok, ct = self.match(h, ex)
+                if not ok:
+                    continue
+                if ex is None and h["td"] and self.td_name(h["td"]):
+                    continue
+                # a try block inside the running catch body is unwound to in
+                # the funclet's frame; an enclosing one in the parent's frame
+                nested = in_funclet and acf is not None and \
+                    acf["try"]["high"] < tb["low"] and tb["high"] <= acf["try"]["catch_high"]
+                self.pending[t.tid] = {"frame": frame, "info": info, "try": tb, "handler": h,
+                                       "ct": ct, "ex": ex,
+                                       "unwind_frame": est if nested or not in_funclet else frame}
+                p.seh.rtl_unwind64(cpu, self.pending[t.tid]["unwind_frame"], 0, rec, 0, ctx,
+                                   on_finish=self._x64_catch)
+        return 1
+
+    def _end_catch(self, t, ac, new_ex=None, remove=True):
+        lst = self.active.get(t.tid, [])
+        if remove and ac in lst:
+            lst.remove(ac)
+        if not ac["done"]:
+            ac["done"] = True
+            same = new_ex is not None and ac["ex"] is not None and new_ex["obj"] == ac["ex"]["obj"]
+            if not ac["rethrown"] and not same:
+                self.destroy(ac["ex"])
+
+    def _begin_catch(self, t, pend, frame, sp):
+        # running catches of this frame that the new try block is not nested
+        # in are being abandoned (the exception escaped them): they end now
+        tb = pend["try"]
+        lst = self.active.get(t.tid, [])
+        lst[:] = [a for a in lst if not a["done"]]      # escaped catches are over now
+        for old in [a for a in lst if a["frame"] == frame]:
+            ot = old["try"]
+            if not (ot["high"] < tb["low"] and tb["high"] <= ot["catch_high"]):
+                if "saved_esp" in old:
+                    self.p.mem.write32(frame - 4, old["saved_esp"])
+                self._end_catch(t, old, pend["ex"])
+        n = self.in_flight.get(t.tid, 0)
+        if n and pend["ex"] is not None:
+            self.in_flight[t.tid] = n - 1
+        ac = {"frame": frame, "info": pend["info"], "try": pend["try"], "ex": pend["ex"],
+              "handler": pend["handler"], "rethrown": False, "done": False, "ret_sp": 0}
+        self.active.setdefault(t.tid, []).append(ac)
+        return ac
+
+    def _x64_catch(self, t, u, regs, rip):
+        cpu = t.cpu
+        pend = self.pending.pop(t.tid)
+        frame = pend["frame"]
+        sp = (u["sp"] - 0x200) & ~0xF
+        h = pend["handler"]
+        self.build_catch_object(h, pend["ct"], pend["ex"], frame + h["disp"], sp=sp)
+        ac = self._begin_catch(t, pend, frame, sp)
+        ac["regs"] = list(regs)
+        ac["rip"] = rip
+        # run the catch funclet on the deep stack (the exception object lives
+        # in the thrower's frame, above us); it returns into catch_ret
+        self.p.seh._call(cpu, h["handler"], [frame, frame], self.catch_ret, sp)
+        ac["ret_sp"] = cpu.regs[RSP] + 8
+        cpu.regs[RDX] = frame
+
+    def _on_catch_ret(self, cpu):
+        t = self.p.current_thread
+        lst = self.active.get(t.tid, [])
+        if not lst:
+            raise NOOError("catch funclet returned with no active catch")
+        ac = lst[-1]
+        cont = cpu.regs[RAX] & (M64 if self._x64() else 0xFFFFFFFF)
+        conts = ac["handler"].get("cont") or ()
+        if conts and cont < len(conts):
+            cont = conts[cont]
+        self._end_catch(t, ac)
+        if self._x64():
+            for i in range(16):
+                cpu.regs[i] = ac["regs"][i] & M64
+        else:
+            rn = ac["frame"]
+            info = ac["info"]
+            self.p.mem.write32(rn + 8, self.enclosing(info, ac["try"]) & 0xFFFFFFFF)
+            self.p.mem.write32(rn - 4, ac["saved_esp"])
+            cpu.regs[RSP] = ac["saved_esp"]
+            cpu.regs[RBP] = rn + 12
+            self.p.mem.write32(t.teb, rn)
+        cpu.eip = cont
+        raise NOOContextSet()
+
+    def frame_hook(self, t, w):
+        """x64 stack walks through a running catch funclet continue in the
+        parent function (like the consolidation frame on Windows)."""
+        if w["rip"] != self.catch_ret:
+            return False
+        sp = w["regs"][RSP]
+        for ac in reversed(self.active.get(t.tid, [])):
+            if ac.get("ret_sp") == sp:
+                w["regs"][:] = list(ac["regs"])
+                w["rip"] = ac["rip"]
+                return True
+        return False
+
+    # =================================================================================
+    # x86: __CxxFrameHandler(2/3) — EAX = FuncInfo, frame = registration node
+    # =================================================================================
+    def frame_handler32(self, cpu, rec, rn, ctx, dc, fi):
+        m = self.p.mem
+        p = self.p
+        t = p.current_thread
+        flags = m.read32(rec + 4)
+        info = self.funcinfo3(fi, 0)
+        st = _s32(m.read32(rn + 8))
+        ex = self.throw_info(rec)
+        if flags & (EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND):
+            self.unwind_to(info, rn + 12, st, -1, x86_rn=rn)
+            ac = self._find_active(t.tid, rn, info)
+            if ac is not None:
+                self._end_catch(t, ac, ex)
+            return 1
+        if ex is None and (info["ehs"] or info["magic"] < 0x19930520):
+            return 1
+        for tb in info["tries"]:
+            if not tb["low"] <= st <= tb["high"]:
+                continue
+            for h in tb["handlers"]:
+                ok, ct = self.match(h, ex)
+                if not ok:
+                    continue
+                if ex is None and h["td"] and self.td_name(h["td"]):
+                    continue
+                self.pending[t.tid] = {"frame": rn, "info": info, "try": tb, "handler": h,
+                                       "ct": ct, "ex": ex, "unwind_frame": rn}
+                p.seh.rtl_unwind32(cpu, rn, 0, rec, 0, on_finish=self._x86_catch)
+                raise NOOContextSet()
+        return 1
+
+    def _x86_catch(self, t, u):
+        cpu = t.cpu
+        m = self.p.mem
+        pend = self.pending.pop(t.tid)
+        rn = pend["frame"]
+        info = pend["info"]
+        tb = pend["try"]
+        h = pend["handler"]
+        sp = (u["sp"] - 0x100) & ~0xF
+        st = _s32(m.read32(rn + 8))
+        self.unwind_to(info, rn + 12, st, tb["low"], x86_rn=rn, sp=sp)
+        self.build_catch_object(h, pend["ct"], pend["ex"], rn + 12 + h["disp"], sp=sp)
+        nxt = tb["high"] + 1 if tb["high"] + 1 <= tb["catch_high"] else self.enclosing(info, tb)
+        m.write32(rn + 8, nxt & 0xFFFFFFFF)
+        m.write32(t.teb, rn)
+        ac = self._begin_catch(t, pend, rn, sp)
+        ac["saved_esp"] = m.read32(rn - 4)       # the funclet reuses this slot
+        self.p.seh._call(cpu, h["handler"], [], self.catch_ret, sp)
+        cpu.regs[RBP] = rn + 12
+
+    # =================================================================================
+    # x86 C SEH: _except_handler3 / _except_handler4
+    # =================================================================================
+    def except_handler(self, cpu, rec, rn, ctx, dc, eh4, cookie=0):
+        """Frame layout (both): [rn-8] saved esp, [rn-4] exception pointers,
+        [rn] next, [rn+4] handler, [rn+8] scope table, [rn+12] try level;
+        the function's EBP is rn+16."""
+        m = self.p.mem
+        p = self.p
+        t = p.current_thread
+        flags = m.read32(rec + 4)
+        ebp = rn + 16
+        table = m.read32(rn + 8)
+        if eh4:
+            table ^= cookie
+            entries = table + 16
+            none = 0xFFFFFFFE
+        else:
+            entries = table
+            none = 0xFFFFFFFF
+        if flags & (EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND):
+            self.local_unwind_seh(rn, entries, none, none)
+            return 1
+        ep = self._ep(t, rec, ctx)
+        m.write32(rn - 4, ep)
+        tl = m.read32(rn + 12)
+        guard = 0
+        while tl != none and tl != 0xFFFFFFFF and guard < 4096:
+            guard += 1
+            enclosing, flt, hnd = struct.unpack("<III", m.read(entries + 12 * tl, 12))
+            if flt:
+                r = _s32(p.call_guest(flt, [], regs={RBP: ebp}) & 0xFFFFFFFF)
+                if r < 0:
+                    return 0                            # ExceptionContinueExecution
+                if r > 0:
+                    t_ = t
+                    self.pending[t_.tid] = {"seh": (rn, entries, none, tl, enclosing, hnd)}
+                    p.seh.rtl_unwind32(cpu, rn, 0, rec, 0, on_finish=self._seh_catch)
+                    raise NOOContextSet()
+            tl = enclosing
+        return 1
+
+    def _ep(self, t, rec, ctx):
+        ep = self.__dict__.setdefault("eps", {}).get(t.tid)
+        if ep is None:
+            ep = self.eps[t.tid] = self.p.heap_alloc(self.p.process_heap_handle, 16)
+        self.p.mem.write32(ep, rec)
+        self.p.mem.write32(ep + 4, ctx)
+        return ep
+
+    def local_unwind_seh(self, rn, entries, none, stop, sp=None):
+        m = self.p.mem
+        guard = 0
+        tl = m.read32(rn + 12)
+        while tl != stop and tl != none and tl != 0xFFFFFFFF and guard < 4096:
+            guard += 1
+            enclosing, flt, hnd = struct.unpack("<III", m.read(entries + 12 * tl, 12))
+            m.write32(rn + 12, enclosing)
+            if not flt and hnd:                        # __finally block
+                try:
+                    self.p.call_guest(hnd, [], regs={RBP: rn + 16}, sp=sp)
+                except (NOOCPUFault, NOOInternalError) as e:
+                    self.p.log.warn("__finally block failed: %s" % e)
+            tl = enclosing
+
+    def _seh_catch(self, t, u):
+        cpu = t.cpu
+        m = self.p.mem
+        rn, entries, none, tl, enclosing, hnd = self.pending.pop(t.tid)["seh"]
+        sp = (u["sp"] - 0x100) & ~0xF
+        self.local_unwind_seh(rn, entries, none, tl, sp=sp)
+        m.write32(rn + 12, enclosing)
+        m.write32(t.teb, rn)
+        cpu.regs[RSP] = m.read32(rn - 8)
+        cpu.regs[RBP] = rn + 16
+        cpu.eip = hnd
+
+    # =================================================================================
+    # API surface
+    # =================================================================================
+    def throw(self, cpu, obj, ti):
+        p = self.p
+        t = p.current_thread
+        if not obj and not ti:                          # `throw;`
+            lst = self.active.get(t.tid, [])
+            cur = lst[-1] if lst else None
+            if cur is None or cur["ex"] is None:
+                p.log.error("rethrow with no active C++ exception — std::terminate()")
+                raise NOOExitProcess(3)
+            cur["rethrown"] = True
+            obj, ti = cur["ex"]["obj"], cur["ex"]["ti"]
+        self.in_flight[t.tid] = self.in_flight.get(t.tid, 0) + 1
+        if self._x64():
+            base = 0
+            for b, pe in p.unwinder._images():
+                if b <= ti < b + pe.size_of_image:
+                    base = b
+            params = [0x19930520, obj, ti, base]
+        else:
+            params = [0x19930520, obj, ti]
+        p.seh.raise_exception(cpu, CXX_EXCEPTION, EXCEPTION_NONCONTINUABLE, params)
+
+    def install(self, k):
+        p = self.p
+        R = k.reg
+        VC = ("vcruntime140.dll", "msvcrt.dll", "ucrtbase.dll", "msvcr100.dll", "msvcr110.dll",
+              "msvcr120.dll", "vcruntime140d.dll", "msvcr90.dll", "msvcr80.dll")
+
+        def catch_ret(cpu):
+            return self._on_catch_ret(cpu)
+        catch_ret._noo_cc = "cdecl"
+        p.api.table[("!noo!", "catch_ret")] = catch_ret
+        if getattr(p, "seh", None) is not None:
+            self.catch_ret = p.api_thunk("!noo!", "catch_ret")
+            p.seh.frame_hooks.append(self.frame_hook)
+        x64 = getattr(p, "cpu_mode", 32) == 64
+
+        @R("_CxxThrowException", "pp", "v", dlls=VC)
+        def _cxxthrow(c, obj, ti):
+            self.throw(c, obj, ti)
+
+        if x64:
+            @R("__CxxFrameHandler3 __CxxFrameHandler2 __CxxFrameHandler __GSHandlerCheck_EH",
+               "pppp", dlls=VC, cc="cdecl")
+            def _fh3(c, rec, est, ctx, dc):
+                return self.frame_handler64(c, rec, est, ctx, dc, 3)
+
+            @R("__CxxFrameHandler4 __GSHandlerCheck_EH4", "pppp", dlls=VC, cc="cdecl")
+            def _fh4(c, rec, est, ctx, dc):
+                return self.frame_handler64(c, rec, est, ctx, dc, 4)
+
+            @R("__GSHandlerCheck", "pppp", dlls=VC, cc="cdecl")
+            def _gshc(c, rec, est, ctx, dc):
+                return 1                              # ExceptionContinueSearch
+
+            @R("__GSHandlerCheck_SEH", "pppp", dlls=VC, cc="cdecl")
+            def _gshc_seh(c, rec, est, ctx, dc):
+                return p.api.table[("ntdll.dll", "__c_specific_handler")](c)
+        else:
+            @R("__CxxFrameHandler3 __CxxFrameHandler2 __CxxFrameHandler", "pppp",
+               dlls=VC, cc="cdecl")
+            def _fh3_32(c, rec, rn, ctx, dc):
+                return self.frame_handler32(c, rec, rn, ctx, dc, c.regs[RAX] & 0xFFFFFFFF)
+
+            @R("_except_handler3 _except_handler2", "pppp", dlls=VC, cc="cdecl")
+            def _eh3(c, rec, rn, ctx, dc):
+                return self.except_handler(c, rec, rn, ctx, dc, False)
+
+            @R("_except_handler4_common", "pppppp", dlls=VC, cc="cdecl")
+            def _eh4c(c, cookie_ptr, check, rec, rn, ctx, dc):
+                cookie = p.mem.read32(cookie_ptr) if cookie_ptr else 0
+                return self.except_handler(c, rec, rn, ctx, dc, True, cookie)
+
+            @R("_local_unwind2", "pi", "v", dlls=VC, cc="cdecl")
+            def _lu2(c, rn, stop):
+                self.local_unwind_seh(rn, p.mem.read32(rn + 8), 0xFFFFFFFF, stop & 0xFFFFFFFF)
+
+            @R("_local_unwind4", "ppi", "v", dlls=VC, cc="cdecl")
+            def _lu4(c, cookie_ptr, rn, stop):
+                cookie = p.mem.read32(cookie_ptr) if cookie_ptr else 0
+                self.local_unwind_seh(rn, (p.mem.read32(rn + 8) ^ cookie) + 16, 0xFFFFFFFE,
+                                      stop & 0xFFFFFFFF)
+
+            @R("_global_unwind2", "p", "v", dlls=VC, cc="cdecl")
+            def _gu2(c, frame):
+                # RtlUnwind(frame) on behalf of the caller, then return to it
+                saved = list(c.regs)
+                ret = p.mem.read32(saved[RSP])
+
+                def fin(t_, u):
+                    for i in range(8):
+                        t_.cpu.regs[i] = saved[i]
+                    t_.cpu.regs[RSP] = (saved[RSP] + 4) & 0xFFFFFFFF
+                    t_.cpu.eip = ret
+
+                p.seh.rtl_unwind32(c, frame, 0, 0, 0, on_finish=fin)
+
+        @R("__std_terminate terminate ?terminate@@YAXXZ _invoke_watson __fastfail",
+           "", "v", dlls=VC)
+        def _terminate(c):
+            p.log.error("std::terminate() called — abort()")
+            raise NOOExitProcess(3)
+
+        @R("__uncaught_exception ?uncaught_exception@std@@YA_NXZ", "", dlls=VC)
+        def _uncaught(c):
+            return 1 if self.in_flight.get(p.current_thread.tid, 0) else 0
+
+        @R("__uncaught_exceptions", "", dlls=VC)
+        def _uncaughts(c):
+            return self.in_flight.get(p.current_thread.tid, 0)
+
+        self.cur_cells = {}
+
+        def _cell(tid):
+            a = self.cur_cells.get(tid)
+            if a is None:
+                a = self.cur_cells[tid] = p.heap_alloc(p.process_heap_handle, 32)
+            return a
+
+        @R("__current_exception", "", "p", dlls=VC)
+        def _curex(c):
+            t = p.current_thread
+            a = _cell(t.tid)
+            lst = self.active.get(t.tid, [])
+            self.wptr(a, 0)
+            return a
+
+        @R("__current_exception_context", "", "p", dlls=VC)
+        def _curexc(c):
+            a = _cell(p.current_thread.tid) + 16
+            self.wptr(a, 0)
+            return a
+
+        @R("__processing_throw", "", "p", dlls=VC)
+        def _pthrow(c):
+            a = _cell(p.current_thread.tid) + 24
+            p.mem.write32(a, self.in_flight.get(p.current_thread.tid, 0))
+            return a
+
+        # std::exception support (vcruntime) --------------------------------------------
+        @R("__std_exception_copy", "pp", "v", dlls=VC)
+        def _sec(c, src, dst):
+            ps = 8 if self._x64() else 4
+            what = self.ptr(src)
+            do_free = p.mem.read8(src + ps)
+            if do_free and what:
+                s_ = p.mem.read_cstring(what, 1 << 20)
+                a = p.heap_alloc(p.process_heap_handle, len(s_) + 1)
+                p.mem.write(a, s_ + b"\0")
+                self.wptr(dst, a)
+                p.mem.write8(dst + ps, 1)
+            else:
+                self.wptr(dst, what)
+                p.mem.write8(dst + ps, 0)
+
+        @R("__std_exception_destroy", "p", "v", dlls=VC)
+        def _sed(c, d):
+            ps = 8 if self._x64() else 4
+            if p.mem.read8(d + ps):
+                p.heap_free(p.process_heap_handle, self.ptr(d))
+            self.wptr(d, 0)
+            p.mem.write8(d + ps, 0)
+
+        # type_info (vcruntime) ---------------------------------------------------------
+        @R("__std_type_info_name", "pp", "p", dlls=VC)
+        def _stin(c, ti, lst):
+            ps = 8 if self._x64() else 4
+            cached = self.ptr(ti)
+            if cached:
+                return cached
+            raw = p.mem.read_cstring(ti + ps + 1, 512).decode("latin-1")
+            name = _undecorate_type(raw)
+            a = p.heap_alloc(p.process_heap_handle, len(name) + 1)
+            p.mem.write(a, name.encode("latin-1", "replace") + b"\0")
+            self.wptr(ti, a)
+            return a
+
+        @R("__std_type_info_compare", "pp", dlls=VC)
+        def _stic(c, a, b_):
+            if a == b_:
+                return 0
+            ps = 8 if self._x64() else 4
+            x = p.mem.read_cstring(a + ps + 1, 512)
+            y = p.mem.read_cstring(b_ + ps + 1, 512)
+            return 0 if x == y else (0xFFFFFFFF if x < y else 1)
+
+        @R("__std_type_info_hash", "p", "z", dlls=VC)
+        def _stih(c, a):
+            ps = 8 if self._x64() else 4
+            h = 0xCBF29CE484222325 if ps == 8 else 0x811C9DC5
+            prime = 0x100000001B3 if ps == 8 else 0x01000193
+            mask = M64 if ps == 8 else 0xFFFFFFFF
+            for ch in p.mem.read_cstring(a + ps + 1, 512):
+                h = ((h ^ ch) * prime) & mask
+            return h
+
+        @R("__std_type_info_destroy_list", "p", "v", dlls=VC)
+        def _stidl(c, lst):
+            return None
+
+        @R("_set_se_translator ?_set_se_translator@@YAP6AXIPAU_EXCEPTION_POINTERS@@@ZP6AXI0@Z@Z",
+           "p", "p", dlls=VC)
+        def _sst(c, fn):
+            return 0
+
+        @R("__telemetry_main_invoke_trigger __telemetry_main_return_trigger "
+           "__vcrt_initialize __vcrt_uninitialize", "p", "v", dlls=VC)
+        def _tele(c, a):
+            return None
+
+        @R("_is_exception_typeof", "pp", dlls=VC)
+        def _iet(c, td, ep):
+            rec = self.ptr(ep)
+            ex = self.throw_info(rec)
+            if ex is None:
+                return 0
+            name = self.td_name(td)
+            return 1 if any(self.td_name(ct["td"]) == name for ct in ex["cts"]) else 0
+
+
+def _undecorate_type(raw):
+    """'.?AVfoo@bar@@' -> 'class bar::foo' (type_info::name())."""
+    s_ = raw
+    if s_.startswith(".?A") and len(s_) > 4:
+        kind = {"V": "class ", "U": "struct ", "T": "union ", "W": "enum "}.get(s_[3], "")
+        body = s_[4:]
+        if body.endswith("@@"):
+            body = body[:-2]
+        parts = [x for x in body.split("@") if x]
+        return kind + "::".join(reversed(parts))
+    basic = {".H": "int", ".I": "unsigned int", ".D": "char", ".E": "unsigned char",
+             ".C": "signed char", ".F": "short", ".G": "unsigned short", ".J": "long",
+             ".K": "unsigned long", ".M": "float", ".N": "double", ".O": "long double",
+             ".X": "void", "._N": "bool", "._J": "__int64", "._K": "unsigned __int64",
+             "._W": "wchar_t", ".PAD": "char *", ".PBD": "char const *", ".PEAD": "char * __ptr64",
+             ".PEBD": "char const * __ptr64"}
+    return basic.get(s_, s_.lstrip("."))
+
+
+# ==============================================================================
 # 11. Module / DLL loader
 # ==============================================================================
 
@@ -19697,7 +20618,7 @@ class NOOProcess:
         return int(ret) & SIZE_MASK[64 if cpu.mode == 64 else 32] if ret is not None else 0
 
     # -- guest callbacks ---------------------------------------------------------------
-    def call_guest(self, fn_addr, args):
+    def call_guest(self, fn_addr, args, regs=None, sp=None):
         """Call guest code from the API layer (qsort comparators, _initterm,
         atexit handlers, window procedures...). Runs on the block engine and
         restores the caller's full CPU state afterwards. x64 callees get the
@@ -19713,9 +20634,10 @@ class NOOProcess:
             cb_ret = THUNK_BASE + THUNK_SIZE - 16
             self.mem.write(cb_ret, b"\x0F\x0B" + struct.pack("<I", CALLBACK_RETURN_API_ID) + b"\xC3")
             self._cb_ret_addr = cb_ret
+        base_sp = cpu.regs[RSP] if sp is None else sp
         if cpu.mode == 64:
             n = max(4, len(args))
-            sp = (cpu.regs[RSP] - 8 * n - 64) & ~0xF
+            sp = (base_sp - 8 * n - 64) & ~0xF
             for i, v in enumerate(args):
                 self.mem.write64(sp + 8 * i, v & M64)
             for reg, val in zip((RCX, RDX, R8, R9), args[:4]):
@@ -19724,10 +20646,13 @@ class NOOProcess:
             self.mem.write64(sp, cb_ret)
             cpu.regs[RSP] = sp
         else:
-            cpu.regs[RSP] = (cpu.regs[RSP] - 16) & ~0x3
+            cpu.regs[RSP] = (base_sp - 16) & ~0x3
             for v in reversed(args):
                 cpu.push(v & 0xFFFFFFFF)
             cpu.push(cb_ret)
+        if regs:
+            for r, v in regs.items():
+                cpu.regs[r] = v & (M64 if cpu.mode == 64 else 0xFFFFFFFF)
         cpu.eip = fn_addr
         cpu.df = 0
         try:
@@ -19855,6 +20780,8 @@ class NOOProcess:
         self.k32 = _K32(self.api)
         _k32_install(self.k32)
         self.seh.install_thunks()
+        self.cxx = _CxxEH(self)
+        self.cxx.install(self.k32)
         main = NOOModule(os.path.basename(self.exe_host_path).lower(), base,
                          pe.size_of_image, "pe", pe)
         self.modules.main = main
@@ -21378,7 +22305,9 @@ class _APIShim(WinAPI):
         except Exception:
             pass
         try:
-            _k32_install(_K32(self))
+            k = _K32(self)
+            _k32_install(k)
+            _CxxEH(self.p).install(k)
         except Exception:
             pass
 
