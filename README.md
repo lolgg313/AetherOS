@@ -189,15 +189,43 @@ VM, WSL or Windows itself. You can also use it on its own:
 python3 NOO.py program.exe [args...]   # run a console program
 python3 NOO.py --info program.exe      # parse it and show a compatibility report
 python3 NOO.py --self-test             # run the built-in test suite (22 tests)
+python3 NOO.py --max-instructions N prog.exe   # optional runaway guard (default: none)
 ```
 
 | Level | Kind of program | Status |
 |:---:|---|:---:|
-| **1** | Simple console applications | 🟢 supported |
-| **2** | Programs using the common C runtime (msvcrt / ucrt) | 🟢 supported |
-| **3** | Basic Win32: windows, messages, dialogs | 🟡 partial |
-| **4** | Complex Win32 / GDI / COM | 🟠 limited |
-| **5** | Drivers, .NET, DirectX | 🔴 unsupported |
+| **1** | Simple console applications (x86 and x64) | 🟢 supported |
+| **2** | Programs using the C/C++ runtimes (msvcrt, ucrt, MSVC, MinGW, Rust, Go) | 🟢 supported |
+| **3** | Win32 GUI: windows, messages, menus, dialogs, GDI painting | 🟢 supported |
+| **4** | Common controls, RichEdit, common dialogs, shell folders, COM basics, packed (UPX) programs | 🟡 good |
+| **5** | Drivers, .NET, DirectX / Direct2D | 🔴 unsupported |
+
+**Verified with real, unmodified programs** (downloaded release builds):
+
+| Program | What works |
+|---|---|
+| **Notepad++ 8.6.9** (x86, C++) | starts, menus, toolbar, tabs, Scintilla editing with syntax/brace highlighting, status bar, session save, clean exit |
+| **Rufus 4.5** (x64, UPX-packed) | unpacks itself, full main window, clean shutdown |
+| **AutoHotkey v1.1 (x86) and v2.0 (x64)** | scripts with GUIs (Edit, Checkbox, DropDownList, Slider, Progress, ListView, TreeView), MsgBox, FileSelect / DirSelect, error dialogs, regex, files, registry, timers, DllCall |
+| **7-Zip** `7zr` / `7za` (x86, x64) | extracting, creating and testing `.7z` archives (LZMA + BCJ2, CRCs verified) |
+| **ripgrep 14** (Rust, x64) | parallel recursive search, `.gitignore` handling |
+| **jq 1.7** (x86, x64) | JSON processing with colored console output |
+| **fzf 0.55** (Go, x64) | Go runtime start-up incl. goroutine preemption |
+
+Built-in subsystems include a software-rendered GDI, a window manager with
+per-thread message queues, standard and **common controls** (ListView, TreeView,
+Toolbar, ReBar, StatusBar, Tab, Trackbar, UpDown, Progress, Tooltips, image
+lists), **RichEdit** (with RTF streaming), in-guest **Open/Save, Color, Font,
+Find/Replace and Browse-for-Folder** dialogs (classic and Vista `IFileDialog`),
+shell folders and PIDLs, shlwapi path/string helpers, crypt32, setupapi,
+Winsock, wininet and more. On 32-bit programs, stack clean-up for every one of
+~14,000 system exports comes from a ground-truth table, so even unimplemented
+calls cannot corrupt the stack.
+
+> [!TIP]
+> NOO interprets x86 code in pure Python (a few million instructions per
+> second), so heavy programs start slower than natively — Notepad++ takes a few
+> minutes to reach its main window. Small tools run in seconds.
 
 > [!NOTE]
 > NOO reports an unsupported Windows API **by name** instead of silently
