@@ -17733,7 +17733,7 @@ def _k32_install(k):
                     return 0
                 size = fsize
             elif size > fsize:
-                if prot & 0xFF in (0x04, 0x40):
+                if (prot & 0xFF) in (0x04, 0x40):
                     f.truncate(size)
                 else:
                     p.last_error = 8                   # ERROR_NOT_ENOUGH_MEMORY (read-only ext.)
@@ -22822,6 +22822,148 @@ def _oa_install(k):
             M_.write(a, M_.read(src, esz))
         return 0
 
+    # -- SAFEARRAY descriptors / resizing --------------------------------------------------
+    @R("SafeArrayRedim", "pp", dlls=_OA)
+    def _saredim(c, sa, pnew):
+        if not sa or not pnew:
+            return 0x80070057
+        dims, feat, esz, data, bounds = sa_info(sa)
+        if M_.read32(sa + 8):                                  # locked
+            return 0x8002000D                                  # DISP_E_ARRAYISLOCKED
+        n_new, lb_new = struct.unpack("<Ii", M_.read(pnew, 8))
+        # the least significant (last) dimension is rgsabound[0]
+        old_n = sa_count(bounds)
+        inner = sa_count(bounds[1:]) if dims > 1 else 1
+        new_n = n_new * inner
+        pv_off, b_off = sa_off()
+        vt = sa_vt(sa)
+        new_data = p.heap_alloc(p.process_heap_handle, max(1, new_n * esz))
+        M_.write(new_data, bytes(max(1, new_n * esz)))
+        keep = min(old_n, new_n)
+        if data and keep:
+            M_.write(new_data, M_.read(data, keep * esz))
+        for i in range(keep, old_n):                           # release dropped elements
+            e = data + i * esz
+            if vt == VT_BSTR:
+                bstr_free(M_.read64(e) if ps() == 8 else M_.read32(e))
+            elif vt == VT_VARIANT:
+                vclear(e)
+        if data and not feat & 0x12:
+            p.heap_free(p.process_heap_handle, data)
+        k.wptr(sa + pv_off, new_data)
+        M_.write(sa + b_off, struct.pack("<Ii", n_new, lb_new))
+        return 0
+
+    def _alloc_desc(vt, dims, out):
+        if not out or not 1 <= dims <= 64:
+            return 0x80070057
+        pv_off, b_off = sa_off()
+        hdr = b_off + 8 * dims
+        raw = p.heap_alloc(p.process_heap_handle, 16 + hdr)
+        M_.write(raw, bytes(16 + hdr))
+        sa = raw + 16
+        esz = {VT_BSTR: ps(), VT_UNKNOWN: ps(), VT_DISPATCH: ps(), VT_VARIANT: vsize()}.get(
+            vt, _VT_SIZE.get(vt, 0))
+        feat = (0x80 | {VT_BSTR: 0x100, VT_VARIANT: 0x800, VT_UNKNOWN: 0x200,
+                        VT_DISPATCH: 0x400}.get(vt, 0)) if vt else 0
+        M_.write32(sa - 4, vt)
+        M_.write(sa, struct.pack("<HHII", dims, feat, esz, 0))
+        p.__dict__.setdefault("_safearrays", {})[sa] = raw
+        k.wptr(out, sa)
+        return 0
+
+    R("SafeArrayAllocDescriptor", "up", dlls=_OA)(lambda c, dims, out: _alloc_desc(0, dims, out))
+    R("SafeArrayAllocDescriptorEx", "uup", dlls=_OA)(lambda c, vt, dims, out: _alloc_desc(vt, dims, out))
+
+    @R("SafeArrayAllocData", "p", dlls=_OA)
+    def _saallocdata(c, sa):
+        if not sa:
+            return 0x80070057
+        dims, feat, esz, data, bounds = sa_info(sa)
+        n = sa_count(bounds)
+        d = p.heap_alloc(p.process_heap_handle, max(1, n * esz))
+        M_.write(d, bytes(max(1, n * esz)))
+        k.wptr(sa + sa_off()[0], d)
+        return 0
+
+    @R("SafeArrayDestroyData", "p", dlls=_OA)
+    def _sadestroydata(c, sa):
+        if not sa:
+            return 0x80070057
+        dims, feat, esz, data, bounds = sa_info(sa)
+        if data and not feat & 0x12:
+            p.heap_free(p.process_heap_handle, data)
+        k.wptr(sa + sa_off()[0], 0)
+        return 0
+
+    @R("SafeArrayDestroyDescriptor", "p", dlls=_OA)
+    def _sadestroydesc(c, sa):
+        raw = p.__dict__.get("_safearrays", {}).pop(sa, None)
+        if raw:
+            p.heap_free(p.process_heap_handle, raw)
+        return 0
+
+    # -- misc OLE Automation ---------------------------------------------------------------
+    @R("OleTranslateColor", "upp", dlls=_OA)
+    def _oletc(c, clr, hpal, out):
+        if clr & 0x80000000:                                   # system color index
+            idx = clr & 0xFF
+            gdi = getattr(p, "gdi", None)
+            v = gdi.sys_color(idx) if gdi is not None else 0
+        else:
+            v = clr & 0xFFFFFF
+        if out:
+            M_.write32(out, v)
+        return 0
+
+    p.__dict__.setdefault("_errinfo", {})
+
+    @R("GetErrorInfo", "up", dlls=_OA)
+    def _geterrinfo(c, res, out):
+        if out:
+            k.wptr(out, 0)
+        return 1                                               # S_FALSE: no error object
+
+    R("SetErrorInfo", "up", dlls=_OA)(lambda c, res, ei: 0)
+    R("CreateErrorInfo", "p", dlls=_OA)(lambda c, out: 0x80004001)
+    R("OleLoadPicture OleLoadPictureEx OleLoadPicturePath", "pipp", dlls=_OA)(
+        lambda c, *a: 0x80004005)
+    R("OleCreatePictureIndirect OleCreateFontIndirect", "pppp", dlls=_OA)(lambda c, *a: 0x80004001)
+    R("OaBuildVersion", "", dlls=_OA)(lambda c: 0x000A0000 | 3)
+    R("LoadTypeLib LoadRegTypeLib LoadTypeLibEx RegisterTypeLib UnRegisterTypeLib",
+      "pp", dlls=_OA)(lambda c, *a: 0x80029C4A)                # TYPE_E_CANTLOADLIBRARY
+
+    import datetime as _dt
+    _VT_EPOCH = _dt.datetime(1899, 12, 30)
+
+    @R("SystemTimeToVariantTime", "pp", dlls=_OA)
+    def _st2vt(c, st, out):
+        y, mo, _dow, d, h, mi, s_, ms = struct.unpack("<8H", M_.read(st, 16))
+        try:
+            t = _dt.datetime(y, mo, d, h, mi, s_)
+        except ValueError:
+            return 0
+        delta = t - _VT_EPOCH
+        days = delta.days + delta.seconds / 86400.0
+        if days < 0:                                           # OLE dates: fraction is positive
+            whole = int(days)
+            days = whole - (days - whole)
+        M_.write(out, struct.pack("<d", days))
+        return 1
+
+    @R("VariantTimeToSystemTime", "dp", dlls=_OA)
+    def _vt2st(c, v, out):
+        try:
+            whole = int(v)
+            frac = abs(v - whole)
+            t = _VT_EPOCH + _dt.timedelta(days=whole) + \
+                _dt.timedelta(seconds=round(frac * 86400))
+        except (OverflowError, ValueError):
+            return 0
+        M_.write(out, struct.pack("<8H", t.year, t.month, (t.weekday() + 1) % 7, t.day, t.hour,
+                                  t.minute, t.second, 0))
+        return 1
+
     # -- PROPVARIANT (ole32 / propsys) ------------------------------------------------------
     @R("PropVariantClear", "p", dlls=_OLE)
     def _pvc(c, v):
@@ -24215,9 +24357,13 @@ def _ws_install(k):
             so.s.listen(max(1, min(backlog, 128)))
         except OSError as e:
             return oserr(e)
+        so.listening = True
         return 0
 
     def do_accept(c, h, sa, plen):
+        rearm = p.__dict__.get("async_sock_rearm")
+        if rearm is not None:
+            rearm(h, "read")
         so = sock(h)
         if so is None:
             return INVALID
@@ -24277,6 +24423,9 @@ def _ws_install(k):
         if so is None:
             return SOCKET_ERROR
         data = M_.read(buf, n) if n else b""
+        rearm = p.__dict__.get("async_sock_rearm")
+        if rearm is not None:
+            rearm(h, "write")
         return attempt_or_block(c, so, lambda: so.s.send(data), "w", so.sndtimeo)
 
     @R("recv", "ppii", dlls=_WS)
@@ -24285,6 +24434,9 @@ def _ws_install(k):
         if so is None:
             return SOCKET_ERROR
         peek = socket.MSG_PEEK if flags & 2 else 0
+        rearm = p.__dict__.get("async_sock_rearm")
+        if rearm is not None and not peek:
+            rearm(h, "read")
 
         def op():
             data = so.s.recv(max(n, 0), peek)
@@ -24955,9 +25107,83 @@ def _ws_install(k):
             e.signaled = False
         return 0
 
+    # WSAAsyncSelect: socket events arrive as window messages (polled by the WM)
+    async_socks = {}
+
+    def async_poll():
+        wm = getattr(p, "wm", None)
+        if wm is None or not async_socks:
+            return
+        now = time.monotonic()
+        if now - p.__dict__.get("_async_poll_t", 0.0) < 0.01:
+            return
+        p._async_poll_t = now
+        for h, st in list(async_socks.items()):
+            so = sock(h)
+            if so is None:
+                async_socks.pop(h, None)
+                continue
+            hwnd, msg, mask = st["hwnd"], st["msg"], st["mask"]
+            try:
+                r, w, x = _sel.select([so.s], [so.s], [so.s], 0)
+            except (OSError, ValueError):
+                r, w, x = [], [], []
+            ev = []
+            if w and not st["connected"] and mask & 0x10:        # FD_CONNECT
+                st["connected"] = True
+                ev.append(0x10)
+            if w and not st["write_sent"] and mask & 0x2:        # FD_WRITE (edge)
+                st["write_sent"] = True
+                ev.append(0x2)
+            if r and not st["read_pending"]:
+                closed = False
+                if getattr(so, "listening", False):
+                    if mask & 0x8:
+                        ev.append(0x8)                            # FD_ACCEPT
+                        st["read_pending"] = True
+                else:
+                    try:
+                        import socket as _socket
+                        peek = so.s.recv(1, _socket.MSG_PEEK)
+                        closed = peek == b""
+                    except BlockingIOError:
+                        peek = None
+                    except OSError:
+                        closed = True
+                    if closed and mask & 0x20 and not st["closed"]:
+                        st["closed"] = True
+                        ev.append(0x20)                           # FD_CLOSE
+                    elif not closed and peek and mask & 0x1:
+                        ev.append(0x1)                            # FD_READ
+                        st["read_pending"] = True
+            for e in ev:
+                wm.post(hwnd, msg, h, e & 0xFFFF)
+
+    p.async_sock_poll = async_poll
+
+    def async_rearm(h, what):
+        st = async_socks.get(h)
+        if st is not None:
+            if what == "read":
+                st["read_pending"] = False
+            elif what == "write":
+                st["write_sent"] = False
+
+    p.async_sock_rearm = async_rearm
+
     @R("WSAAsyncSelect", "ppui", dlls=_WS)
     def _wsaas(c, h, hwnd, msg, mask):
-        return err(WSAEOPNOTSUPP)
+        so = sock(h)
+        if so is None:
+            return SOCKET_ERROR
+        so.blocking = False
+        if not mask or not hwnd:
+            async_socks.pop(h, None)
+            return 0
+        async_socks[h] = {"hwnd": hwnd & 0xFFFFFFFF, "msg": msg, "mask": mask,
+                          "connected": False, "write_sent": False, "read_pending": False,
+                          "closed": False}
+        return 0
 
     @R("WSAGetOverlappedResult", "ppppp", dlls=_WS)
     def _wsagor(c, h, ov, pn, wait, pflags):
@@ -30616,6 +30842,9 @@ class _WM:
         q = self.queue(tid)
         if self.raw_input and not q.input:
             self.process_raw_input(one=True)
+        poll = self.p.__dict__.get("async_sock_poll")
+        if poll is not None:
+            poll()
         want = flags >> 16 if flags & 0xFFFF0000 else 0     # PM_QS_* filters
         # 1. posted
         if not want or want & 0x80:                         # QS_POSTMESSAGE
@@ -36412,6 +36641,10 @@ def _combo_proc(wm):
         if msg == 0x0001:
             f = _ctl_gfont(wm, w)
             s["drop_h"] = w.h
+            # WS_VSCROLL/WS_HSCROLL on a combo box belong to its list, not the combo itself
+            w.style &= ~(WS_VSCROLL | 0x100000)
+            w.sbshow = [False, False]
+            wm.nc_calc(w)
             W = w.cl[2] - w.cl[0]
             if kind(w) != 1:
                 # the combo itself is only as tall as its edit field; the list pops up
@@ -36445,6 +36678,16 @@ def _combo_proc(wm):
             return 0
         if msg == 0x000F or msg == WM_PRINTCLIENT:
             paint(w, wp)
+            return 0
+        if msg == 0x0046 and kind(w) != 1 and s.get("lb"):         # WM_WINDOWPOSCHANGING
+            off = 16 if wm.ps == 8 else 8
+            cx, cy, fl = struct.unpack("<iiI", wm.mem.read(lp + off + 8, 12))
+            if not (fl & SWP_NOSIZE):
+                total = field_h(w) + (w.h - (w.cl[3] - w.cl[1]))
+                if cy != total:
+                    if cy > total:
+                        s["drop_h"] = cy                       # a taller size is the drop height
+                    wm.mem.write(lp + off + 12, struct.pack("<i", total))
             return 0
         if msg == 0x0014:
             return 1
@@ -41859,6 +42102,8 @@ def _gui_install(k):
     _user_install(k)
     _user_install2(k)
     _user_install3(k)
+    _sysdlls_install(k)
+    _cc_install(k)
 
 
 # -- displays: headless (PNG dump / scripted input), Tk, AetherOS web sessions ----------------------
@@ -42015,6 +42260,16 @@ class NOOHeadlessDisplay(NOODisplay):
                 if self.dump_dir:
                     self.dump(name)
                 continue
+            if t == "tree":                                  # log the window tree (debug aid)
+                def walk(w, d):
+                    for c in reversed(w.children):
+                        self.p.log.info("[GUI] tree %s%#x %s %r (%d,%d %dx%d) style=%#x%s" % (
+                            "  " * d, c.hwnd, c.cls.name if c.cls else "?", c.text[:40],
+                            c.x, c.y, c.w, c.h, c.style,
+                            "" if c.style & 0x10000000 else " hidden"))
+                        walk(c, d + 1)
+                walk(self.p.wm.desktop, 0)
+                continue
             if t == "call":
                 try:
                     ev["fn"](self.p)
@@ -42076,7 +42331,7 @@ class NOOHeadlessDisplay(NOODisplay):
         for w in list(wm.wins.values()):
             if w.dead or w is wm.desktop or not wm.visible(w):
                 continue
-            if w.text.replace("&", "") != want.replace("&", ""):
+            if want != "*" and w.text.replace("&", "") != want.replace("&", ""):
                 continue
             if cls and (w.cls is None or w.cls.name.upper() != cls):
                 continue
@@ -42687,6 +42942,4360 @@ def gui_stop(sid):
     except Exception:
         pass
     return {"ok": True}
+
+
+# -- version.dll, psapi.dll, wininet.dll, shell tray, kernel32 odds ----------------------------------
+
+def _ver_parse(data, off=0, end=None):
+    """VS_VERSIONINFO node -> (key, value_bytes, value_type, children, next_off)."""
+    if end is None:
+        end = len(data)
+    if off + 6 > end:
+        return None
+    wlen, vlen, wtype = struct.unpack_from("<HHH", data, off)
+    if wlen == 0:
+        return None
+    node_end = min(off + wlen, end)
+    p_ = off + 6
+    kend = p_
+    while kend + 1 < node_end and data[kend:kend + 2] != b"\0\0":
+        kend += 2
+    key = data[p_:kend].decode("utf-16-le", "replace")
+    p_ = (kend + 2 + 3) & ~3
+    vbytes = vlen * 2 if wtype == 1 else vlen
+    value_off = p_
+    p_ = (p_ + vbytes + 3) & ~3
+    children = []
+    while p_ < node_end:
+        ch = _ver_parse(data, p_, node_end)
+        if ch is None:
+            break
+        children.append(ch)
+        p_ = ch[4]
+    return (key, value_off, vbytes, children, (off + wlen + 3) & ~3, wtype)
+
+
+def _sysdlls_install(k):
+    R = k.reg
+    p = k.p
+    M_ = p.mem
+    VER = ("version.dll", "api-ms-win-core-version-l1-1-0.dll")
+    PS = ("psapi.dll", "kernel32.dll")
+    INET = ("wininet.dll",)
+
+    def err(e):
+        p.last_error = e
+        return 0
+
+    def gstr(a, wide):
+        return _gstr(M_, a, -1, wide) if a else ""
+
+    # ---- version.dll ---------------------------------------------------------------------
+    def _version_block(path):
+        """Raw RT_VERSION resource of an exe/dll given by guest path (or loaded module)."""
+        name = path.replace("/", "\\").rsplit("\\", 1)[-1].lower()
+        for m in p.modules.by_handle.values():
+            if m.pe is not None and (m.name.lower() == name or
+                                     (m is p.modules.main and
+                                      p.exe_win_path.lower() == path.lower())):
+                r = _res_find(p, m.base, 16, 1)
+                if r is not None:
+                    return bytes(M_.read(r[0], r[1]))
+        try:
+            host = p.vfs.resolve(path)
+            with open(host, "rb") as fh:
+                pe = PEFile(fh.read(), host)
+        except Exception:
+            return None
+        for ent in pe.resources:
+            if ent["path"] and ent["path"][0] == 16:
+                return pe._read_rva(ent["rva"], ent["size"])
+        return None
+
+    def _gfvis(c, path_a, handle, wide):
+        if handle:
+            M_.write32(handle, 0)
+        blk = _version_block(gstr(path_a, wide))
+        if blk is None:
+            return err(1813)                                  # ERROR_RESOURCE_TYPE_NOT_FOUND
+        return len(blk) * 2 + 16
+
+    reg = lambda n, s, r="i": R(n, s, r, dlls=VER)
+    reg("GetFileVersionInfoSizeA", "pp")(lambda c, a, h: _gfvis(c, a, h, False))
+    reg("GetFileVersionInfoSizeW", "pp")(lambda c, a, h: _gfvis(c, a, h, True))
+    reg("GetFileVersionInfoSizeExA", "upp")(lambda c, f, a, h: _gfvis(c, a, h, False))
+    reg("GetFileVersionInfoSizeExW", "upp")(lambda c, f, a, h: _gfvis(c, a, h, True))
+
+    def _gfvi(c, path_a, n, buf, wide):
+        blk = _version_block(gstr(path_a, wide))
+        if blk is None:
+            return err(1813)
+        data = blk[:max(0, n)]
+        M_.write(buf, data)
+        return 1
+
+    reg("GetFileVersionInfoA", "pupp")(lambda c, a, h, n, b: _gfvi(c, a, n, b, False))
+    reg("GetFileVersionInfoW", "pupp")(lambda c, a, h, n, b: _gfvi(c, a, n, b, True))
+    reg("GetFileVersionInfoExA", "upupp")(lambda c, f, a, h, n, b: _gfvi(c, a, n, b, False))
+    reg("GetFileVersionInfoExW", "upupp")(lambda c, f, a, h, n, b: _gfvi(c, a, n, b, True))
+
+    def _vqv(c, blk, sub_a, pptr, plen, wide):
+        if not blk:
+            return 0
+        wlen = M_.read16(blk)
+        data = bytes(M_.read(blk, wlen))
+        root = _ver_parse(data)
+        if root is None:
+            return 0
+        sub = gstr(sub_a, wide) or "\\"
+        parts = [s for s in sub.split("\\") if s]
+        node = root
+        for part in parts:
+            nxt = None
+            for ch in node[3]:
+                if ch[0].lower() == part.lower():
+                    nxt = ch
+                    break
+            if nxt is None:
+                return err(1813)
+            node = nxt
+        key, voff, vbytes, children, _n, wtype = node
+        if wtype == 1 and not wide:
+            # ANSI text value: convert into the reserved second half of the buffer
+            text = data[voff:voff + vbytes].decode("utf-16-le", "replace").rstrip("\0")
+            enc = text.encode("utf-8") + b"\0"
+            dst = blk + wlen + (voff % max(1, wlen))
+            M_.write(dst, enc)
+            k.wptr(pptr, dst)
+            if plen:
+                M_.write32(plen, len(enc))
+            return 1
+        k.wptr(pptr, blk + voff)
+        if plen:
+            M_.write32(plen, vbytes // 2 if wtype == 1 else vbytes)
+        return 1
+
+    reg("VerQueryValueA", "pppp")(lambda c, b, s, pp_, pl: _vqv(c, b, s, pp_, pl, False))
+    reg("VerQueryValueW", "pppp")(lambda c, b, s, pp_, pl: _vqv(c, b, s, pp_, pl, True))
+
+    def _verlang(c, lang, buf, n, wide):
+        name = "English (United States)" if (lang & 0x3FF) == 9 else "Language Neutral"
+        if not buf:
+            return len(name)
+        return k.put(buf, n, name, wide)
+
+    reg("VerLanguageNameA", "upu")(lambda c, l, b, n: _verlang(c, l, b, n, False))
+    reg("VerLanguageNameW", "upu")(lambda c, l, b, n: _verlang(c, l, b, n, True))
+    reg("VerFindFileA VerFindFileW", "uppppppp")(lambda c, *a: 0)
+    reg("VerInstallFileA VerInstallFileW", "uppppppp")(lambda c, *a: 0)
+
+    # ---- psapi -----------------------------------------------------------------------------
+    def _modpath(h):
+        if not h or h == p.image_base:
+            return p.exe_win_path
+        mod = p.modules.by_handle.get(h)
+        if mod is None:
+            return None
+        if mod.kind == "internal":
+            return "C:\\Windows\\System32\\" + mod.name
+        return "C:\\app\\" + mod.name if "\\" not in mod.name else mod.name
+
+    def _own(hproc):
+        return hproc in (0xFFFFFFFF, M64, 0xFFFFFFFFFFFFFFFF) or \
+            p.handles.kind(hproc) in (None, "process", "process_self")
+
+    def _gmbn(c, hproc, hmod, buf, n, wide, full):
+        path = _modpath(hmod)
+        if path is None:
+            return err(6)
+        s = path if full else path.rsplit("\\", 1)[-1]
+        return k.put(buf, n, s, wide) if n > len(s) else k.put(buf, n, s[:max(0, n - 1)], wide)
+
+    for pre in ("", "K32"):
+        R(pre + "GetModuleBaseNameA", "pppu", dlls=PS)(lambda c, h, m, b, n: _gmbn(c, h, m, b, n, False, False))
+        R(pre + "GetModuleBaseNameW", "pppu", dlls=PS)(lambda c, h, m, b, n: _gmbn(c, h, m, b, n, True, False))
+        R(pre + "GetModuleFileNameExA", "pppu", dlls=PS)(lambda c, h, m, b, n: _gmbn(c, h, m, b, n, False, True))
+        R(pre + "GetModuleFileNameExW", "pppu", dlls=PS)(lambda c, h, m, b, n: _gmbn(c, h, m, b, n, True, True))
+        R(pre + "GetProcessImageFileNameA", "ppu", dlls=PS)(
+            lambda c, h, b, n: k.put(b, n, "\\Device\\HarddiskVolume1" + p.exe_win_path[2:], False))
+        R(pre + "GetProcessImageFileNameW", "ppu", dlls=PS)(
+            lambda c, h, b, n: k.put(b, n, "\\Device\\HarddiskVolume1" + p.exe_win_path[2:], True))
+
+        def _epm(c, h, out, cb, needed):
+            mods = [p.image_base] + sorted(b for b, m in p.modules.by_handle.items()
+                                           if b != p.image_base)
+            ps = k.ptr_size()
+            if needed:
+                M_.write32(needed, len(mods) * ps)
+            for i, b in enumerate(mods[:cb // ps]):
+                k.wptr(out + ps * i, b)
+            return 1
+
+        R(pre + "EnumProcessModules", "ppup", dlls=PS)(_epm)
+        R(pre + "EnumProcessModulesEx", "ppupu", dlls=PS)(lambda c, h, o, cb, nd, f: _epm(c, h, o, cb, nd))
+
+        def _eproc(c, out, cb, needed):
+            pids = [getattr(p, "pid", 0x1000)]
+            if needed:
+                M_.write32(needed, 4 * len(pids))
+            for i, v in enumerate(pids[:cb // 4]):
+                M_.write32(out + 4 * i, v)
+            return 1
+
+        R(pre + "EnumProcesses", "pup", dlls=PS)(_eproc)
+
+        def _gmi(c, h, hmod, out, cb):
+            m = p.modules.by_handle.get(hmod) if hmod else p.modules.main
+            if m is None:
+                return err(6)
+            ps = k.ptr_size()
+            k.wptr(out, m.base)
+            M_.write32(out + ps, m.size)
+            entry = (m.base + m.pe.entry_rva) if m.pe is not None and \
+                getattr(m.pe, "entry_rva", 0) else 0
+            k.wptr(out + (16 if ps == 8 else 8), entry)
+            return 1
+
+        R(pre + "GetModuleInformation", "pppu", dlls=PS)(_gmi)
+
+        def _gpmi(c, h, out, cb):
+            used = getattr(p.mem, "committed", 0)
+            ps = k.ptr_size()
+            vals = [0, used, used, 0, 0, 0, 0, used, used]
+            M_.write32(out, cb)
+            M_.write32(out + 4, 0)
+            for i, v in enumerate(vals[1:]):
+                k.wptr(out + 8 + ps * i, v)
+            return 1
+
+        R(pre + "GetProcessMemoryInfo", "ppu", dlls=PS)(_gpmi)
+        R(pre + "EmptyWorkingSet", "p", dlls=PS)(lambda c, h: 1)
+        R(pre + "GetMappedFileNameW GetMappedFileNameA", "pppu", dlls=PS)(lambda c, *a: 0)
+        R(pre + "GetPerformanceInfo", "pu", dlls=PS)(lambda c, a, n: (M_.write(a, bytes(n)), M_.write32(a, n), 1)[2])
+        R(pre + "QueryWorkingSet QueryWorkingSetEx", "ppu", dlls=PS)(lambda c, *a: 0)
+        R(pre + "InitializeProcessForWsWatch", "p", dlls=PS)(lambda c, h: 1)
+        R(pre + "EnumDeviceDrivers", "pup", dlls=PS)(lambda c, a, n, nd: (M_.write32(nd, 0) if nd else None, 1)[1])
+
+    # ---- wininet (real HTTP through urllib when networking is allowed) -------------------------
+    inet = {}
+
+    def _inet_add(kind, **kw):
+        h = p.handles.add(dict(kind=kind, **kw), "inet")
+        return h
+
+    def _iopen(c, agent, typ, proxy, bypass, flags, wide):
+        return _inet_add("session", agent=gstr(agent, wide))
+
+    R("InternetOpenA", "pupppu"[:5], "p", dlls=INET)(lambda c, a, t, pr, b, f: _iopen(c, a, t, pr, b, f, False))
+    R("InternetOpenW", "pupppu"[:5], "p", dlls=INET)(lambda c, a, t, pr, b, f: _iopen(c, a, t, pr, b, f, True))
+
+    def _fetch(url, headers=None, method="GET", body=None):
+        if not getattr(p.sandbox, "allow_network", False):
+            return None, 12007                               # ERROR_INTERNET_NAME_NOT_RESOLVED
+        try:
+            import urllib.request as _ur
+            req = _ur.Request(url, data=body, method=method, headers=headers or {})
+            with _ur.urlopen(req, timeout=20) as r:
+                return (r.status, dict(r.headers), r.read()), 0
+        except Exception as e:
+            code = getattr(e, "code", None)
+            if code is not None:
+                try:
+                    return (code, dict(e.headers), e.read()), 0
+                except Exception:
+                    pass
+            return None, 12029                               # ERROR_INTERNET_CANNOT_CONNECT
+
+    def _iopenurl(c, h, url_a, hdr_a, hlen, flags, ctx, wide):
+        url = gstr(url_a, wide)
+        res, e = _fetch(url)
+        if res is None:
+            return err(e)
+        status, hdrs, body = res
+        return _inet_add("request", url=url, status=status, headers=hdrs, body=body, pos=0)
+
+    R("InternetOpenUrlA", "ppppup", "p", dlls=INET)(lambda c, h, u, hd, hl, f, x: _iopenurl(c, h, u, hd, hl, f, x, False))
+    R("InternetOpenUrlW", "ppppup", "p", dlls=INET)(lambda c, h, u, hd, hl, f, x: _iopenurl(c, h, u, hd, hl, f, x, True))
+
+    @R("InternetReadFile", "ppup", dlls=INET)
+    def _iread(c, h, buf, n, nread):
+        r = p.handles.get(h, "inet")
+        if r is None or r.get("kind") != "request":
+            return err(6)
+        data = r["body"][r["pos"]:r["pos"] + n]
+        r["pos"] += len(data)
+        if data:
+            M_.write(buf, data)
+        if nread:
+            M_.write32(nread, len(data))
+        return 1
+
+    @R("InternetReadFileExA InternetReadFileExW", "ppup", dlls=INET)
+    def _ireadex(c, h, bufs, flags, ctx):
+        ps = k.ptr_size()
+        buf = k.p.mem.read64(bufs + 16) if ps == 8 else M_.read32(bufs + 12)
+        n = M_.read32(bufs + (32 if ps == 8 else 20))
+        r = p.handles.get(h, "inet")
+        if r is None:
+            return err(6)
+        data = r["body"][r["pos"]:r["pos"] + n]
+        r["pos"] += len(data)
+        M_.write(buf, data)
+        M_.write32(bufs + (32 if ps == 8 else 20), len(data))
+        return 1
+
+    @R("InternetQueryDataAvailable", "ppuu".replace("uu", "up")[:4], dlls=INET)
+    def _iqda(c, h, avail, flags, ctx):
+        r = p.handles.get(h, "inet")
+        if r is None:
+            return err(6)
+        if avail:
+            M_.write32(avail, len(r.get("body", b"")) - r.get("pos", 0))
+        return 1
+
+    @R("InternetCloseHandle", "p", dlls=INET)
+    def _iclose(c, h):
+        return 1 if p.handles.close(h) else err(6)
+
+    def _hqi(c, h, level, buf, blen, idx, wide):
+        r = p.handles.get(h, "inet")
+        if r is None or r.get("kind") != "request":
+            return err(6)
+        info = level & 0xFFFF
+        if info == 19:                                       # HTTP_QUERY_STATUS_CODE
+            val = str(r["status"])
+        elif info == 5:                                      # CONTENT_LENGTH
+            val = str(len(r["body"]))
+        elif info == 1:                                      # CONTENT_TYPE
+            val = r["headers"].get("Content-Type", "")
+        elif info == 22:                                     # RAW_HEADERS_CRLF
+            val = "HTTP/1.1 %d\r\n" % r["status"] + "".join(
+                "%s: %s\r\n" % kv for kv in r["headers"].items()) + "\r\n"
+        else:
+            return err(12150)                                # ERROR_HTTP_HEADER_NOT_FOUND
+        if level & 0x20000000:                               # HTTP_QUERY_FLAG_NUMBER
+            if M_.read32(blen) < 4:
+                return err(122)
+            M_.write32(buf, int(val or 0))
+            M_.write32(blen, 4)
+            return 1
+        need = (len(val) + 1) * (2 if wide else 1)
+        if M_.read32(blen) < need or not buf:
+            M_.write32(blen, need)
+            return err(122)
+        k.put(buf, len(val) + 1, val, wide)
+        M_.write32(blen, need - (2 if wide else 1))
+        return 1
+
+    R("HttpQueryInfoA", "puppp", dlls=INET)(lambda c, h, l, b, bl, i: _hqi(c, h, l, b, bl, i, False))
+    R("HttpQueryInfoW", "puppp", dlls=INET)(lambda c, h, l, b, bl, i: _hqi(c, h, l, b, bl, i, True))
+
+    def _iconnect(c, h, server, port, user, pw, svc, flags, ctx, wide):
+        return _inet_add("connect", server=gstr(server, wide), port=port or (443 if svc == 3 and False else 80))
+
+    R("InternetConnectA", "ppuppuup", "p", dlls=INET)(lambda c, *a: _iconnect(c, *a, False))
+    R("InternetConnectW", "ppuppuup", "p", dlls=INET)(lambda c, *a: _iconnect(c, *a, True))
+
+    def _hopen(c, hc, verb, obj, ver, ref, accept, flags, ctx, wide):
+        conn = p.handles.get(hc, "inet")
+        if conn is None:
+            return err(6)
+        secure = bool(flags & 0x00800000)                    # INTERNET_FLAG_SECURE
+        scheme = "https" if secure or conn["port"] == 443 else "http"
+        port = conn["port"]
+        host = conn["server"] + ("" if port in (80, 443, 0) else ":%d" % port)
+        path = gstr(obj, wide) or "/"
+        return _inet_add("pending", method=gstr(verb, wide) or "GET",
+                         url="%s://%s%s" % (scheme, host, path if path.startswith("/") else "/" + path))
+
+    R("HttpOpenRequestA", "pppppppu".replace("pu", "up"), "p", dlls=INET)(lambda c, *a: _hopen(c, *a[:8], False))
+    R("HttpOpenRequestW", "pppppppu".replace("pu", "up"), "p", dlls=INET)(lambda c, *a: _hopen(c, *a[:8], True))
+
+    def _hsend(c, h, hdrs, hlen, opt, olen, wide):
+        r = p.handles.get(h, "inet")
+        if r is None:
+            return err(6)
+        body = bytes(M_.read(opt, olen)) if opt and olen else None
+        res, e = _fetch(r["url"], method=r.get("method", "GET"), body=body)
+        if res is None:
+            return err(e)
+        r.update(kind="request", status=res[0], headers=res[1], body=res[2], pos=0)
+        return 1
+
+    R("HttpSendRequestA", "ppupu", dlls=INET)(lambda c, h, hd, hl, o, ol: _hsend(c, h, hd, hl, o, ol, False))
+    R("HttpSendRequestW", "ppupu", dlls=INET)(lambda c, h, hd, hl, o, ol: _hsend(c, h, hd, hl, o, ol, True))
+    R("HttpAddRequestHeadersA HttpAddRequestHeadersW", "ppuu", dlls=INET)(lambda c, *a: 1)
+
+    @R("InternetGetConnectedState", "pu", dlls=INET)
+    def _igcs(c, flags, res):
+        if flags:
+            M_.write32(flags, 2 if getattr(p.sandbox, "allow_network", False) else 0x20)
+        return 1 if getattr(p.sandbox, "allow_network", False) else 0
+
+    R("InternetCheckConnectionA InternetCheckConnectionW", "puu", dlls=INET)(
+        lambda c, u, f, r: 1 if getattr(p.sandbox, "allow_network", False) else err(12029))
+    R("InternetSetOptionA InternetSetOptionW", "pupu", dlls=INET)(lambda c, *a: 1)
+    R("InternetQueryOptionA InternetQueryOptionW", "pupp", dlls=INET)(lambda c, *a: err(12018))
+    R("InternetSetStatusCallback InternetSetStatusCallbackA InternetSetStatusCallbackW",
+      "pp", "p", dlls=INET)(lambda c, h, cb: 0)
+    R("InternetAttemptConnect", "u", dlls=INET)(lambda c, r: 0)
+
+    def _crack(c, url_a, n, flags, comp, wide):
+        from urllib.parse import urlsplit
+        url = gstr(url_a, wide) if n in (0, 0xFFFFFFFF) else _gstr(M_, url_a, n, wide)
+        u = urlsplit(url)
+        if not u.scheme:
+            return err(12006)
+        ps = k.ptr_size()
+        # URL_COMPONENTS: dwStructSize; lpszScheme, dwSchemeLength, nScheme; lpszHostName,
+        # dwHostNameLength, nPort; lpszUserName...; lpszUrlPath, dwUrlPathLength; lpszExtraInfo
+        fields = [("scheme", u.scheme), ("host", u.hostname or ""), ("user", u.username or ""),
+                  ("pw", u.password or ""), ("path", u.path or ""),
+                  ("extra", ("?" + u.query if u.query else "") + ("#" + u.fragment if u.fragment else ""))]
+        off = 4 if ps == 4 else 8
+        layout = [("scheme", True), ("host", True), ("user", False), ("pw", False),
+                  ("path", False), ("extra", False)]
+        base_ptr = url_a
+        vals = dict(fields)
+        pos = off
+        for name, has_extra in layout:
+            ptr = M_.read64(comp + pos) if ps == 8 else M_.read32(comp + pos)
+            ln_off = pos + ps
+            ln = M_.read32(comp + ln_off)
+            text = vals[name]
+            if ptr and ln:
+                k.put(ptr, ln, text, wide)
+                M_.write32(comp + ln_off, len(text))
+            elif ln:
+                idx = url.find(text) if text else 0
+                k.wptr(comp + pos, url_a + max(0, idx) * (2 if wide else 1) if text else 0)
+                M_.write32(comp + ln_off, len(text))
+            pos = ln_off + 4
+            if name == "scheme":
+                M_.write32(comp + pos, {"http": 3, "https": 4, "ftp": 1, "file": 5}.get(u.scheme, 0))
+                pos += 4
+            elif name == "host":
+                port = u.port or {"http": 80, "https": 443, "ftp": 21}.get(u.scheme, 0)
+                M_.write16(comp + pos, port)
+                pos += 4
+            if ps == 8 and pos % 8:
+                pos += 4
+        return 1
+
+    R("InternetCrackUrlA", "puup", dlls=INET)(lambda c, u, n, f, cp: _crack(c, u, n, f, cp, False))
+    R("InternetCrackUrlW", "puup", dlls=INET)(lambda c, u, n, f, cp: _crack(c, u, n, f, cp, True))
+
+    # ---- kernel32 odds -------------------------------------------------------------------
+    @R("MulDiv", "iii")
+    def _muldiv(c, a, b, d):
+        if d == 0:
+            return -1
+        v = a * b
+        q = abs(v) + abs(d) // 2
+        q //= abs(d)
+        if (v < 0) != (d < 0):
+            q = -q
+        if not -2 ** 31 <= q < 2 ** 31:
+            return -1
+        return q
+
+    R("SetHandleCount", "u")(lambda c, n: n)
+
+    # ---- shell tray icons: remembered so a display can show them ----------------------------
+    SH = ("shell32.dll",)
+
+    def _notify_icon(c, msg, data, wide):
+        wm = getattr(p, "wm", None)
+        tray = p.__dict__.setdefault("tray_icons", {})
+        if not data:
+            return 0
+        ps = k.ptr_size()
+        hwnd = M_.read64(data + (8 if ps == 8 else 4)) if ps == 8 else M_.read32(data + 4)
+        uid = M_.read32(data + (16 if ps == 8 else 8))
+        flags = M_.read32(data + (20 if ps == 8 else 12))
+        key = (hwnd & 0xFFFFFFFF, uid)
+        if msg == 2:                                         # NIM_DELETE
+            tray.pop(key, None)
+            return 1
+        ent = tray.setdefault(key, {})
+        if flags & 1:                                        # NIF_MESSAGE
+            ent["cb"] = M_.read32(data + (24 if ps == 8 else 16))
+        if flags & 4:                                        # NIF_TIP
+            tip_off = (40 if ps == 8 else 24)
+            ent["tip"] = _gstr(M_, data + tip_off, -1, wide)[:127]
+        return 1
+
+    R("Shell_NotifyIconA", "up", dlls=SH)(lambda c, m, d: _notify_icon(c, m, d, False))
+    R("Shell_NotifyIconW", "up", dlls=SH)(lambda c, m, d: _notify_icon(c, m, d, True))
+    R("Shell_NotifyIconGetRect", "pp", dlls=SH)(lambda c, a, r: 0x80004005)
+
+
+# ==============================================================================
+# 10m. comctl32: common controls, image lists, window subclassing
+# ==============================================================================
+
+_CC = ("comctl32.dll",)
+NM_CLICK, NM_DBLCLK, NM_RETURN, NM_RCLICK, NM_RDBLCLK = -2, -3, -4, -5, -6
+NM_SETFOCUS, NM_KILLFOCUS = -7, -8
+
+
+class _ImageList(_GObj):
+    kind = "imagelist"
+
+    def __init__(self, cx, cy, flags):
+        self.cx, self.cy, self.flags = max(1, cx), max(1, cy), flags
+        self.images = []              # [(color bytes BGRX cx*cy*4, mask bytearray, alpha or None)]
+        self.bk = 0xFFFFFFFF          # CLR_NONE
+
+    def add_surface(self, surf, mask=None, key=None, alpha=None):
+        """Split a strip bitmap into cx-wide images."""
+        n = max(1, surf.w // self.cx)
+        added = []
+        for i in range(n):
+            col = bytearray(self.cx * self.cy * 4)
+            msk = bytearray(self.cx * self.cy)
+            alp = bytearray(self.cx * self.cy) if alpha is not None else None
+            for y in range(min(self.cy, surf.h)):
+                so = (y * surf.w + i * self.cx) * 4
+                row = surf.px[so:so + self.cx * 4]
+                col[y * self.cx * 4:y * self.cx * 4 + len(row)] = row
+                for x in range(min(self.cx, surf.w - i * self.cx)):
+                    o = y * self.cx + x
+                    if mask is not None:
+                        msk[o] = 1 if mask.get(i * self.cx + x, y) & 0xFFFFFF else 0
+                    elif key is not None:
+                        msk[o] = 1 if bytes(row[x * 4:x * 4 + 3]) == key else 0
+                    if alp is not None:
+                        alp[o] = alpha[y * surf.w + i * self.cx + x]
+            self.images.append((col, msk, alp))
+            added.append(len(self.images) - 1)
+        return added[0] if added else -1
+
+    def add_icon(self, ic, index=-1):
+        col = bytearray(self.cx * self.cy * 4)
+        msk = bytearray(b"\x01" * (self.cx * self.cy))
+        alp = bytearray(self.cx * self.cy) if ic.alpha is not None else None
+        for y in range(self.cy):
+            sy = y * ic.ht // self.cy
+            for x in range(self.cx):
+                sx = x * ic.w // self.cx
+                so = sy * ic.w + sx
+                o = y * self.cx + x
+                col[o * 4:o * 4 + 4] = ic.color.px[so * 4:so * 4 + 4]
+                msk[o] = ic.mask[so] if ic.mask is not None else 0
+                if alp is not None:
+                    alp[o] = ic.alpha[so]
+        ent = (col, msk, alp)
+        if 0 <= index < len(self.images):
+            self.images[index] = ent
+            return index
+        self.images.append(ent)
+        return len(self.images) - 1
+
+    def draw(self, surf, clip, X, Y, i, style=0, bk=None, selected=False):
+        if not 0 <= i < len(self.images):
+            return
+        col, msk, alp = self.images[i]
+        cx, cy = self.cx, self.cy
+        for y in range(cy):
+            yy = Y + y
+            if not 0 <= yy < surf.h:
+                continue
+            for x in range(cx):
+                xx = X + x
+                if not 0 <= xx < surf.w:
+                    continue
+                if not any(cl <= xx < cr and ct <= yy < cb for (cl, ct, cr, cb) in clip):
+                    continue
+                o = y * cx + x
+                do = (yy * surf.w + xx) * 4
+                if alp is not None and any(alp):
+                    a = alp[o]
+                    if a == 0:
+                        continue
+                    for ch in range(3):
+                        surf.px[do + ch] = (col[o * 4 + ch] * a + surf.px[do + ch] * (255 - a)) // 255
+                elif msk[o] and self.flags & 1 and not style & 0x10:   # ILC_MASK, !ILD_IMAGE
+                    continue
+                else:
+                    surf.px[do:do + 3] = col[o * 4:o * 4 + 3]
+                if selected:
+                    # ILD_SELECTED/FOCUS: 50% blend with the highlight color
+                    surf.px[do] = (surf.px[do] + 0x6A) // 2
+                    surf.px[do + 1] = (surf.px[do + 1] + 0x24) // 2
+                    surf.px[do + 2] = (surf.px[do + 2] + 0x0A) // 2
+
+
+def _std_toolbar_bitmap(which, cx=16):
+    """Procedural stand-ins for the comctl32 standard toolbar images (IDB_STD_*)."""
+    n = 15
+    s = _Surf(cx * n, cx, b"\xc0\xc0\xc0\x00")
+    pt_clip = [(0, 0, s.w, s.h)]
+
+    def rect(i, l, t, r, b, cr):
+        _fill(s, pt_clip, i * cx + l, t, i * cx + r, b, _cr_pix(cr))
+
+    for i in range(n):
+        if i in (6, 7):                                  # new / open: page / folder
+            rect(i, 3, 1, 12, 15, 0x000000)
+            rect(i, 4, 2, 11, 14, 0xFFFFFF if i == 6 else 0x00C0FF)
+        elif i == 8:                                     # save: disk
+            rect(i, 1, 1, 15, 15, 0x800000)
+            rect(i, 4, 2, 12, 7, 0xFFFFFF)
+            rect(i, 4, 10, 12, 15, 0xC0C0C0)
+        elif i == 14:                                    # print
+            rect(i, 2, 6, 14, 12, 0x808080)
+            rect(i, 4, 2, 12, 6, 0xFFFFFF)
+        elif i in (0, 1, 2):                             # cut / copy / paste
+            rect(i, 3, 3, 10, 13, 0x000000)
+            rect(i, 4, 4, 9, 12, 0xFFFFFF)
+            if i == 1:
+                rect(i, 6, 1, 13, 11, 0x000000)
+                rect(i, 7, 2, 12, 10, 0xFFFFFF)
+        elif i in (3, 4):                                # undo / redo arrows
+            for k_ in range(5):
+                rect(i, 7 - k_ if i == 3 else 8 + k_, 4 + k_, 8 - k_ if i == 3 else 9 + k_,
+                     12 - k_, 0x000080)
+            rect(i, 5, 7, 11, 9, 0x000080)
+        elif i == 5:                                     # delete X
+            for k_ in range(10):
+                rect(i, 3 + k_, 3 + k_, 5 + k_, 4 + k_, 0x0000C0)
+                rect(i, 12 - k_, 3 + k_, 14 - k_, 4 + k_, 0x0000C0)
+        else:
+            rect(i, 4, 4, 12, 12, 0x808080)
+            rect(i, 5, 5, 11, 11, 0xFFFFFF)
+    return s
+
+
+def _cc_install(k):
+    R = k.reg
+    p = k.p
+    M_ = p.mem
+    wm = p.wm
+    gdi = p.gdi
+    ps = wm.ps
+
+    def reg(names, sig="", ret="i", dlls=_CC):
+        return R(names, sig, ret, dlls=dlls)
+
+    def W(h):
+        return wm.wnd(h)
+
+    def IL(h):
+        return gdi.get(h, "imagelist")
+
+    # ---- WM_NOTIFY helper ---------------------------------------------------------------
+    def notify(w, code, extra=b"", after=None, target=None):
+        """Send WM_NOTIFY {NMHDR + extra} to the parent; returns (result, struct addr)."""
+        par = target or (w.parent if w.parent is not None and w.parent is not wm.desktop
+                         else wm.wnd(w.owner))
+        if par is None or par is wm.desktop:
+            return 0, 0
+        code &= 0xFFFFFFFF
+        if ps == 8:
+            hdr = struct.pack("<QQI4x", w.hwnd, w.id & M64, code)
+        else:
+            hdr = struct.pack("<III", w.hwnd, w.id & 0xFFFFFFFF, code)
+        mark = wm.scratch_mark()
+        try:
+            a = wm.scratch(hdr + extra + bytes(64))
+            r = wm.send(par.hwnd, WM_NOTIFY, w.id & 0xFFFF, a)
+            if after is not None:
+                after(a + len(hdr))
+            return r, a
+        finally:
+            wm.scratch_release(mark)
+
+    NMHDR_SZ = 24 if ps == 8 else 12
+
+    def paint(w, fn, hdc=0):
+        _ctl_paint(wm, w, fn, hdc)
+
+    def hfont(w):
+        return w.font if w.font and gdi.get(w.font, "font") else gdi.stock[17].h
+
+    def gfont(w):
+        return gdi.get(hfont(w), "font").realize()
+
+    sysc = gdi.sys_color
+
+    def py_class(name, fn, style=0x8 | 0x40 | 1 | 2):
+        return wm.py_class(name, fn, style=style)
+
+    # ---- image lists --------------------------------------------------------------------------
+    @reg("ImageList_Create", "iiuii", "p")
+    def _ilc(c, cx, cy, flags, initial, grow):
+        return gdi.add(_ImageList(cx, cy, flags))
+
+    @reg("ImageList_Destroy", "p")
+    def _ild(c, h):
+        return 1 if gdi.objs.pop(h & 0xFFFFFFFF, None) is not None else 0
+
+    @reg("ImageList_GetImageCount", "p")
+    def _ilgic(c, h):
+        il = IL(h)
+        return len(il.images) if il else 0
+
+    @reg("ImageList_SetImageCount", "pu")
+    def _ilsic(c, h, n):
+        il = IL(h)
+        if il is None:
+            return 0
+        while len(il.images) < n:
+            il.images.append((bytearray(il.cx * il.cy * 4), bytearray(il.cx * il.cy), None))
+        del il.images[n:]
+        return 1
+
+    def _bm_surf(hbm):
+        bm = gdi.get(hbm, "bitmap")
+        if bm is None:
+            return None, None
+        if bm.dib is not None:
+            _dib_pull(M_, bm)
+        alpha = None
+        if bm.bpp == 32 and (bm.dib is not None or getattr(bm, "has_alpha", False)):
+            a = bm.surf.px[3::4]
+            if any(a):
+                alpha = bytearray(a)
+        return bm.surf, alpha
+
+    @reg("ImageList_Add", "ppp")
+    def _ila(c, h, hbm, hmask):
+        il = IL(h)
+        s, alpha = _bm_surf(hbm)
+        if il is None or s is None:
+            return -1
+        ms, _a = _bm_surf(hmask) if hmask else (None, None)
+        return il.add_surface(s, mask=ms, alpha=alpha)
+
+    @reg("ImageList_AddMasked", "ppu")
+    def _ilam(c, h, hbm, key):
+        il = IL(h)
+        s, alpha = _bm_surf(hbm)
+        if il is None or s is None:
+            return -1
+        il.flags |= 1
+        return il.add_surface(s, key=_cr_pix(key)[:3], alpha=alpha)
+
+    @reg("ImageList_ReplaceIcon", "pip")
+    def _ilri(c, h, i, hicon):
+        il, ic = IL(h), gdi.get(hicon)
+        if il is None or ic is None or ic.kind not in ("icon", "cursor"):
+            return -1
+        il.flags |= 1
+        return il.add_icon(ic, i)
+
+    @reg("ImageList_Replace", "pipp")
+    def _ilrep(c, h, i, hbm, hmask):
+        il = IL(h)
+        s, alpha = _bm_surf(hbm)
+        if il is None or s is None or not 0 <= i < len(il.images):
+            return 0
+        tmp = _ImageList(il.cx, il.cy, il.flags)
+        ms, _a = _bm_surf(hmask) if hmask else (None, None)
+        tmp.add_surface(s, mask=ms, alpha=alpha)
+        il.images[i] = tmp.images[0]
+        return 1
+
+    @reg("ImageList_Remove", "pi")
+    def _ilrm(c, h, i):
+        il = IL(h)
+        if il is None:
+            return 0
+        if i == -1:
+            il.images = []
+        elif 0 <= i < len(il.images):
+            del il.images[i]
+        else:
+            return 0
+        return 1
+
+    @reg("ImageList_GetIconSize", "ppp")
+    def _ilgis(c, h, pcx, pcy):
+        il = IL(h)
+        if il is None:
+            return 0
+        M_.write32(pcx, il.cx)
+        M_.write32(pcy, il.cy)
+        return 1
+
+    @reg("ImageList_SetIconSize", "pii")
+    def _ilsis(c, h, cx, cy):
+        il = IL(h)
+        if il is None:
+            return 0
+        il.cx, il.cy, il.images = max(1, cx), max(1, cy), []
+        return 1
+
+    @reg("ImageList_SetBkColor", "pu")
+    def _ilsbk(c, h, clr):
+        il = IL(h)
+        if il is None:
+            return 0xFFFFFFFF
+        old, il.bk = il.bk, clr
+        return old
+
+    @reg("ImageList_GetBkColor", "p")
+    def _ilgbk(c, h):
+        il = IL(h)
+        return il.bk if il else 0xFFFFFFFF
+
+    def _draw_il(h, i, hdc, x, y, style):
+        il, dc = IL(h), gdi.get(hdc, "dc")
+        if il is None or dc is None:
+            return 0
+        surf, ox, oy, clip, bm = t = gdi.begin(dc)
+        X, Y = dc.lp2dp(x, y)
+        il.draw(surf, clip, X + ox, Y + oy, i, style, selected=bool(style & 6))
+        gdi.end(dc, t)
+        return 1
+
+    reg("ImageList_Draw", "pipiiu")(lambda c, h, i, d, x, y, s: _draw_il(h, i, d, x, y, s))
+    reg("ImageList_DrawEx", "pipiiiiuuu")(lambda c, h, i, d, x, y, dx, dy, bk, fg, s: _draw_il(h, i, d, x, y, s))
+    reg("ImageList_DrawIndirect", "p")(lambda c, a: 1)
+
+    @reg("ImageList_GetIcon", "piu", "p")
+    def _ilgi(c, h, i, flags):
+        il = IL(h)
+        if il is None or not 0 <= i < len(il.images):
+            return 0
+        col, msk, alp = il.images[i]
+        ic = _GIcon(il.cx, il.cy)
+        ic.color.px[:] = col
+        ic.mask = bytearray(msk)
+        ic.alpha = bytearray(alp) if alp is not None else None
+        return gdi.add(ic)
+
+    @reg("ImageList_GetImageInfo", "pip")
+    def _ilgii(c, h, i, out):
+        il = IL(h)
+        if il is None or not 0 <= i < len(il.images):
+            return 0
+        M_.write(out, bytes(2 * ps + 8 + 16))
+        _wr_rect(M_, out + 2 * ps + 8, (0, 0, il.cx, il.cy))
+        return 1
+
+    def _il_load(c, inst, name, cx, grow, key, typ, flags, wide):
+        data = _res_bytes(p, inst, 2, _res_key(p, name, wide)) if typ == 0 else None
+        if data is None:
+            return 0
+        bm = _bitmap_from_packed(p, data)
+        if bm is None:
+            return 0
+        cx = cx or bm.surf.h
+        il = _ImageList(cx, bm.surf.h, 1 if key != 0xFFFFFFFF else 0)
+        il.add_surface(bm.surf, key=_cr_pix(key)[:3] if key != 0xFFFFFFFF else None)
+        return gdi.add(il)
+
+    reg("ImageList_LoadImageA", "ppiiuuu", "p")(lambda c, i, n, cx, g, k_, t, f: _il_load(c, i, n, cx, g, k_, t, f, False))
+    reg("ImageList_LoadImageW", "ppiiuuu", "p")(lambda c, i, n, cx, g, k_, t, f: _il_load(c, i, n, cx, g, k_, t, f, True))
+
+    @reg("ImageList_Duplicate", "p", "p")
+    def _ildup(c, h):
+        il = IL(h)
+        if il is None:
+            return 0
+        n = _ImageList(il.cx, il.cy, il.flags)
+        n.images = [(bytearray(a), bytearray(b), bytearray(cc) if cc is not None else None)
+                    for (a, b, cc) in il.images]
+        return gdi.add(n)
+
+    reg("ImageList_BeginDrag ImageList_DragEnter ImageList_DragMove ImageList_DragShowNolock",
+        "pii")(lambda c, *a: 1)
+    reg("ImageList_EndDrag", "", "v")(lambda c: None)
+    reg("ImageList_DragLeave", "p")(lambda c, h: 1)
+    reg("ImageList_SetOverlayImage", "pii")(lambda c, *a: 1)
+    reg("ImageList_Merge", "pipiii", "p")(lambda c, *a: 0)
+    reg("ImageList_Copy", "pipiu")(lambda c, *a: 1)
+    reg("ImageList_SetDragCursorImage", "piii")(lambda c, *a: 1)
+
+    # ---- subclassing ------------------------------------------------------------------------
+    def _sc_dispatch(hwnd, msg, wp, lp, wide):
+        w = W(hwnd)
+        if w is None:
+            return 0
+        chain = w.py.get("subclass") or []
+        stack = w.py.setdefault("sc_stack", [])
+        if not chain:
+            return wm.call_proc(w.py.get("sc_orig", 0), hwnd, msg, wp, lp, wide)
+        stack.append(0)
+        try:
+            proc, sid, ref = chain[0]
+            return p.call_guest(proc, [hwnd, msg & 0xFFFFFFFF, wp, lp, sid, ref])
+        finally:
+            stack.pop()
+
+    sc_name = "__noo_subclass_proc"
+    R(sc_name, "pupp", "p", dlls=_CC)(lambda c, h, m, w_, l_: _sc_dispatch(h & 0xFFFFFFFF, m, w_, l_, True))
+    sc_addr = p.api_thunk("comctl32.dll", sc_name)
+    wm.pyprocs[sc_addr] = _sc_dispatch
+
+    @reg("SetWindowSubclass", "pppp")
+    def _swsc(c, h, proc, sid, ref):
+        w = W(h)
+        if w is None or not proc:
+            return 0
+        chain = w.py.setdefault("subclass", [])
+        for i, (pr, s_, r_) in enumerate(chain):
+            if pr == proc and s_ == sid:
+                chain[i] = (proc, sid, ref)
+                return 1
+        if w.proc != sc_addr:
+            w.py["sc_orig"] = w.proc
+            w.py["sc_orig_unicode"] = w.unicode
+            w.proc = sc_addr
+        chain.insert(0, (proc, sid, ref))
+        return 1
+
+    @reg("GetWindowSubclass", "pppp")
+    def _gwsc(c, h, proc, sid, pref):
+        w = W(h)
+        if w is None:
+            return 0
+        for (pr, s_, r_) in w.py.get("subclass", []):
+            if pr == proc and s_ == sid:
+                if pref:
+                    wm.wp(pref, r_)
+                return 1
+        return 0
+
+    @reg("RemoveWindowSubclass", "ppp")
+    def _rwsc(c, h, proc, sid):
+        w = W(h)
+        if w is None:
+            return 0
+        chain = w.py.get("subclass", [])
+        for i, (pr, s_, r_) in enumerate(chain):
+            if pr == proc and s_ == sid:
+                del chain[i]
+                if not chain and w.proc == sc_addr:
+                    w.proc = w.py.pop("sc_orig", w.proc)
+                return 1
+        return 0
+
+    @reg("DefSubclassProc", "pupp", "p")
+    def _defsc(c, h, msg, wp_, lp_):
+        w = W(h)
+        if w is None:
+            return 0
+        chain = w.py.get("subclass", [])
+        stack = w.py.setdefault("sc_stack", [])
+        depth = (stack[-1] + 1) if stack else len(chain)
+        if depth < len(chain):
+            stack.append(depth)
+            try:
+                proc, sid, ref = chain[depth]
+                return p.call_guest(proc, [h, msg & 0xFFFFFFFF, wp_, lp_, sid, ref])
+            finally:
+                stack.pop()
+        return wm.call_proc(w.py.get("sc_orig", w.proc if w.proc != sc_addr else 0), h, msg,
+                            wp_, lp_, w.py.get("sc_orig_unicode", w.unicode))
+
+    # ---- init / misc --------------------------------------------------------------------------
+    reg("InitCommonControls", "", "v")(lambda c: None)
+    reg("InitCommonControlsEx", "p")(lambda c, a: 1)
+    reg("InitMUILanguage", "u", "v")(lambda c, l: None)
+
+    @reg("GetEffectiveClientRect", "ppp", "v")
+    def _gecr(c, h, r, info):
+        w = W(h)
+        if w is None:
+            return
+        rc = list(wm.client_rect(w))
+        i = 0
+        while info:
+            flag = M_.read32(info + 8 * i)
+            cid = M_.read32(info + 8 * i + 4)
+            if not flag and not cid:
+                break
+            if i > 0:
+                for ch in w.children:
+                    if ch.id == cid and ch.style & WS_VISIBLE:
+                        if ch.y > (rc[3] - rc[1]) // 2:
+                            rc[3] = min(rc[3], ch.y)
+                        else:
+                            rc[1] = max(rc[1], ch.y + ch.h)
+            i += 1
+            if i > 64:
+                break
+        _wr_rect(M_, r, rc)
+
+    reg("MenuHelp", "upppppp", "v")(lambda c, *a: None)
+    reg("ShowHideMenuCtl", "ppp")(lambda c, *a: 1)
+
+    @reg("LoadIconMetric", "ppip")
+    def _lim(c, inst, name, metric, out):
+        size = 16 if metric == 0 else 32
+        h = _load_icon_res(p, inst, _res_key(p, name, True), size) if inst or name >= 0x10000 else None
+        if h is None:
+            hh = wm.std_icons.get(name, wm.std_icons.get(32512))
+        else:
+            hh = gdi.add(h)
+        wm.wp(out, hh)
+        return 0
+
+    @reg("LoadIconWithScaleDown", "ppiip")
+    def _liwsd(c, inst, name, cx, cy, out):
+        return _lim(c, inst, name, 0 if cx <= 16 else 1, out)
+
+    # DPA / DSA (dynamic pointer/structure arrays) — used by shell-style code
+    dpas = {}
+
+    @reg("DPA_Create", "i", "p")
+    def _dpac(c, grow):
+        h = gdi.add(_GMisc("dpa", items=[]))
+        return h
+
+    reg("DPA_CreateEx", "ip", "p")(lambda c, g, heap: _dpac(c, g))
+
+    def DPA(h):
+        return gdi.get(h, "dpa")
+
+    reg("DPA_Destroy", "p")(lambda c, h: 1 if gdi.objs.pop(h & 0xFFFFFFFF, None) else 0)
+    reg("DPA_GetPtrCount", "p")(lambda c, h: len(DPA(h).items) if DPA(h) else 0)
+
+    @reg("DPA_InsertPtr", "pip")
+    def _dpai(c, h, i, v):
+        d = DPA(h)
+        if d is None:
+            return -1
+        i = len(d.items) if i < 0 or i > len(d.items) else i
+        d.items.insert(i, v)
+        return i
+
+    @reg("DPA_GetPtr", "pi", "p")
+    def _dpag(c, h, i):
+        d = DPA(h)
+        return d.items[i] if d and 0 <= i < len(d.items) else 0
+
+    @reg("DPA_SetPtr", "pip")
+    def _dpas(c, h, i, v):
+        d = DPA(h)
+        if d is None or i < 0:
+            return 0
+        while len(d.items) <= i:
+            d.items.append(0)
+        d.items[i] = v
+        return 1
+
+    @reg("DPA_DeletePtr", "pi", "p")
+    def _dpad(c, h, i):
+        d = DPA(h)
+        return d.items.pop(i) if d and 0 <= i < len(d.items) else 0
+
+    reg("DPA_DeleteAllPtrs", "p")(lambda c, h: (DPA(h).items.clear(), 1)[1] if DPA(h) else 0)
+
+    @reg("DPA_GetPtrIndex", "pp")
+    def _dpagi(c, h, v):
+        d = DPA(h)
+        return d.items.index(v) if d and v in d.items else -1
+
+    @reg("DPA_DestroyCallback DPA_EnumCallback", "ppp", "v")
+    def _dpaenum(c, h, cb, data):
+        d = DPA(h)
+        if d is None:
+            return
+        for v in list(d.items):
+            if not (p.call_guest(cb, [v, data]) & 0xFFFFFFFF):
+                break
+
+    @reg("DPA_Sort", "ppp")
+    def _dpasort(c, h, cmp, lp):
+        d = DPA(h)
+        if d is None:
+            return 0
+        import functools
+        d.items.sort(key=functools.cmp_to_key(
+            lambda a, b: _s32(p.call_guest(cmp, [a, b, lp]) & 0xFFFFFFFF)))
+        return 1
+
+    @reg("DSA_Create", "ii", "p")
+    def _dsac(c, size, grow):
+        return gdi.add(_GMisc("dsa", size=size, items=[]))
+
+    def DSA(h):
+        return gdi.get(h, "dsa")
+
+    reg("DSA_Destroy", "p")(lambda c, h: 1 if gdi.objs.pop(h & 0xFFFFFFFF, None) else 0)
+    reg("DSA_GetItemCount", "p")(lambda c, h: len(DSA(h).items) if DSA(h) else 0)
+
+    @reg("DSA_InsertItem", "pip")
+    def _dsai(c, h, i, src):
+        d = DSA(h)
+        if d is None:
+            return -1
+        i = len(d.items) if i < 0 or i > len(d.items) else i
+        d.items.insert(i, bytes(M_.read(src, d.size)))
+        # the stored copy lives in guest memory so DSA_GetItemPtr can hand it out
+        return i
+
+    @reg("DSA_GetItemPtr", "pi", "p")
+    def _dsagp(c, h, i):
+        d = DSA(h)
+        if d is None or not 0 <= i < len(d.items):
+            return 0
+        cache = d.__dict__.setdefault("ptrs", {})
+        a = cache.get(i)
+        if a is None:
+            a = cache[i] = p.heap_alloc(p.process_heap_handle, max(1, d.size))
+        M_.write(a, d.items[i])
+        return a
+
+    @reg("DSA_DeleteItem", "pi")
+    def _dsad(c, h, i):
+        d = DSA(h)
+        if d is None or not 0 <= i < len(d.items):
+            return 0
+        del d.items[i]
+        d.__dict__.pop("ptrs", None)
+        return 1
+
+    reg("DSA_DeleteAllItems", "p")(lambda c, h: (DSA(h).items.clear(), 1)[1] if DSA(h) else 0)
+
+    @reg("Str_SetPtrW", "pp")
+    def _strsetptr(c, pp_, s):
+        old = wm.rp(pp_)
+        if old:
+            p.heap_free(p.process_heap_handle, old)
+        if s:
+            data = M_.read_wstring(s, 1 << 20) + b"\0\0"
+            a = p.heap_alloc(p.process_heap_handle, len(data))
+            M_.write(a, data)
+            wm.wp(pp_, a)
+        else:
+            wm.wp(pp_, 0)
+        return 1
+
+    # flat scroll bars behave like the standard ones
+    reg("InitializeFlatSB UninitializeFlatSB", "p")(lambda c, h: 1)
+    reg("FlatSB_SetScrollInfo", "pipi")(lambda c, h, bar, a, r: _scrollinfo_set(wm, W(h), bar, a, bool(r)) if W(h) else 0)
+    reg("FlatSB_GetScrollInfo", "pip")(lambda c, h, bar, a: _scrollinfo_get(wm, W(h), bar, a) if W(h) else 0)
+    reg("FlatSB_SetScrollProp FlatSB_GetScrollProp", "pupi")(lambda c, *a: 1)
+    reg("FlatSB_ShowScrollBar", "pii")(lambda c, h, bar, s: 1)
+    reg("FlatSB_EnableScrollBar", "puu")(lambda c, *a: 1)
+
+    # ---- progress bar ------------------------------------------------------------------------
+    def progress_proc(hwnd, msg, wp, lp, wide):
+        w = W(hwnd)
+        if w is None:
+            return 0
+        st = w.py.setdefault("pb", {"lo": 0, "hi": 100, "pos": 0, "step": 10, "bar": None,
+                                    "bk": None, "marquee": 0})
+        if msg == WM_NCCREATE:
+            w.exstyle |= WS_EX_STATICEDGE
+            return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+        if msg in (0x000F, WM_PRINTCLIENT):
+            def draw(pt):
+                W_, H_ = w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]
+                pt.fill(0, 0, W_, H_, st["bk"] if st["bk"] is not None else sysc(COLOR_BTNFACE))
+                rng = max(1, st["hi"] - st["lo"])
+                frac = (min(max(st["pos"], st["lo"]), st["hi"]) - st["lo"]) / float(rng)
+                col = st["bar"] if st["bar"] is not None else sysc(COLOR_HIGHLIGHT)
+                vert = w.style & 4
+                length = H_ - 2 if vert else W_ - 2
+                filled = int(length * frac + 0.5)
+                if w.style & 1:                                    # PBS_SMOOTH
+                    if vert:
+                        pt.fill(1, H_ - 1 - filled, W_ - 1, H_ - 1, col)
+                    else:
+                        pt.fill(1, 1, 1 + filled, H_ - 1, col)
+                else:
+                    thick = (W_ if vert else H_) - 2
+                    blk = max(2, thick * 2 // 3)
+                    x = 0
+                    while x < filled:
+                        e = min(filled, x + blk)
+                        if vert:
+                            pt.fill(1, H_ - 1 - e, W_ - 1, H_ - 1 - x, col)
+                        else:
+                            pt.fill(1 + x, 1, 1 + e, H_ - 1, col)
+                        x += blk + 2
+            paint(w, draw, wp)
+            return 0
+        if msg == 0x0014:
+            return 1
+        old = st["pos"]
+        if msg == 0x401:                                       # PBM_SETRANGE
+            old_r = (st["lo"] & 0xFFFF) | ((st["hi"] & 0xFFFF) << 16)
+            st["lo"], st["hi"] = lp & 0xFFFF, (lp >> 16) & 0xFFFF
+            wm.invalidate(w, None, True)
+            return old_r
+        if msg == 0x406:                                       # PBM_SETRANGE32
+            old_r = (st["lo"] & 0xFFFF) | ((st["hi"] & 0xFFFF) << 16)
+            st["lo"], st["hi"] = _s32(wp & 0xFFFFFFFF), _s32(lp & 0xFFFFFFFF)
+            wm.invalidate(w, None, True)
+            return old_r
+        if msg == 0x402:                                       # PBM_SETPOS
+            st["pos"] = _s32(wp & 0xFFFFFFFF)
+        elif msg == 0x403:                                     # PBM_DELTAPOS
+            st["pos"] += _s32(wp & 0xFFFFFFFF)
+        elif msg == 0x404:                                     # PBM_SETSTEP
+            o, st["step"] = st["step"], _s32(wp & 0xFFFFFFFF)
+            return o
+        elif msg == 0x405:                                     # PBM_STEPIT
+            st["pos"] += st["step"]
+            if st["pos"] > st["hi"]:
+                st["pos"] = st["lo"] + (st["pos"] - st["hi"])
+        elif msg == 0x407:                                     # PBM_GETRANGE
+            if lp:
+                M_.write(lp, struct.pack("<ii", st["lo"], st["hi"]))
+            return st["lo"] if wp else st["hi"]
+        elif msg == 0x408:                                     # PBM_GETPOS
+            return st["pos"] & 0xFFFFFFFF
+        elif msg == 0x409:                                     # PBM_SETBARCOLOR
+            o = st["bar"] if st["bar"] is not None else 0xFF000000
+            st["bar"] = None if lp == 0xFF000000 else lp & 0xFFFFFF
+            wm.invalidate(w, None, True)
+            return o
+        elif msg == 0x2001:                                    # PBM_SETBKCOLOR
+            o = st["bk"] if st["bk"] is not None else 0xFF000000
+            st["bk"] = None if lp == 0xFF000000 else lp & 0xFFFFFF
+            wm.invalidate(w, None, True)
+            return o
+        elif msg in (0x40A, 0x410, 0x40D, 0x40E, 0x40F, 0x411):   # marquee/state/step getters
+            return 0 if msg != 0x40D else st["step"]
+        else:
+            return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+        st["pos"] = max(st["lo"], min(st["pos"], st["hi"]))
+        if st["pos"] != old:
+            wm.invalidate(w, None, False)
+        return old & 0xFFFFFFFF
+
+    py_class("msctls_progress32", progress_proc)
+
+    # ---- trackbar ---------------------------------------------------------------------------
+    def trackbar_proc(hwnd, msg, wp, lp, wide):
+        w = W(hwnd)
+        if w is None:
+            return 0
+        st = w.py.setdefault("tb", {"lo": 0, "hi": 100, "pos": 0, "page": 20, "line": 1,
+                                    "freq": 1, "tics": [], "sel": (0, 0), "drag": False,
+                                    "tlen": 21})
+        vert = bool(w.style & 2)
+        Wd, Hd = w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]
+
+        def geom():
+            L_ = Wd if not vert else Hd
+            margin = 8
+            span = max(1, L_ - 2 * margin)
+            rng = max(1, st["hi"] - st["lo"])
+            pos = margin + (st["pos"] - st["lo"]) * span // rng
+            return margin, span, pos
+
+        def pos_from(xy):
+            margin, span, _p = geom()
+            rng = st["hi"] - st["lo"]
+            v = st["lo"] + ((xy - margin) * rng + span // 2) // max(1, span)
+            return max(st["lo"], min(st["hi"], v))
+
+        def notify_scroll(code):
+            par = w.parent if w.parent is not wm.desktop else wm.wnd(w.owner)
+            if par is not None:
+                wm.send(par.hwnd, WM_VSCROLL if vert else WM_HSCROLL,
+                        (code & 0xFFFF) | ((st["pos"] & 0xFFFF) << 16 if code in (4, 5) else 0),
+                        hwnd)
+
+        def setpos(v, code=None):
+            v = max(st["lo"], min(st["hi"], v))
+            if v != st["pos"]:
+                st["pos"] = v
+                wm.invalidate(w, None, True)
+                if code is not None:
+                    notify_scroll(code)
+
+        if msg in (0x000F, WM_PRINTCLIENT):
+            def draw(pt):
+                br = _ctl_color(wm, w, WM_CTLCOLORSTATIC, pt.dc)
+                pt.fill_brush(0, 0, Wd, Hd, br)
+                margin, span, pos = geom()
+                if not vert:
+                    cy = min(Hd // 2, 12)
+                    _draw_edge(pt, (margin - 2, cy - 2, margin + span + 2, cy + 2), 10, 15)
+                    th = min(st["tlen"], Hd - 4)
+                    _draw_edge(pt, (pos - 5, cy - th // 2, pos + 6, cy + th // 2), 5,
+                               15 | 0x800 | 0x1000)
+                    if not (w.style & 0x10):                         # ticks
+                        rng = st["hi"] - st["lo"]
+                        freq = max(1, st["freq"])
+                        vals = list(range(st["lo"], st["hi"] + 1, freq)) \
+                            if (w.style & 1) and rng // freq < 200 else [st["lo"], st["hi"]]
+                        for v in vals + st["tics"]:
+                            x = margin + (v - st["lo"]) * span // max(1, rng)
+                            pt.vline(x, cy + th // 2 + 2, cy + th // 2 + (5 if v in (st["lo"], st["hi"]) else 4), 0)
+                else:
+                    cx = min(Wd // 2, 12)
+                    _draw_edge(pt, (cx - 2, margin - 2, cx + 2, margin + span + 2), 10, 15)
+                    tw = min(st["tlen"], Wd - 4)
+                    _draw_edge(pt, (cx - tw // 2, pos - 5, cx + tw // 2, pos + 6), 5,
+                               15 | 0x800 | 0x1000)
+                if wm.focus == hwnd:
+                    _focus_rect(pt, 0, 0, Wd, Hd)
+            paint(w, draw, wp)
+            return 0
+        if msg == 0x0014:
+            return 1
+        if msg == WM_GETDLGCODE:
+            return DLGC_WANTARROWS
+        if msg in (0x0201, 0x0203):
+            wm.set_focus(hwnd)
+            x, y = _xy_lparam(lp)
+            margin, span, pos = geom()
+            c_ = y if vert else x
+            if abs(c_ - pos) <= 6:
+                st["drag"] = True
+                wm.set_capture(hwnd)
+            else:
+                setpos(st["pos"] + (st["page"] if c_ > pos else -st["page"]), 3 if c_ > pos else 2)
+                notify_scroll(8)
+            return 0
+        if msg == 0x0200 and st["drag"]:
+            x, y = _xy_lparam(lp)
+            setpos(pos_from(y if vert else x), 5)
+            return 0
+        if msg == 0x0202 and st["drag"]:
+            st["drag"] = False
+            if wm.capture == hwnd:
+                wm.set_capture(0)
+            notify_scroll(4)
+            notify_scroll(8)
+            return 0
+        if msg == 0x0100:
+            vk = wp & 0xFF
+            d = {0x25: (-st["line"], 0), 0x26: (-st["line"], 0), 0x27: (st["line"], 1),
+                 0x28: (st["line"], 1), 0x21: (-st["page"], 2), 0x22: (st["page"], 3)}.get(vk)
+            if d:
+                setpos(st["pos"] + d[0], d[1])
+                notify_scroll(8)
+            elif vk == 0x24:
+                setpos(st["lo"], 6)
+                notify_scroll(8)
+            elif vk == 0x23:
+                setpos(st["hi"], 7)
+                notify_scroll(8)
+            return 0
+        if msg in (WM_SETFOCUS, WM_KILLFOCUS):
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x400:
+            return st["pos"] & 0xFFFFFFFF
+        if msg == 0x401:
+            return st["lo"] & 0xFFFFFFFF
+        if msg == 0x402:
+            return st["hi"] & 0xFFFFFFFF
+        if msg == 0x405:                                           # TBM_SETPOS
+            setpos(_s32(lp & 0xFFFFFFFF))
+            return 0
+        if msg == 0x406:                                           # TBM_SETRANGE
+            st["lo"], st["hi"] = _s32(((lp & 0xFFFF) << 16)) >> 16, _s32(lp & 0xFFFF0000) >> 16
+            st["pos"] = max(st["lo"], min(st["pos"], st["hi"]))
+            st["page"] = max(1, (st["hi"] - st["lo"]) // 5)       # as Wine: page = range / 5
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x407:
+            st["lo"] = _s32(lp & 0xFFFFFFFF)
+            st["pos"] = max(st["lo"], st["pos"])
+            st["page"] = max(1, (st["hi"] - st["lo"]) // 5)       # as Wine: page = range / 5
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x408:
+            st["hi"] = _s32(lp & 0xFFFFFFFF)
+            st["pos"] = min(st["hi"], st["pos"])
+            st["page"] = max(1, (st["hi"] - st["lo"]) // 5)       # as Wine: page = range / 5
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x404:
+            st["tics"].append(_s32(lp & 0xFFFFFFFF))
+            return 1
+        if msg == 0x409:
+            st["tics"] = []
+            return 0
+        if msg == 0x40A:
+            st["sel"] = (lp & 0xFFFF, (lp >> 16) & 0xFFFF)
+            return 0
+        if msg == 0x414:                                           # TBM_SETTICFREQ
+            st["freq"] = max(1, wp)
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x415:
+            o, st["page"] = st["page"], _s32(lp & 0xFFFFFFFF)
+            return o
+        if msg == 0x416:
+            return st["page"]
+        if msg == 0x417:
+            o, st["line"] = st["line"], _s32(lp & 0xFFFFFFFF)
+            return o
+        if msg == 0x418:
+            return st["line"]
+        if msg == 0x410:
+            return len(st["tics"]) + 2
+        if msg in (0x419, 0x41A):                                  # GETTHUMBRECT / CHANNELRECT
+            margin, span, pos = geom()
+            if msg == 0x419:
+                r = (pos - 5, 2, pos + 6, Hd - 2) if not vert else (2, pos - 5, Wd - 2, pos + 6)
+            else:
+                r = (margin, Hd // 2 - 2, margin + span, Hd // 2 + 2)
+            _wr_rect(M_, lp, r)
+            return 0
+        if msg == 0x41B:
+            st["tlen"] = wp
+            return 0
+        if msg == 0x41C:
+            return st["tlen"]
+        if msg in (0x40B, 0x40C, 0x40D, 0x40E, 0x40F, 0x411, 0x412, 0x413, 0x41D, 0x41E,
+                   0x41F, 0x420, 0x421):
+            return 0
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+
+    py_class("msctls_trackbar32", trackbar_proc)
+
+    # ---- up-down ------------------------------------------------------------------------------
+    def updown_proc(hwnd, msg, wp, lp, wide):
+        w = W(hwnd)
+        if w is None:
+            return 0
+        st = w.py.setdefault("ud", {"lo": 100, "hi": 0, "pos": 0, "buddy": 0, "base": 10,
+                                    "pressed": None})
+        horz = bool(w.style & 0x40)
+        Wd, Hd = w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]
+
+        def buddy_sync():
+            b = W(st["buddy"])
+            if b is not None and w.style & 2:                  # UDS_SETBUDDYINT
+                v = st["pos"]
+                if st["base"] == 16:
+                    txt = "0x%04X" % (v & 0xFFFF)
+                elif w.style & 0x80 or abs(v) < 1000:
+                    txt = str(v)
+                else:
+                    txt = "{:,}".format(v)
+                mark = wm.scratch_mark()
+                try:
+                    wm.send(b.hwnd, WM_SETTEXT, 0, wm.scratch(txt.encode("utf-16-le") + b"\0\0"),
+                            True)
+                finally:
+                    wm.scratch_release(mark)
+
+        def attach(bh):
+            b = W(bh)
+            st["buddy"] = bh
+            if b is None:
+                return
+            if w.style & 0xC:                                  # ALIGNLEFT / ALIGNRIGHT
+                uw = 16 if w.w in (0, 1) or w.w > 40 else w.w
+                if w.style & 4:
+                    wm.set_pos(b, 0, 0, 0, max(1, b.w - uw + 2), b.h,
+                               SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)
+                    wm.set_pos(w, 0, b.x + b.w - 2, b.y, uw, b.h, SWP_NOZORDER | SWP_NOACTIVATE)
+                else:
+                    wm.set_pos(w, 0, b.x, b.y, uw, b.h, SWP_NOZORDER | SWP_NOACTIVATE)
+                    wm.set_pos(b, 0, b.x + uw - 2, b.y, max(1, b.w - uw + 2), b.h,
+                               SWP_NOZORDER | SWP_NOACTIVATE)
+            buddy_sync()
+
+        def step(d):
+            lo, hi = st["lo"], st["hi"]
+            b = W(st["buddy"])
+            if b is not None and w.style & 2:
+                try:
+                    st["pos"] = int(b.text.replace(",", ""), 0 if st["base"] == 16 else 10)
+                except ValueError:
+                    pass
+            if lo > hi:
+                d = -d                                         # reversed range
+            r, a = notify(w, -722, struct.pack("<ii", st["pos"], d))   # UDN_DELTAPOS
+            if r & 0xFFFFFFFF:
+                return
+            new = st["pos"] + d
+            mn, mx = min(lo, hi), max(lo, hi)
+            if new < mn:
+                new = mx if w.style & 1 else mn
+            elif new > mx:
+                new = mn if w.style & 1 else mx
+            if new == st["pos"]:
+                return
+            st["pos"] = new
+            buddy_sync()
+            par = w.parent if w.parent is not wm.desktop else None
+            if par is not None:
+                wm.send(par.hwnd, WM_HSCROLL if horz else WM_VSCROLL,
+                        4 | ((new & 0xFFFF) << 16), hwnd)
+                wm.send(par.hwnd, WM_HSCROLL if horz else WM_VSCROLL,
+                        8 | ((new & 0xFFFF) << 16), hwnd)
+
+        if msg == 0x0001:
+            if w.style & 0x10:                                 # UDS_AUTOBUDDY: previous sibling
+                par = w.parent
+                if par is not None and w in par.children:
+                    i = par.children.index(w)
+                    if i > 0:
+                        attach(par.children[i - 1].hwnd)
+            return 0
+        if msg in (0x000F, WM_PRINTCLIENT):
+            def draw(pt):
+                pr = st["pressed"]
+                if horz:
+                    a = (0, 0, Wd // 2, Hd)
+                    b_ = (Wd // 2, 0, Wd, Hd)
+                    _draw_frame_control(pt, a, 3, 2 | (0x200 if pr == 0 else 0))
+                    _draw_frame_control(pt, b_, 3, 3 | (0x200 if pr == 1 else 0))
+                else:
+                    a = (0, 0, Wd, Hd // 2)
+                    b_ = (0, Hd // 2, Wd, Hd)
+                    _draw_frame_control(pt, a, 3, 0 | (0x200 if pr == 0 else 0))
+                    _draw_frame_control(pt, b_, 3, 1 | (0x200 if pr == 1 else 0))
+            paint(w, draw, wp)
+            return 0
+        if msg == 0x0014:
+            return 1
+        if msg in (0x0201, 0x0203):
+            x, y = _xy_lparam(lp)
+            up = (x < Wd // 2) if horz else (y < Hd // 2)
+            st["pressed"] = 0 if up else 1
+            wm.invalidate(w, None, True)
+            step((-1 if horz else 1) if up else (1 if horz else -1))
+            wm.set_capture(hwnd)
+            return 0
+        if msg == 0x0202:
+            st["pressed"] = None
+            if wm.capture == hwnd:
+                wm.set_capture(0)
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x465:                                       # UDM_SETRANGE
+            st["hi"], st["lo"] = _s32(((lp & 0xFFFF) << 16)) >> 16, _s32(lp & 0xFFFF0000) >> 16
+            return 0
+        if msg == 0x46F:                                       # UDM_SETRANGE32
+            st["lo"], st["hi"] = _s32(wp & 0xFFFFFFFF), _s32(lp & 0xFFFFFFFF)
+            return 0
+        if msg == 0x466:
+            return ((st["lo"] & 0xFFFF) << 16) | (st["hi"] & 0xFFFF)
+        if msg == 0x470:
+            if wp:
+                M_.write32(wp, st["lo"] & 0xFFFFFFFF)
+            if lp:
+                M_.write32(lp, st["hi"] & 0xFFFFFFFF)
+            return 0
+        if msg in (0x467, 0x471):                              # UDM_SETPOS(32)
+            old = st["pos"]
+            v = _s32(lp & 0xFFFFFFFF) if msg == 0x471 else _s32(((lp & 0xFFFF) << 16)) >> 16
+            st["pos"] = max(min(st["lo"], st["hi"]), min(v, max(st["lo"], st["hi"])))
+            buddy_sync()
+            return old & 0xFFFFFFFF
+        if msg in (0x468, 0x472):                              # UDM_GETPOS(32)
+            b = W(st["buddy"])
+            if b is not None and w.style & 2:
+                try:
+                    st["pos"] = int(b.text.replace(",", ""), 0 if st["base"] == 16 else 10)
+                except ValueError:
+                    return 0x10000 if msg == 0x468 else st["pos"]
+            if msg == 0x472 and lp:
+                M_.write32(lp, 0)
+            return st["pos"] & (0xFFFF if msg == 0x468 else 0xFFFFFFFF)
+        if msg == 0x469:                                       # UDM_SETBUDDY
+            old = st["buddy"]
+            attach(wp & 0xFFFFFFFF)
+            return old
+        if msg == 0x46A:
+            return st["buddy"]
+        if msg == 0x46D:
+            o, st["base"] = st["base"], wp
+            return o
+        if msg == 0x46E:
+            return st["base"]
+        if msg in (0x46B, 0x46C):
+            return 1
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+
+    py_class("msctls_updown32", updown_proc)
+
+    @reg("CreateUpDownControl", "uiiiipipiii", "p")
+    def _cudc(c, style, x, y, cx, cy, par, cid, inst, buddy, up, lo, pos):
+        h = wm.create(0, wm.find_class("msctls_updown32"), "", style, x, y, cx, cy, par, cid,
+                      inst, 0, True)
+        if h:
+            wm.send(h, 0x465, 0, ((lo & 0xFFFF) << 16) | (up & 0xFFFF))
+            if buddy:
+                wm.send(h, 0x469, buddy, 0)
+            wm.send(h, 0x467, 0, pos & 0xFFFF)
+        return h
+
+    # ---- status bar ------------------------------------------------------------------------------
+    def sb_layout(w):
+        par = w.parent if w.parent is not wm.desktop else None
+        if par is None:
+            return
+        pw, ph = par.cl[2] - par.cl[0], par.cl[3] - par.cl[1]
+        f = gfont(w)
+        h = max(f.height + 8, w.py.get("sb_minh", 0) + 2, 20)
+        if w.style & 0x4 == 0 and not (w.style & 3 == 1):        # CCS_NORESIZE / CCS_TOP
+            wm.set_pos(w, 0, 0, ph - h, pw, h, SWP_NOZORDER | SWP_NOACTIVATE)
+
+    def statusbar_proc(hwnd, msg, wp, lp, wide):
+        w = W(hwnd)
+        if w is None:
+            return 0
+        st = w.py.setdefault("sb", {"parts": [-1], "texts": {}, "simple": False,
+                                    "simple_text": "", "bk": None, "icons": {}})
+        Wd, Hd = w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]
+
+        def part_rects():
+            out = []
+            x = 0
+            grip = 16 if (w.style & 0x100) else 0
+            for i, r in enumerate(st["parts"]):
+                right = Wd - grip if r == -1 or r > Wd - grip else r
+                out.append((x + (2 if i else 0), 2, right, Hd))
+                x = right
+            return out
+
+        if msg == 0x0001:
+            sb_layout(w)
+            return 0
+        if msg == 0x0005:                                          # WM_SIZE (from the parent)
+            sb_layout(w)
+            wm.invalidate(w, None, True)
+            return 0
+        if msg in (0x000F, WM_PRINTCLIENT):
+            def draw(pt):
+                pt.fill(0, 0, Wd, Hd, st["bk"] if st["bk"] is not None else sysc(COLOR_BTNFACE))
+                f = gfont(w)
+                items = [(0, (0, 2, Wd, Hd), st["simple_text"])] if st["simple"] else \
+                    [(i, r, st["texts"].get(i, ("", 0))[0]) for i, r in enumerate(part_rects())]
+                for i, r, text in items:
+                    flags = st["texts"].get(i, ("", 0))[1] if not st["simple"] else 0
+                    if not flags & 0x100:                          # SBT_NOBORDERS
+                        _draw_edge(pt, r, 2 if not flags & 0x200 else 4, 15)
+                    x = r[0] + 3
+                    ic = st["icons"].get(i)
+                    if ic:
+                        pt.icon(x, r[1] + (r[3] - r[1] - 16) // 2, ic, 16, 16)
+                        x += 18
+                    segs = text.split("\t")
+                    ty = r[1] + (r[3] - r[1] - f.height) // 2
+                    for k_, seg in enumerate(segs[:3]):
+                        if k_ == 0:
+                            pt.text(x, ty, seg, f, sysc(COLOR_BTNTEXT), (r[0] + 1, r[1], r[2] - 1, r[3]))
+                        elif k_ == 1:
+                            sw = f.width(seg)
+                            pt.text((r[0] + r[2] - sw) // 2, ty, seg, f, sysc(COLOR_BTNTEXT), r)
+                        else:
+                            pt.text(r[2] - f.width(seg) - 4, ty, seg, f, sysc(COLOR_BTNTEXT), r)
+                if w.style & 0x100:
+                    _draw_frame_control(pt, (Wd - 16, Hd - 16, Wd, Hd), 3, 8)
+            paint(w, draw, wp)
+            return 0
+        if msg == 0x0014:
+            return 1
+        if msg == WM_NCHITTEST:
+            x, y = _xy_lparam(lp)
+            cx, cy = wm.client_origin(w)
+            if w.style & 0x100 and x - cx >= Wd - 16 and y - cy >= Hd - 16:
+                top = wm.top(w)
+                if top is not None and top.style & WS_THICKFRAME and top.min_state != 2:
+                    return HTTRANSPARENT & 0xFFFFFFFF
+            return HTCLIENT
+        if msg in (0x0201, 0x0203, 0x0204, 0x0206):
+            x, y = _xy_lparam(lp)
+            code = {0x0201: NM_CLICK, 0x0203: NM_DBLCLK, 0x0204: NM_RCLICK,
+                    0x0206: NM_RDBLCLK}[msg]
+            part = 0
+            for i, r in enumerate(part_rects()):
+                if r[0] <= x < r[2]:
+                    part = i
+            notify(w, code, struct.pack("<Q" if ps == 8 else "<I", part) +
+                   struct.pack("<ii", x, y) + bytes(8))
+            return 0
+        if msg in (0x401, 0x40B, WM_SETTEXT):                      # SB_SETTEXTA/W
+            if msg == WM_SETTEXT:
+                part, flags = 0, 0
+                text = wm.gstr(lp, wide) if lp else ""
+                w.text = text
+            else:
+                part, flags = wp & 0xFF, wp & 0xFF00
+                if part == 255:
+                    st["simple_text"] = wm.gstr(lp, msg == 0x40B) if lp else ""
+                    wm.invalidate(w, None, True)
+                    return 1
+                if flags & 0x1000:                                 # SBT_OWNERDRAW
+                    text = ""
+                else:
+                    text = wm.gstr(lp, msg == 0x40B) if lp else ""
+            st["texts"][part] = (text, flags)
+            wm.invalidate(w, None, True)
+            return 1
+        if msg in (0x402, 0x40D, 0x403, 0x40C):                    # SB_GETTEXT / LENGTH
+            wide_ = msg in (0x40D, 0x40C)
+            text, flags = st["texts"].get(wp & 0xFF, ("", 0))
+            n = wm.str_len(text, wide_)
+            if msg in (0x402, 0x40D) and lp:
+                M_.write(lp, (text.encode("utf-16-le") + b"\0\0") if wide_ else
+                         (text.encode("utf-8") + b"\0"))
+            return (n & 0xFFFF) | ((flags & 0xFFFF) << 16)
+        if msg == 0x404:                                           # SB_SETPARTS
+            n = max(1, min(wp, 256))
+            st["parts"] = [_s32(M_.read32(lp + 4 * i)) for i in range(n)] if lp else [-1]
+            wm.invalidate(w, None, True)
+            return 1
+        if msg == 0x406:                                           # SB_GETPARTS
+            if lp:
+                for i, v in enumerate(st["parts"][:wp]):
+                    M_.write32(lp + 4 * i, v & 0xFFFFFFFF)
+            return len(st["parts"])
+        if msg == 0x407:                                           # SB_GETBORDERS
+            M_.write(lp, struct.pack("<iii", 0, 2, 2))
+            return 1
+        if msg == 0x408:
+            st["sb_minh"] = w.py["sb_minh"] = wp
+            return 0
+        if msg == 0x409:                                           # SB_SIMPLE
+            st["simple"] = bool(wp)
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x40A:                                           # SB_GETRECT
+            rs = part_rects()
+            if not 0 <= wp < len(rs):
+                return 0
+            _wr_rect(M_, lp, rs[wp])
+            return 1
+        if msg == 0x40E:
+            return 1 if st["simple"] else 0
+        if msg == 0x40F:                                           # SB_SETICON
+            st["icons"][wp & 0xFF] = lp
+            wm.invalidate(w, None, True)
+            return 1
+        if msg in (0x410, 0x411):                                  # SB_SETTIPTEXT
+            return 0
+        if msg == 0x414:
+            return st["icons"].get(wp, 0)
+        if msg == 0x2001:                                          # SB_SETBKCOLOR
+            o = st["bk"] if st["bk"] is not None else 0xFF000000
+            st["bk"] = None if lp == 0xFF000000 else lp & 0xFFFFFF
+            wm.invalidate(w, None, True)
+            return o
+        if msg == WM_SETFONT:
+            w.font = wp
+            sb_layout(w)
+            return 0
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+
+    py_class("msctls_statusbar32", statusbar_proc)
+
+    def _create_status(c, style, text, par, cid, wide):
+        h = wm.create(0, wm.find_class("msctls_statusbar32"), "", style, 0, 0, 0, 0, par, cid,
+                      0, 0, wide)
+        if h and text:
+            wm.send(h, 0x40B if wide else 0x401, 0, text, wide)
+        return h
+
+    reg("CreateStatusWindowA", "ippu", "p")(lambda c, s, t, par, i: _create_status(c, s, t, par, i, False))
+    reg("CreateStatusWindowW", "ippu", "p")(lambda c, s, t, par, i: _create_status(c, s, t, par, i, True))
+
+    def _draw_status_text(c, hdc, r, text_a, flags, wide):
+        dc = gdi.get(hdc, "dc")
+        if dc is None or not r:
+            return
+        pt = _Painter(wm, dc=dc)
+        try:
+            rc = _rd_rect(M_, r)
+            if not flags & 0x100:
+                _draw_edge(pt, rc, 2, 15)
+            text = wm.gstr(text_a, wide) if text_a else ""
+            pt.draw_text((rc[0] + 3, rc[1], rc[2] - 2, rc[3]), text, 0x20 | 4, dc.font,
+                         sysc(COLOR_BTNTEXT))
+        finally:
+            pt.done()
+
+    reg("DrawStatusTextA", "pppu", "v")(lambda c, h, r, t, f: _draw_status_text(c, h, r, t, f, False))
+    reg("DrawStatusTextW", "pppu", "v")(lambda c, h, r, t, f: _draw_status_text(c, h, r, t, f, True))
+
+    # ---- tooltips (a real window that stays hidden; tools are remembered) --------------------------
+    def tooltip_proc(hwnd, msg, wp, lp, wide):
+        w = W(hwnd)
+        if w is None:
+            return 0
+        st = w.py.setdefault("tt", {"tools": 0, "active": True, "width": -1, "delays": {}})
+        if msg in (0x404, 0x432):                                  # TTM_ADDTOOLA/W
+            st["tools"] += 1
+            return 1
+        if msg in (0x405, 0x433, 0x40C, 0x439, 0x406, 0x434, 0x401, 0x403, 0x411, 0x412,
+                   0x413, 0x41C, 0x41D, 0x41F, 0x420, 0x421, 0x422, 0x42B):
+            return 0 if msg not in (0x418,) else st["width"]
+        if msg == 0x418:                                           # TTM_SETMAXTIPWIDTH
+            o, st["width"] = st["width"], _s32(lp & 0xFFFFFFFF)
+            return o
+        if msg == 0x40D:                                           # TTM_GETTOOLCOUNT
+            return st["tools"]
+        if msg in (0x408, 0x43A, 0x410, 0x43B):                    # GETTOOLINFO/HITTEST
+            return 0
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+
+    py_class("tooltips_class32", tooltip_proc, style=0x8 | 0x20000)
+
+    # ---- tab control ----------------------------------------------------------------------------
+    def tab_proc(hwnd, msg, wp, lp, wide):
+        w = W(hwnd)
+        if w is None:
+            return 0
+        st = w.py.setdefault("tab", {"items": [], "cur": -1, "il": 0, "focus": -1,
+                                     "size": None, "pad": (6, 3)})
+        Wd, Hd = w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]
+        f = gfont(w)
+        row_h = max(f.height + 7, (st["size"][1] if st["size"] else 0))
+
+        def tab_rects():
+            out = []
+            x = 2
+            il = IL(st["il"])
+            for it in st["items"]:
+                vis, _u = _strip_prefix(it["text"])
+                tw = f.width(vis) + 2 * st["pad"][0] + (il.cx + 4 if il and it["img"] >= 0 else 0)
+                if st["size"] and w.style & 0x400:                 # TCS_FIXEDWIDTH
+                    tw = st["size"][0]
+                out.append((x, 2, x + tw, 2 + row_h))
+                x += tw
+            return out
+
+        def select(i, notify_=True):
+            if i == st["cur"] or not 0 <= i < len(st["items"]):
+                return
+            if notify_:
+                r, _a = notify(w, -552)                            # TCN_SELCHANGING
+                if r & 0xFFFFFFFF:
+                    return
+            st["cur"] = i
+            st["focus"] = i
+            wm.invalidate(w, None, True)
+            if notify_:
+                notify(w, -551)                                    # TCN_SELCHANGE
+
+        def item_struct(a, wide_, get, idx):
+            """TCITEM{mask, dwState, dwStateMask, pszText, cchTextMax, iImage, lParam}."""
+            mask = M_.read32(a)
+            off_txt = 16 if ps == 8 else 12
+            it = st["items"][idx] if get else {"text": "", "img": -1, "param": 0}
+            if get:
+                if mask & 1:
+                    buf = wm.rp(a + off_txt)
+                    n = M_.read32(a + off_txt + ps)
+                    wm.put_str(buf, n, it["text"], wide_)
+                if mask & 2:
+                    M_.write32(a + off_txt + ps + 4, it["img"] & 0xFFFFFFFF)
+                if mask & 8:
+                    wm.wp(a + off_txt + ps + 8, it["param"])
+                return it
+            if mask & 1:
+                it["text"] = wm.gstr(wm.rp(a + off_txt), wide_)
+            if mask & 2:
+                it["img"] = _s32(M_.read32(a + off_txt + ps + 4))
+            if mask & 8:
+                it["param"] = wm.rp(a + off_txt + ps + 8)
+            it["mask"] = mask
+            return it
+
+        if msg in (0x000F, WM_PRINTCLIENT):
+            def draw(pt):
+                br = _ctl_color(wm, w, WM_CTLCOLORDLG, pt.dc)
+                pt.fill(0, 0, Wd, Hd, sysc(COLOR_BTNFACE))
+                rects = tab_rects()
+                _draw_edge(pt, (0, 2 + row_h, Wd, Hd), 5, 15)
+                il = IL(st["il"])
+                for i, (it, r) in enumerate(zip(st["items"], rects)):
+                    sel = i == st["cur"]
+                    l, t, rr, b = r
+                    if sel:
+                        l, t, rr, b = l - 2, t - 2, rr + 2, b + 1
+                    pt.fill(l + 1, t + 1, rr - 1, b, sysc(COLOR_BTNFACE))
+                    pt.vline(l, t + 2, b, sysc(COLOR_BTNHIGHLIGHT))
+                    pt.hline(l + 2, rr - 2, t, sysc(COLOR_BTNHIGHLIGHT))
+                    pt.plot(l + 1, t + 1, sysc(COLOR_BTNHIGHLIGHT))
+                    pt.vline(rr - 2, t + 1, b, sysc(COLOR_BTNSHADOW))
+                    pt.vline(rr - 1, t + 2, b, sysc(COLOR_3DDKSHADOW))
+                    if sel:
+                        pt.hline(l + 1, rr - 1, b, sysc(COLOR_BTNFACE))
+                    x = l + st["pad"][0]
+                    if il and it["img"] >= 0:
+                        surf, ox, oy = pt.surf, pt.ox, pt.oy
+                        X, Y = pt.xy(x, t + (b - t - il.cy) // 2)
+                        il.draw(surf, pt.clip, X, Y, it["img"])
+                        x += il.cx + 4
+                    vis, ul = _strip_prefix(it["text"])
+                    ty = t + (b - t - f.height) // 2
+                    pt.text(x, ty, vis, f, sysc(COLOR_BTNTEXT))
+                    if sel and wm.focus == hwnd:
+                        _focus_rect(pt, l + 3, t + 3, rr - 3, b - 1)
+            paint(w, draw, wp)
+            return 0
+        if msg == 0x0014:
+            return 1
+        if msg == WM_GETDLGCODE:
+            return DLGC_WANTARROWS | DLGC_WANTCHARS
+        if msg in (0x0201, 0x0203):
+            x, y = _xy_lparam(lp)
+            for i, r in enumerate(tab_rects()):
+                if r[0] <= x < r[2] and r[1] - 2 <= y < r[3]:
+                    if not (w.style & 0x10000):                    # !TCS_FOCUSNEVER
+                        wm.set_focus(hwnd)
+                    select(i)
+                    notify(w, NM_CLICK)
+                    break
+            return 0
+        if msg == 0x0100:
+            vk = wp & 0xFF
+            if vk in (0x25, 0x27) and st["items"]:
+                select(max(0, min(len(st["items"]) - 1, st["cur"] + (1 if vk == 0x27 else -1))))
+            return 0
+        if msg in (WM_SETFOCUS, WM_KILLFOCUS):
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x1304:                                          # TCM_GETITEMCOUNT
+            return len(st["items"])
+        if msg in (0x1307, 0x133E):                                # TCM_INSERTITEMA/W
+            it = item_struct(lp, msg == 0x133E, False, 0)
+            i = max(0, min(wp, len(st["items"])))
+            st["items"].insert(i, it)
+            if st["cur"] < 0:
+                st["cur"] = 0
+            elif i <= st["cur"]:
+                st["cur"] += 1
+            wm.invalidate(w, None, True)
+            return i
+        if msg in (0x1306, 0x133D):                                # TCM_SETITEMA/W
+            if not 0 <= wp < len(st["items"]):
+                return 0
+            new = item_struct(lp, msg == 0x133D, False, wp)
+            old = st["items"][wp]
+            m = new.get("mask", 0)
+            for key, bit in (("text", 1), ("img", 2), ("param", 8)):
+                if m & bit:
+                    old[key] = new[key]
+            wm.invalidate(w, None, True)
+            return 1
+        if msg in (0x1305, 0x133C):                                # TCM_GETITEMA/W
+            if not 0 <= wp < len(st["items"]):
+                return 0
+            item_struct(lp, msg == 0x133C, True, wp)
+            return 1
+        if msg == 0x1308:                                          # TCM_DELETEITEM
+            if not 0 <= wp < len(st["items"]):
+                return 0
+            del st["items"][wp]
+            if st["cur"] >= len(st["items"]):
+                st["cur"] = len(st["items"]) - 1
+            wm.invalidate(w, None, True)
+            return 1
+        if msg == 0x1309:
+            st["items"] = []
+            st["cur"] = -1
+            wm.invalidate(w, None, True)
+            return 1
+        if msg == 0x130A:                                          # TCM_GETITEMRECT
+            rs = tab_rects()
+            if not 0 <= wp < len(rs):
+                return 0
+            _wr_rect(M_, lp, rs[wp])
+            return 1
+        if msg == 0x130B:
+            return st["cur"] & 0xFFFFFFFF
+        if msg == 0x130C:                                          # TCM_SETCURSEL
+            old = st["cur"]
+            if 0 <= wp < len(st["items"]):
+                st["cur"] = wp
+                wm.invalidate(w, None, True)
+            return old & 0xFFFFFFFF
+        if msg == 0x130D:                                          # TCM_HITTEST
+            x, y = struct.unpack("<ii", M_.read(lp, 8))
+            for i, r in enumerate(tab_rects()):
+                if r[0] <= x < r[2] and r[1] <= y < r[3]:
+                    M_.write32(lp + 8, 6)
+                    return i
+            M_.write32(lp + 8, 1)
+            return 0xFFFFFFFF
+        if msg == 0x1328:                                          # TCM_ADJUSTRECT
+            l, t, r, b = _rd_rect(M_, lp)
+            if wp:
+                _wr_rect(M_, lp, (l - 4, t - 4 - row_h, r + 4, b + 4))
+            else:
+                _wr_rect(M_, lp, (l + 4, t + row_h + 4, r - 4, b - 4))
+            return 0
+        if msg == 0x1329:                                          # TCM_SETITEMSIZE
+            old = st["size"] or (0, row_h)
+            st["size"] = (lp & 0xFFFF, (lp >> 16) & 0xFFFF)
+            return (old[0] & 0xFFFF) | ((old[1] & 0xFFFF) << 16)
+        if msg == 0x132B:
+            st["pad"] = (lp & 0xFFFF, (lp >> 16) & 0xFFFF)
+            return 0
+        if msg == 0x132C:
+            return 1
+        if msg == 0x1302:                                          # TCM_GETIMAGELIST
+            return st["il"]
+        if msg == 0x1303:
+            o, st["il"] = st["il"], lp
+            return o
+        if msg in (0x132F,):
+            return st["focus"] & 0xFFFFFFFF
+        if msg == 0x1330:
+            select(wp, False)
+            return 0
+        if msg in (0x1331, 0x130E, 0x132D, 0x132E, 0x1332, 0x1333, 0x1334, 0x1335, 0x1339):
+            return 0
+        if msg == WM_SETFONT:
+            w.font = wp
+            if lp:
+                wm.invalidate(w, None, True)
+            return 0
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+
+    py_class("SysTabControl32", tab_proc)
+
+    _cc_install_views(k, notify, NMHDR_SZ, hfont, gfont, paint, IL, py_class)
+    _cc_install_bars(k, notify, NMHDR_SZ, hfont, gfont, paint, IL, py_class)
+
+
+# -- comctl32: header, list view, tree view -----------------------------------------------------------
+
+def _cc_install_views(k, notify, NMHDR_SZ, hfont, gfont, paint, IL, py_class):
+    p = k.p
+    M_ = p.mem
+    wm = p.wm
+    gdi = p.gdi
+    ps = wm.ps
+    sysc = gdi.sys_color
+    W = wm.wnd
+    LPSTR_TEXTCALLBACK = M64 if ps == 8 else 0xFFFFFFFF
+
+    def nf_unicode(w):
+        """Does the parent want Unicode notifications (WM_NOTIFYFORMAT)?"""
+        v = w.py.get("nf_uni")
+        if v is None:
+            par = w.parent if w.parent is not None and w.parent is not wm.desktop else \
+                wm.wnd(w.owner)
+            v = True
+            if par is not None and par is not wm.desktop:
+                v = (wm.send(par.hwnd, WM_NOTIFYFORMAT, w.hwnd, 3) & 0xFFFFFFFF) != 1
+            w.py["nf_uni"] = v
+        return v
+
+    # ---- header ---------------------------------------------------------------------------------
+    def hd_items(w):
+        return w.py.setdefault("hd", {"items": [], "il": 0, "press": -1, "drag": None})
+
+    def hd_height(w):
+        return gfont(w).height + 6
+
+    def hd_rects(w):
+        x = 0
+        out = []
+        for it in hd_items(w)["items"]:
+            out.append((x, 0, x + max(0, it["cx"]), hd_height(w)))
+            x += max(0, it["cx"])
+        return out
+
+    def hd_item_io(a, wide_, it, get):
+        """HDITEM{mask, cxy, pszText, hbm, cchTextMax, fmt, lParam, iImage, iOrder}."""
+        mask = M_.read32(a)
+        if ps == 8:
+            o = {"cxy": 4, "text": 8, "hbm": 16, "cch": 24, "fmt": 28, "lparam": 32,
+                 "image": 40, "order": 44}
+        else:
+            o = {"cxy": 4, "text": 8, "hbm": 12, "cch": 16, "fmt": 20, "lparam": 24,
+                 "image": 28, "order": 32}
+        if get:
+            if mask & 1:
+                M_.write32(a + o["cxy"], it["cx"] & 0xFFFFFFFF)
+            if mask & 2:
+                wm.put_str(wm.rp(a + o["text"]), M_.read32(a + o["cch"]), it["text"], wide_)
+            if mask & 4:
+                M_.write32(a + o["fmt"], it["fmt"])
+            if mask & 8:
+                wm.wp(a + o["lparam"], it["param"])
+            if mask & 0x20:
+                M_.write32(a + o["image"], it["img"] & 0xFFFFFFFF)
+            return it
+        if mask & 1:
+            it["cx"] = _s32(M_.read32(a + o["cxy"]))
+        if mask & 2:
+            ptr = wm.rp(a + o["text"])
+            it["text"] = wm.gstr(ptr, wide_) if ptr and ptr != LPSTR_TEXTCALLBACK else ""
+        if mask & 4:
+            it["fmt"] = M_.read32(a + o["fmt"])
+        if mask & 8:
+            it["param"] = wm.rp(a + o["lparam"])
+        if mask & 0x20:
+            it["img"] = _s32(M_.read32(a + o["image"]))
+        return it
+
+    def header_paint(w, pt, xoff=0):
+        st = hd_items(w)
+        f = gfont(w)
+        H = hd_height(w)
+        Wd = w.cl[2] - w.cl[0]
+        pt.fill(0, 0, Wd, H, sysc(COLOR_BTNFACE))
+        x = -xoff
+        for i, it in enumerate(st["items"]):
+            r = (x, 0, x + max(0, it["cx"]), H)
+            x = r[2]
+            pressed = st["press"] == i
+            if pressed:
+                pt.frame(r[0], r[1], r[2], r[3], sysc(COLOR_BTNSHADOW))
+            else:
+                _draw_edge(pt, r, 5, 15 | 0x1000)
+            fmt = it["fmt"] & 3
+            align = {0: 0, 1: 2, 2: 1}.get(fmt, 0)
+            off = 1 if pressed else 0
+            pt.draw_text((r[0] + 6 + off, r[1] + off, r[2] - 6 + off, r[3] + off), it["text"],
+                         align | 0x20 | 4 | 0x8000 | 0x800, hfont(w), sysc(COLOR_BTNTEXT))
+        if x < Wd:
+            _draw_edge(pt, (x, 0, Wd + 2, H), 5, 15 | 0x1000)
+
+    def header_proc(hwnd, msg, wp, lp, wide):
+        w = W(hwnd)
+        if w is None:
+            return 0
+        st = hd_items(w)
+        if msg in (0x000F, WM_PRINTCLIENT):
+            paint(w, lambda pt: header_paint(w, pt), wp)
+            return 0
+        if msg == 0x0014:
+            return 1
+        if msg in (0x0201, 0x0203):
+            x, y = _xy_lparam(lp)
+            for i, r in enumerate(hd_rects(w)):
+                if r[2] - 4 <= x < r[2] + 4 and w.style & 0x800 == 0:        # resize grip
+                    st["drag"] = (i, x, st["items"][i]["cx"])
+                    wm.set_capture(hwnd)
+                    return 0
+            for i, r in enumerate(hd_rects(w)):
+                if r[0] <= x < r[2]:
+                    if w.style & 2:                                        # HDS_BUTTONS
+                        st["press"] = i
+                        wm.set_capture(hwnd)
+                        wm.invalidate(w, None, True)
+                    break
+            return 0
+        if msg == 0x0200 and st["drag"]:
+            i, x0, cx0 = st["drag"]
+            x, y = _xy_lparam(lp)
+            st["items"][i]["cx"] = max(0, cx0 + x - x0)
+            wm.invalidate(w, None, True)
+            par = w.parent
+            if par is not None and par.py.get("lv") is not None:
+                wm.invalidate(par, None, True)
+            return 0
+        if msg == 0x0202:
+            if st["drag"]:
+                st["drag"] = None
+            elif st["press"] >= 0:
+                i = st["press"]
+                st["press"] = -1
+                wm.invalidate(w, None, True)
+                x, y = _xy_lparam(lp)
+                rs = hd_rects(w)
+                if i < len(rs) and rs[i][0] <= x < rs[i][2]:
+                    par = w.parent
+                    if par is not None and par.py.get("lv") is not None:
+                        wm.send(par.hwnd, 0x0400 + 0x99, i, 0)            # column click
+                    else:
+                        notify(w, -302, struct.pack("<ii", i, 0) + bytes(ps))   # HDN_ITEMCLICKW
+            if wm.capture == hwnd:
+                wm.set_capture(0)
+            return 0
+        if msg == 0x1200:                                                  # HDM_GETITEMCOUNT
+            return len(st["items"])
+        if msg in (0x1201, 0x120A):                                        # HDM_INSERTITEM
+            it = hd_item_io(lp, msg == 0x120A, {"cx": 50, "text": "", "fmt": 0, "param": 0,
+                                                "img": -1}, False)
+            i = max(0, min(wp, len(st["items"])))
+            st["items"].insert(i, it)
+            wm.invalidate(w, None, True)
+            return i
+        if msg == 0x1202:
+            if 0 <= wp < len(st["items"]):
+                del st["items"][wp]
+                wm.invalidate(w, None, True)
+                return 1
+            return 0
+        if msg in (0x1203, 0x120B):
+            if not 0 <= wp < len(st["items"]):
+                return 0
+            hd_item_io(lp, msg == 0x120B, st["items"][wp], True)
+            return 1
+        if msg in (0x1204, 0x120C):
+            if not 0 <= wp < len(st["items"]):
+                return 0
+            hd_item_io(lp, msg == 0x120C, st["items"][wp], False)
+            wm.invalidate(w, None, True)
+            return 1
+        if msg == 0x1205:                                                  # HDM_LAYOUT
+            prc = wm.rp(lp)
+            pwp = wm.rp(lp + ps)
+            l, t, r, b = _rd_rect(M_, prc)
+            h = hd_height(w) if not (w.style & 8) else 0                   # HDS_HIDDEN
+            if ps == 8:
+                M_.write(pwp, struct.pack("<QQiiiiI", hwnd, 0, l, t, r - l, h, 0))
+            else:
+                M_.write(pwp, struct.pack("<IIiiiiI", hwnd, 0, l, t, r - l, h, 0))
+            _wr_rect(M_, prc, (l, t + h, r, b))
+            return 1
+        if msg == 0x1207:                                                  # HDM_GETITEMRECT
+            rs = hd_rects(w)
+            if not 0 <= wp < len(rs):
+                return 0
+            _wr_rect(M_, lp, rs[wp])
+            return 1
+        if msg == 0x1208:
+            o, st["il"] = st["il"], lp
+            return o
+        if msg == 0x1209:
+            return st["il"]
+        if msg == 0x1206:                                                  # HDM_HITTEST
+            x, y = struct.unpack("<ii", M_.read(lp, 8))
+            for i, r in enumerate(hd_rects(w)):
+                if r[0] <= x < r[2]:
+                    M_.write32(lp + 8, 6)
+                    M_.write32(lp + 12, i)
+                    return i
+            return 0xFFFFFFFF
+        if msg in (0x1211, 0x1212, 0x120F, 0x1210, 0x1213):
+            return 0
+        if msg == WM_SETFONT:
+            w.font = wp
+            return 0
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+
+    py_class("SysHeader32", header_proc)
+
+    # ---- list view ----------------------------------------------------------------------------------
+    LVIS_FOCUSED, LVIS_SELECTED = 1, 2
+
+    class _LVItem:
+        __slots__ = ("texts", "img", "param", "state", "indent")
+
+        def __init__(self):
+            self.texts = {}           # subitem -> str or None (callback)
+            self.img = -1
+            self.param = 0
+            self.state = 0
+            self.indent = 0
+
+    def lvst(w):
+        s = w.py.get("lv")
+        if s is None:
+            s = w.py["lv"] = {"items": [], "hdr": 0, "top": 0, "xoff": 0, "ex": 0, "il": {},
+                              "bk": sysc(COLOR_WINDOW), "tbk": 0xFFFFFFFF,
+                              "tc": sysc(COLOR_WINDOWTEXT), "mark": -1, "anchor": -1,
+                              "count_virtual": 0, "search": "", "stime": 0.0,
+                              "drag_sel": False}
+        return s
+
+    def view(w):
+        return w.style & 3
+
+    def row_h(w):
+        f = gfont(w)
+        il = IL(lvst(w)["il"].get(1, 0))
+        return max(f.height + 3, (il.cy + 1) if il else 0, 16)
+
+    def header(w):
+        return W(lvst(w)["hdr"])
+
+    def columns(w):
+        h = header(w)
+        return hd_items(h)["items"] if h is not None else []
+
+    def top_off(w):
+        h = header(w)
+        if view(w) == 1 and h is not None and not (w.style & 0x4000):      # !LVS_NOCOLUMNHEADER
+            return hd_height(h)
+        return 0
+
+    def nitems(w):
+        s = lvst(w)
+        return s["count_virtual"] if w.style & 0x1000 else len(s["items"])   # LVS_OWNERDATA
+
+    def item(w, i):
+        s = lvst(w)
+        if w.style & 0x1000:
+            it = s.setdefault("vcache", {}).get(i)
+            if it is None:
+                it = _LVItem()
+                s["vcache"][i] = it
+            return it
+        return s["items"][i] if 0 <= i < len(s["items"]) else None
+
+    def item_text(w, i, sub):
+        it = item(w, i)
+        if it is None:
+            return ""
+        t = it.texts.get(sub, "")
+        if t is None or w.style & 0x1000:
+            return dispinfo_text(w, i, sub, it)
+        return t
+
+    def dispinfo_text(w, i, sub, it):
+        # LVN_GETDISPINFO with an LVITEM asking for the text
+        uni = nf_unicode(w)
+        out = [""]
+
+        def after(a):
+            ptr = wm.rp(a + LVO["text"])
+            out[0] = wm.gstr(ptr, uni) if ptr and ptr != LPSTR_TEXTCALLBACK else ""
+        mark = wm.scratch_mark()
+        try:
+            buf = wm.scratch(520)
+            lv = lvitem_pack(1, i, sub, 0, 0, buf, 260, 0, it.param if it else 0)
+            notify(w, -177 if uni else -150, lv, after)
+        finally:
+            wm.scratch_release(mark)
+        return out[0]
+
+    def lvitem_pack(mask, i, sub, state, smask, text, cch, img, param):
+        if ps == 8:
+            return struct.pack("<IiiII4xQiiQi4x", mask, i, sub, state, smask, text, cch, img,
+                               param & M64, 0)
+        return struct.pack("<IiiIIIiiIi", mask, i, sub, state, smask, text & 0xFFFFFFFF, cch,
+                           img, param & 0xFFFFFFFF, 0)
+
+    LVO = {"mask": 0, "item": 4, "sub": 8, "state": 12, "smask": 16,
+           "text": 24 if ps == 8 else 20, "cch": 32 if ps == 8 else 24,
+           "img": 36 if ps == 8 else 28, "param": 40 if ps == 8 else 32,
+           "indent": 48 if ps == 8 else 36}
+
+    def notify_item(w, code, i, sub=0, newst=0, oldst=0, changed=0, pt=(0, 0), param=0):
+        """NMLISTVIEW {iItem, iSubItem, uNewState, uOldState, uChanged, ptAction, lParam}."""
+        extra = struct.pack("<iiIIIii", i, sub, newst, oldst, changed, pt[0], pt[1])
+        if ps == 8:
+            extra += bytes(4) + struct.pack("<Q", param & M64)
+        else:
+            extra += struct.pack("<I", param & 0xFFFFFFFF)
+        r, _a = notify(w, code, extra)
+        return r
+
+    def set_state(w, i, state, mask, notify_=True):
+        it = item(w, i)
+        if it is None:
+            return False
+        new = (it.state & ~mask) | (state & mask)
+        if new == it.state:
+            return True
+        old = it.state
+        if notify_ and notify_item(w, -100, i, 0, new, old, 8, param=it.param) & 0xFFFFFFFF:
+            return False
+        it.state = new
+        if new & LVIS_FOCUSED and not old & LVIS_FOCUSED:
+            for j in range(nitems(w)):
+                o = item(w, j)
+                if j != i and o is not None and o.state & LVIS_FOCUSED:
+                    o.state &= ~LVIS_FOCUSED
+        if notify_:
+            notify_item(w, -101, i, 0, new, old, 8, param=it.param)
+        wm.invalidate(w, None, True)
+        return True
+
+    def select_only(w, i, notify_=True):
+        for j in range(nitems(w)):
+            it = item(w, j)
+            if it is not None and it.state & LVIS_SELECTED and j != i:
+                set_state(w, j, 0, LVIS_SELECTED, notify_)
+        if i >= 0:
+            set_state(w, i, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED, notify_)
+            lvst(w)["mark"] = i
+
+    def vis_rows(w):
+        return max(1, (w.cl[3] - w.cl[1] - top_off(w)) // row_h(w))
+
+    def icon_cell(w):
+        return (75, 70) if view(w) == 0 else (0, 0)
+
+    def item_rect(w, i):
+        s = lvst(w)
+        Wd = w.cl[2] - w.cl[0]
+        if view(w) == 0:                                          # LVS_ICON: grid
+            cw, ch = icon_cell(w)
+            per = max(1, Wd // cw)
+            r_, c_ = divmod(i, per)
+            y = r_ * ch - s["top"] * ch
+            return (c_ * cw, y, c_ * cw + cw, y + ch)
+        rh = row_h(w)
+        y = top_off(w) + (i - s["top"]) * rh
+        if view(w) == 1:
+            width = sum(max(0, c["cx"]) for c in columns(w)) or Wd
+            return (-s["xoff"], y, -s["xoff"] + width, y + rh)
+        return (0, y, Wd, y + rh)
+
+    def hit(w, x, y):
+        for i in range(nitems(w)):
+            r = item_rect(w, i)
+            if r[1] > w.cl[3]:
+                break
+            if r[0] <= x < max(r[2], r[0] + 1 if view(w) != 1 else r[2]) and r[1] <= y < r[3]:
+                return i
+            if view(w) == 1 and r[1] <= y < r[3] and not (lvst(w)["ex"] & 0x20) and x < r[2]:
+                return i
+        return -1
+
+    def update_sb(w):
+        n = nitems(w)
+        if view(w) == 0:
+            cw, ch = icon_cell(w)
+            per = max(1, (w.cl[2] - w.cl[0]) // cw)
+            rows = (n + per - 1) // per
+            vis = max(1, (w.cl[3] - w.cl[1]) // ch)
+        else:
+            rows, vis = n, vis_rows(w)
+        if not (w.style & 0x2000):                                # !LVS_NOSCROLL
+            _sb_set(wm, w, 1, 7, 0, max(0, rows - 1), vis, lvst(w)["top"], True)
+
+    def ensure_visible(w, i):
+        s = lvst(w)
+        vis = vis_rows(w)
+        if view(w) == 0:
+            return
+        if i < s["top"]:
+            s["top"] = i
+        elif i >= s["top"] + vis:
+            s["top"] = i - vis + 1
+        update_sb(w)
+        wm.invalidate(w, None, True)
+
+    def lv_paint(w, pt):
+        s = lvst(w)
+        f = gfont(w)
+        Wd, Hd = w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]
+        pt.fill(0, 0, Wd, Hd, s["bk"])
+        focused = wm.focus == w.hwnd
+        cols = columns(w)
+        n = nitems(w)
+        il_small = IL(s["il"].get(1, 0))
+        il_state = IL(s["il"].get(2, 0))
+        il_big = IL(s["il"].get(0, 0))
+        checks = s["ex"] & 4
+        for i in range(s["top"], n):
+            r = item_rect(w, i)
+            if r[1] >= Hd:
+                break
+            if r[3] <= top_off(w):
+                continue
+            it = item(w, i)
+            sel = it.state & LVIS_SELECTED and (focused or w.style & 8)   # LVS_SHOWSELALWAYS
+            if view(w) == 0:
+                cx = r[0] + (r[2] - r[0] - 32) // 2
+                if il_big and it.img >= 0:
+                    X, Y = pt.xy(cx, r[1] + 2)
+                    il_big.draw(pt.surf, pt.clip, X, Y, it.img, selected=bool(sel))
+                label = item_text(w, i, 0)
+                tr = (r[0] + 2, r[1] + 38, r[2] - 2, r[3])
+                if sel:
+                    tw = min(r[2] - r[0] - 4, f.width(label) + 4)
+                    pt.fill((r[0] + r[2] - tw) // 2, tr[1], (r[0] + r[2] + tw) // 2,
+                            tr[1] + f.height + 1, sysc(COLOR_HIGHLIGHT))
+                pt.draw_text(tr, label, 1 | 0x10 | 0x800, hfont(w),
+                             sysc(COLOR_HIGHLIGHTTEXT) if sel else s["tc"])
+                continue
+            colspans = []
+            if view(w) == 1 and cols:
+                x = r[0]
+                for ci, c in enumerate(cols):
+                    colspans.append((ci, x, x + max(0, c["cx"]), c["fmt"] & 3))
+                    x += max(0, c["cx"])
+            else:
+                colspans.append((0, r[0], r[2], 0))
+            for ci, x0, x1, fmt in colspans:
+                text = item_text(w, i, ci)
+                tx = x0 + 4
+                if ci == 0:
+                    if checks:
+                        state_i = (it.state >> 12) & 0xF
+                        _draw_frame_control(pt, (tx, r[1] + (r[3] - r[1] - 13) // 2, tx + 13,
+                                                 r[1] + (r[3] - r[1] - 13) // 2 + 13), 4,
+                                            0x400 if state_i == 2 else 0)
+                        tx += 16
+                    elif il_state and (it.state >> 12) & 0xF:
+                        X, Y = pt.xy(tx, r[1])
+                        il_state.draw(pt.surf, pt.clip, X, Y, ((it.state >> 12) & 0xF) - 1)
+                        tx += il_state.cx + 2
+                    if il_small and it.img >= 0:
+                        X, Y = pt.xy(tx, r[1] + (r[3] - r[1] - il_small.cy) // 2)
+                        il_small.draw(pt.surf, pt.clip, X, Y, it.img, selected=bool(sel))
+                        tx += il_small.cx + 2
+                full = s["ex"] & 0x20                              # LVS_EX_FULLROWSELECT
+                col = s["tc"]
+                if sel and (ci == 0 or full):
+                    hx0 = tx - 2 if ci == 0 and not full else x0
+                    hx1 = (min(x1, tx + f.width(text) + 4) if ci == 0 and not full else x1)
+                    pt.fill(hx0, r[1], hx1, r[3], sysc(COLOR_HIGHLIGHT) if focused
+                            else sysc(COLOR_BTNFACE))
+                    col = sysc(COLOR_HIGHLIGHTTEXT) if focused else s["tc"]
+                align = {0: 0, 1: 2, 2: 1}.get(fmt, 0)
+                pt.draw_text((tx, r[1], x1 - 4, r[3]), text, align | 0x20 | 4 | 0x8000 | 0x800,
+                             hfont(w), col)
+                if s["ex"] & 1 and view(w) == 1:                  # LVS_EX_GRIDLINES
+                    pt.vline(x1 - 1, r[1], r[3], sysc(COLOR_BTNFACE))
+            if s["ex"] & 1 and view(w) == 1:
+                pt.hline(r[0], r[2], r[3] - 1, sysc(COLOR_BTNFACE))
+            if focused and it.state & LVIS_FOCUSED:
+                _focus_rect(pt, r[0], r[1], min(r[2], Wd) if view(w) == 1 else r[2], r[3])
+
+    def lv_layout_header(w):
+        h = header(w)
+        if h is None:
+            return
+        show = view(w) == 1 and not (w.style & 0x4000)
+        if show:
+            wm.set_pos(h, 0, -lvst(w)["xoff"], 0, max(w.cl[2] - w.cl[0] + lvst(w)["xoff"], 1),
+                       hd_height(h), SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW)
+        else:
+            wm.set_pos(h, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                       SWP_NOACTIVATE | SWP_HIDEWINDOW)
+
+    def lvitem_read(a, wide_):
+        mask = M_.read32(a)
+        i = _s32(M_.read32(a + 4))
+        sub = _s32(M_.read32(a + 8))
+        return mask, i, sub
+
+    def lvitem_apply(w, it, a, wide_, sub=0):
+        mask = M_.read32(a)
+        if mask & 1:                                               # LVIF_TEXT
+            ptr = wm.rp(a + LVO["text"])
+            it.texts[sub] = None if ptr == LPSTR_TEXTCALLBACK else (wm.gstr(ptr, wide_) if ptr else "")
+        if sub == 0:
+            if mask & 2:
+                it.img = _s32(M_.read32(a + LVO["img"]))
+            if mask & 4:
+                it.param = wm.rp(a + LVO["param"])
+            if mask & 8:
+                smask = M_.read32(a + LVO["smask"])
+                it.state = (it.state & ~smask) | (M_.read32(a + LVO["state"]) & smask)
+            if mask & 0x10:
+                it.indent = _s32(M_.read32(a + LVO["indent"]))
+
+    def lv_sort(w, cmp, lp_, ex):
+        s = lvst(w)
+        import functools
+        idx = list(range(len(s["items"])))
+        items = s["items"]
+        if ex:
+            key = functools.cmp_to_key(lambda a, b: _s32(p.call_guest(cmp, [a, b, lp_]) & 0xFFFFFFFF))
+            order = sorted(idx, key=key)
+        else:
+            key = functools.cmp_to_key(lambda a, b: _s32(p.call_guest(
+                cmp, [items[a].param, items[b].param, lp_]) & 0xFFFFFFFF))
+            order = sorted(idx, key=key)
+        s["items"] = [items[i] for i in order]
+        wm.invalidate(w, None, True)
+        return 1
+
+    def listview_proc(hwnd, msg, wp, lp, wide):
+        w = W(hwnd)
+        if w is None:
+            return 0
+        s = lvst(w)
+        n = nitems(w)
+        if msg == WM_NCCREATE:
+            if w.style & WS_BORDER and not (w.exstyle & WS_EX_CLIENTEDGE):
+                w.style &= ~WS_BORDER
+                w.exstyle |= WS_EX_CLIENTEDGE
+            return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+        if msg == 0x0001:
+            h = wm.create(0, wm.find_class("SysHeader32"), "", WS_CHILD | 2 | 0x80, 0, 0,
+                          max(1, w.cl[2] - w.cl[0]), 20, hwnd, 0, w.inst, 0, True)
+            s["hdr"] = h
+            lv_layout_header(w)
+            return 0
+        if msg in (0x000F, WM_PRINTCLIENT):
+            paint(w, lambda pt: lv_paint(w, pt), wp)
+            return 0
+        if msg == 0x0014:
+            return 1
+        if msg == 0x0005:
+            lv_layout_header(w)
+            update_sb(w)
+            return 0
+        if msg == WM_GETDLGCODE:
+            return DLGC_WANTARROWS | DLGC_WANTCHARS
+        if msg in (WM_SETFOCUS, WM_KILLFOCUS):
+            wm.invalidate(w, None, True)
+            notify(w, NM_SETFOCUS if msg == WM_SETFOCUS else NM_KILLFOCUS)
+            return 0
+        if msg == WM_SETFONT:
+            w.font = wp
+            h = header(w)
+            if h is not None:
+                h.font = wp
+            lv_layout_header(w)
+            if lp:
+                wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x0400 + 0x99:                                   # header column click
+            r, _a = notify(w, -108, struct.pack("<iiIIIii", -1, wp, 0, 0, 0, 0, 0) +
+                           (bytes(4) + bytes(8) if ps == 8 else bytes(4)))   # LVN_COLUMNCLICK
+            return 0
+        if msg in (0x0201, 0x0203, 0x0204):
+            wm.set_focus(hwnd)
+            x, y = _xy_lparam(lp)
+            i = hit(w, x, y)
+            if msg == 0x0204:
+                if i >= 0 and not item(w, i).state & LVIS_SELECTED:
+                    select_only(w, i)
+                notify_item(w, NM_RCLICK, i, 0, pt=(x, y))
+                return 0
+            ctrl, shift = bool(wp & 8), bool(wp & 4)
+            if i >= 0:
+                it = item(w, i)
+                if s["ex"] & 4 and view(w) != 0 and x - item_rect(w, i)[0] < 20:
+                    cur = (it.state >> 12) & 0xF
+                    set_state(w, i, (0x2000 if cur != 2 else 0x1000), 0xF000)
+                elif w.style & 4 or not (ctrl or shift):          # LVS_SINGLESEL
+                    select_only(w, i)
+                elif ctrl:
+                    set_state(w, i, it.state ^ LVIS_SELECTED | LVIS_FOCUSED,
+                              LVIS_SELECTED | LVIS_FOCUSED)
+                    s["mark"] = i
+                else:
+                    a_ = s["mark"] if s["mark"] >= 0 else i
+                    for j in range(n):
+                        want = min(a_, i) <= j <= max(a_, i)
+                        set_state(w, j, LVIS_SELECTED if want else 0, LVIS_SELECTED)
+                    set_state(w, i, LVIS_FOCUSED, LVIS_FOCUSED)
+            elif not (ctrl or shift):
+                select_only(w, -1)
+            notify_item(w, NM_DBLCLK if msg == 0x0203 else NM_CLICK, i, 0, pt=(x, y))
+            if msg == 0x0203 and i >= 0:
+                notify_item(w, -114, i, 0, pt=(x, y))              # LVN_ITEMACTIVATE
+            return 0
+        if msg == WM_MOUSEWHEEL:
+            d = _s32(((wp >> 16) & 0xFFFF) << 16) >> 16
+            s["top"] = max(0, min(s["top"] + (-3 if d > 0 else 3), max(0, n - vis_rows(w))))
+            update_sb(w)
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == WM_VSCROLL:
+            code = wp & 0xFFFF
+            vis = vis_rows(w)
+            top = s["top"]
+            top = {0: top - 1, 1: top + 1, 2: top - vis, 3: top + vis, 6: 0, 7: n}.get(
+                code, (wp >> 16) & 0xFFFF if code in (4, 5) else top)
+            s["top"] = max(0, min(top, max(0, n - vis)))
+            update_sb(w)
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == WM_HSCROLL:
+            return 0
+        if msg == 0x0100:
+            vk = wp & 0xFF
+            notify(w, -155, struct.pack("<HI", vk, 0))             # LVN_KEYDOWN
+            if not n:
+                return 0
+            cur = next((j for j in range(n) if item(w, j).state & LVIS_FOCUSED), s["mark"])
+            if cur < 0:
+                cur = 0
+            new = {0x26: cur - 1, 0x28: cur + 1, 0x21: cur - vis_rows(w), 0x22: cur + vis_rows(w),
+                   0x24: 0, 0x23: n - 1}.get(vk)
+            if new is not None:
+                new = max(0, min(n - 1, new))
+                select_only(w, new)
+                ensure_visible(w, new)
+            elif vk == 0x20 and s["ex"] & 4:
+                it = item(w, cur)
+                c_ = (it.state >> 12) & 0xF
+                set_state(w, cur, 0x2000 if c_ != 2 else 0x1000, 0xF000)
+            elif vk == 0x0D:
+                notify(w, NM_RETURN)
+                notify_item(w, -114, cur, 0)
+            return 0
+        if msg == WM_CHAR:
+            ch = chr(wp & 0xFFFF)
+            if ch < " " or not n:
+                return 0
+            now = time.monotonic()
+            if now - s["stime"] > 1.0:
+                s["search"] = ""
+            s["stime"] = now
+            s["search"] += ch.lower()
+            for j in list(range(n)):
+                if item_text(w, j, 0).lower().startswith(s["search"]):
+                    select_only(w, j)
+                    ensure_visible(w, j)
+                    break
+            return 0
+        # -- LVM_* -------------------------------------------------------------------------------
+        base = 0x1000
+        m = msg - base
+        if not 0 <= m < 0x200:
+            return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+        if m == 0:
+            return s["bk"]
+        if m == 1:                                                 # LVM_SETBKCOLOR
+            s["bk"] = sysc(COLOR_WINDOW) if lp == 0xFFFFFFFF else lp & 0xFFFFFF
+            wm.invalidate(w, None, True)
+            return 1
+        if m == 2:                                                 # LVM_GETIMAGELIST
+            return s["il"].get(wp, 0)
+        if m == 3:                                                 # LVM_SETIMAGELIST
+            old = s["il"].get(wp, 0)
+            s["il"][wp] = lp
+            wm.invalidate(w, None, True)
+            return old
+        if m == 4:
+            return n
+        if m in (5, 75):                                           # LVM_GETITEMA/W
+            mask, i, sub = lvitem_read(lp, m == 75)
+            it = item(w, i)
+            if it is None:
+                return 0
+            if mask & 1:
+                buf = wm.rp(lp + LVO["text"])
+                cch = M_.read32(lp + LVO["cch"])
+                wm.put_str(buf, cch, item_text(w, i, sub), m == 75)
+            if mask & 2:
+                M_.write32(lp + LVO["img"], it.img & 0xFFFFFFFF)
+            if mask & 4:
+                wm.wp(lp + LVO["param"], it.param)
+            if mask & 8:
+                M_.write32(lp + LVO["state"], it.state & M_.read32(lp + LVO["smask"]))
+            if mask & 0x10:
+                M_.write32(lp + LVO["indent"], it.indent & 0xFFFFFFFF)
+            return 1
+        if m in (6, 76):                                           # LVM_SETITEMA/W
+            mask, i, sub = lvitem_read(lp, m == 76)
+            it = item(w, i)
+            if it is None:
+                return 0
+            old = it.state
+            lvitem_apply(w, it, lp, m == 76, sub)
+            if it.state != old:
+                notify_item(w, -101, i, 0, it.state, old, 8, param=it.param)
+            wm.invalidate(w, None, True)
+            return 1
+        if m in (7, 77):                                           # LVM_INSERTITEMA/W
+            mask, i, sub = lvitem_read(lp, m == 77)
+            if sub != 0:
+                return 0xFFFFFFFF
+            it = _LVItem()
+            lvitem_apply(w, it, lp, m == 77, 0)
+            items = s["items"]
+            i = len(items) if i < 0 or i > len(items) else i
+            if w.style & 0x30 and 0 in it.texts and it.texts[0] is not None:   # LVS_SORT*
+                t = it.texts[0].lower()
+                desc = w.style & 0x20
+                i = 0
+                while i < len(items) and ((items[i].texts.get(0) or "").lower() <= t) != bool(desc):
+                    i += 1
+            items.insert(i, it)
+            notify_item(w, -102, i, param=it.param)
+            update_sb(w)
+            wm.invalidate(w, None, True)
+            return i
+        if m == 8:                                                 # LVM_DELETEITEM
+            if not 0 <= wp < len(s["items"]):
+                return 0
+            notify_item(w, -103, wp, param=s["items"][wp].param)
+            del s["items"][wp]
+            update_sb(w)
+            wm.invalidate(w, None, True)
+            return 1
+        if m == 9:                                                 # LVM_DELETEALLITEMS
+            if not notify_item(w, -104, -1) & 0xFFFFFFFF:
+                for j in range(len(s["items"])):
+                    notify_item(w, -103, j, param=s["items"][j].param)
+            s["items"] = []
+            s["top"] = 0
+            s.pop("vcache", None)
+            update_sb(w)
+            wm.invalidate(w, None, True)
+            return 1
+        if m == 12:                                                # LVM_GETNEXTITEM
+            start = _s32(wp & 0xFFFFFFFF)
+            fl = lp & 0xFFFF
+            back = bool(fl & 0x500)                                # LVNI_ABOVE / LVNI_TOLEFT
+            rng_ = range(start - 1, -1, -1) if back else range(start + 1, n)
+            for j in rng_:
+                it = item(w, j)
+                if (not (fl & 1) or it.state & LVIS_FOCUSED) and \
+                        (not (fl & 2) or it.state & LVIS_SELECTED) and \
+                        (not (fl & 4) or it.state & 4) and \
+                        (not (fl & 8) or it.state & 8):
+                    return j
+            return 0xFFFFFFFF
+        if m in (13, 83):                                          # LVM_FINDITEMA/W
+            flags = M_.read32(lp)
+            txt = wm.gstr(wm.rp(lp + 4 + (4 if ps == 8 else 0)), m == 83) if flags & 3 else ""
+            param = wm.rp(lp + 4 + (4 if ps == 8 else 0) + ps) if flags & 1 == 0 else 0
+            start = _s32(wp & 0xFFFFFFFF)
+            for j in range(start + 1, n):
+                if flags & 1 and item(w, j).param == wm.rp(lp + (16 if ps == 8 else 8)):
+                    return j
+                t = item_text(w, j, 0)
+                if flags & 2 and (t.lower() == txt.lower() or
+                                  (flags & 8 and t.lower().startswith(txt.lower()))):
+                    return j
+            return 0xFFFFFFFF
+        if m == 14:                                                # LVM_GETITEMRECT
+            if not 0 <= wp < max(1, n):
+                return 0
+            r = item_rect(w, wp)
+            code = M_.read32(lp)
+            if code == 2 and view(w) == 1 and columns(w):          # LVIR_LABEL
+                r = (r[0], r[1], r[0] + columns(w)[0]["cx"], r[3])
+            _wr_rect(M_, lp, r)
+            return 1
+        if m == 18 or m == 57:                                     # LVM_HITTEST / SUBITEMHITTEST
+            x, y = struct.unpack("<ii", M_.read(lp, 8))
+            i = hit(w, x, y)
+            M_.write32(lp + 8, 0xE if i >= 0 else 1)
+            M_.write32(lp + 12, i & 0xFFFFFFFF)
+            if m == 57:
+                sub = 0
+                if i >= 0 and view(w) == 1:
+                    cx = item_rect(w, i)[0]
+                    for ci, c in enumerate(columns(w)):
+                        if cx <= x < cx + c["cx"]:
+                            sub = ci
+                        cx += c["cx"]
+                M_.write32(lp + 16, sub)
+            return i & 0xFFFFFFFF
+        if m == 19:                                                # LVM_ENSUREVISIBLE
+            ensure_visible(w, wp)
+            return 1
+        if m in (20,):                                             # LVM_SCROLL
+            s["top"] = max(0, min(s["top"] + _s32(lp & 0xFFFFFFFF) // row_h(w), max(0, n - 1)))
+            update_sb(w)
+            wm.invalidate(w, None, True)
+            return 1
+        if m in (21, 42):                                          # REDRAWITEMS / UPDATE
+            wm.invalidate(w, None, True)
+            return 1
+        if m in (25, 95):                                          # LVM_GETCOLUMNA/W
+            h = header(w)
+            if h is None or not 0 <= wp < len(columns(w)):
+                return 0
+            c = columns(w)[wp]
+            mask = M_.read32(lp)
+            off = {"fmt": 4, "cx": 8, "text": 16 if ps == 8 else 12,
+                   "cch": 24 if ps == 8 else 16, "sub": 28 if ps == 8 else 20}
+            if mask & 1:
+                M_.write32(lp + off["fmt"], c["fmt"])
+            if mask & 2:
+                M_.write32(lp + off["cx"], c["cx"] & 0xFFFFFFFF)
+            if mask & 4:
+                wm.put_str(wm.rp(lp + off["text"]), M_.read32(lp + off["cch"]), c["text"], m == 95)
+            if mask & 8:
+                M_.write32(lp + off["sub"], wp)
+            return 1
+        if m in (26, 96, 27, 97):                                  # LVM_SETCOLUMN / INSERTCOLUMN
+            h = header(w)
+            if h is None:
+                return 0xFFFFFFFF
+            mask = M_.read32(lp)
+            off = {"fmt": 4, "cx": 8, "text": 16 if ps == 8 else 12}
+            cols = columns(w)
+            if m in (27, 97):
+                c = {"cx": 50, "text": "", "fmt": 0, "param": 0, "img": -1}
+                i = max(0, min(wp, len(cols)))
+                cols.insert(i, c)
+                if i == 0 and len(cols) > 1:                       # column 0 stays left-aligned
+                    pass
+                for it in s["items"]:
+                    if i < max(it.texts.keys(), default=-1) + 1 and i > 0:
+                        it.texts = {(kk + 1 if kk >= i else kk): v for kk, v in it.texts.items()}
+            else:
+                if not 0 <= wp < len(cols):
+                    return 0
+                c = cols[wp]
+                i = wp
+            if mask & 1:
+                c["fmt"] = M_.read32(lp + off["fmt"]) if i != 0 else 0
+            if mask & 2:
+                c["cx"] = _s32(M_.read32(lp + off["cx"]))
+            if mask & 4:
+                ptr = wm.rp(lp + off["text"])
+                c["text"] = wm.gstr(ptr, m in (96, 97)) if ptr else ""
+            lv_layout_header(w)
+            wm.invalidate(header(w), None, True)
+            wm.invalidate(w, None, True)
+            return i if m in (27, 97) else 1
+        if m == 28:                                                # LVM_DELETECOLUMN
+            cols = columns(w)
+            if not 0 <= wp < len(cols):
+                return 0
+            del cols[wp]
+            for it in s["items"]:
+                it.texts = {(kk - 1 if kk > wp else kk): v for kk, v in it.texts.items() if kk != wp}
+            wm.invalidate(w, None, True)
+            return 1
+        if m == 29:                                                # LVM_GETCOLUMNWIDTH
+            cols = columns(w)
+            return cols[wp]["cx"] if 0 <= wp < len(cols) else (75 if view(w) != 1 else 0)
+        if m == 30:                                                # LVM_SETCOLUMNWIDTH
+            cols = columns(w)
+            if not 0 <= wp < len(cols):
+                return 0
+            cx = lp & 0xFFFF
+            cx = cx - 0x10000 if cx >= 0x8000 else cx
+            if cx in (-1, -2):                                     # LVSCW_AUTOSIZE(_USEHEADER)
+                f = gfont(w)
+                widest = max([f.width(item_text(w, j, wp)) for j in range(min(n, 500))] or [0])
+                if cx == -2:
+                    widest = max(widest, f.width(cols[wp]["text"]))
+                    if wp == len(cols) - 1:
+                        rest = (w.cl[2] - w.cl[0]) - sum(c["cx"] for c in cols[:-1])
+                        widest = max(widest, rest - 12)
+                cx = widest + 12 + (18 if wp == 0 and (s["ex"] & 4 or s["il"].get(1)) else 0)
+            cols[wp]["cx"] = cx
+            lv_layout_header(w)
+            wm.invalidate(header(w), None, True)
+            wm.invalidate(w, None, True)
+            return 1
+        if m == 31:                                                # LVM_GETHEADER
+            return s["hdr"]
+        if m == 36:                                                # LVM_SETTEXTCOLOR
+            s["tc"] = lp & 0xFFFFFF
+            return 1
+        if m == 35:
+            return s["tc"]
+        if m in (37, 38):
+            if m == 38:
+                s["tbk"] = lp
+            return s["tbk"] if m == 37 else 1
+        if m == 39:                                                # LVM_GETTOPINDEX
+            return s["top"]
+        if m == 40:                                                # LVM_GETCOUNTPERPAGE
+            return vis_rows(w)
+        if m == 43:                                                # LVM_SETITEMSTATE
+            i = _s32(wp & 0xFFFFFFFF)
+            state = M_.read32(lp + LVO["state"])
+            smask = M_.read32(lp + LVO["smask"])
+            targets = range(n) if i == -1 else [i]
+            for j in targets:
+                set_state(w, j, state, smask)
+            if state & smask & LVIS_SELECTED and i >= 0:
+                s["mark"] = i
+            return 1
+        if m == 44:                                                # LVM_GETITEMSTATE
+            it = item(w, wp)
+            return (it.state & lp) if it else 0
+        if m in (45, 115):                                         # LVM_GETITEMTEXTA/W
+            sub = _s32(M_.read32(lp + 8))
+            t = item_text(w, wp, sub)
+            return wm.put_str(wm.rp(lp + LVO["text"]), M_.read32(lp + LVO["cch"]), t, m == 115)
+        if m in (46, 116):                                         # LVM_SETITEMTEXTA/W
+            it = item(w, wp)
+            if it is None:
+                return 0
+            sub = _s32(M_.read32(lp + 8))
+            ptr = wm.rp(lp + LVO["text"])
+            it.texts[sub] = None if ptr == LPSTR_TEXTCALLBACK else (wm.gstr(ptr, m == 116) if ptr else "")
+            wm.invalidate(w, None, True)
+            return 1
+        if m == 47:                                                # LVM_SETITEMCOUNT
+            if w.style & 0x1000:
+                s["count_virtual"] = wp
+                s.pop("vcache", None)
+            update_sb(w)
+            wm.invalidate(w, None, True)
+            return 1
+        if m == 48:                                                # LVM_SORTITEMS
+            return lv_sort(w, lp, wp, False)
+        if m == 81:                                                # LVM_SORTITEMSEX
+            return lv_sort(w, lp, wp, True)
+        if m == 50:                                                # LVM_GETSELECTEDCOUNT
+            return sum(1 for j in range(n) if item(w, j).state & LVIS_SELECTED)
+        if m == 54:                                                # LVM_SETEXTENDEDLISTVIEWSTYLE
+            old = s["ex"]
+            mask = wp or 0xFFFFFFFF
+            s["ex"] = (s["ex"] & ~mask) | (lp & mask)
+            wm.invalidate(w, None, True)
+            return old
+        if m == 55:
+            return s["ex"]
+        if m in (17, 87):                                          # LVM_GETSTRINGWIDTH
+            return gfont(w).width(wm.gstr(lp, m == 87))
+        if m == 66:
+            return s["mark"] & 0xFFFFFFFF
+        if m == 67:
+            o, s["mark"] = s["mark"], _s32(lp & 0xFFFFFFFF)
+            return o & 0xFFFFFFFF
+        if m == 142:                                               # LVM_SETVIEW
+            w.style = (w.style & ~3) | {0: 0, 1: 1, 2: 2, 3: 3, 4: 1}.get(wp, 1)
+            lv_layout_header(w)
+            wm.invalidate(w, None, True)
+            return 1
+        if m == 143:
+            return view(w)
+        if m == 64:                                                # LVM_APPROXIMATEVIEWRECT
+            cnt = n if (wp & 0xFFFFFFFF) == 0xFFFFFFFF else _s32(wp & 0xFFFFFFFF)
+            cx, cy = lp & 0xFFFF, (lp >> 16) & 0xFFFF
+            cx = (w.cl[2] - w.cl[0]) if cx == 0xFFFF else cx
+            rh = row_h(w)
+            if view(w) == 1:                                       # report: header + rows
+                hh = 0
+                if not (w.style & 0x4000):
+                    hh = hd_height(header(w)) if header(w) is not None else gfont(w).height + 6
+                width = sum(max(0, c["cx"]) for c in columns(w)) or cx
+                height = hh + (cnt + 1) * rh
+            elif view(w) == 3:                                     # list: one column of rows
+                width, height = cx, max(1, cnt) * rh
+            else:                                                  # icon / small icon grid
+                per = max(1, cx // 75)
+                width, height = cx, ((cnt + per - 1) // per) * (rh if view(w) == 2 else 70)
+            return (width & 0xFFFF) | ((height & 0xFFFF) << 16)
+        if m in (51, 52, 53):                                      # GETITEMSPACING etc
+            return (row_h(w) << 16) | 75
+        if m in (58, 59, 60, 61, 62, 63, 64, 65, 22, 23, 24, 33, 34, 41, 49, 56, 68, 69,
+                 70, 71, 72, 73, 74, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155):
+            return 0
+        if m == 145 or m == 76:
+            return 0
+        return 0
+
+    py_class("SysListView32", listview_proc)
+
+    # ---- tree view -----------------------------------------------------------------------------------
+    class _TVItem:
+        __slots__ = ("h", "parent", "kids", "text", "img", "simg", "param", "state",
+                     "children_flag")
+
+        def __init__(self, h, parent):
+            self.h, self.parent, self.kids = h, parent, []
+            self.text, self.img, self.simg, self.param = "", 0, 0, 0
+            self.state, self.children_flag = 0, 0
+
+    TVI_ROOT, TVI_FIRST, TVI_LAST, TVI_SORT = (-0x10000, -0xFFFF, -0xFFFE, -0xFFFD)
+    TVIS_SELECTED, TVIS_EXPANDED = 2, 0x20
+
+    def tvst(w):
+        s = w.py.get("tv")
+        if s is None:
+            s = w.py["tv"] = {"root": _TVItem(0, None), "map": {}, "next": 0x00300000, "sel": 0,
+                              "top": 0, "il": {}, "indent": 19, "bk": sysc(COLOR_WINDOW),
+                              "tc": sysc(COLOR_WINDOWTEXT), "ih": 0}
+        return s
+
+    def tv_rowh(w):
+        s = tvst(w)
+        if s["ih"]:
+            return s["ih"]
+        il = IL(s["il"].get(0, 0))
+        return max(gfont(w).height + 2, (il.cy + 1) if il else 0, 16)
+
+    def tv_visible(w):
+        """Flattened list of (item, depth) currently shown."""
+        s = tvst(w)
+        out = []
+
+        def walk(node, depth):
+            for ch in node.kids:
+                out.append((ch, depth))
+                if ch.state & TVIS_EXPANDED:
+                    walk(ch, depth + 1)
+        walk(s["root"], 0)
+        return out
+
+    def tv_item(w, h):
+        s = tvst(w)
+        return s["map"].get(h & 0xFFFFFFFF) if h else None
+
+    def tv_has_kids(it):
+        return bool(it.kids) or it.children_flag == 1
+
+    def tv_notify(w, code_a, code_w, action=0, old=None, new=None, pt=(0, 0)):
+        """NMTREEVIEW {action, itemOld, itemNew, ptDrag}."""
+        code = -400 + (code_w if nf_unicode(w) else code_a)
+
+        def tvi(it):
+            if it is None:
+                return bytes(40 if ps == 4 else 56)
+            if ps == 8:
+                return struct.pack("<I4xQII", 0x4F, it.h, it.state, 0xFFFF) + \
+                    struct.pack("<QiiiiQ", 0, 0, it.img, it.simg, 1 if tv_has_kids(it) else 0,
+                                it.param & M64)
+            return struct.pack("<IIIIIiiiiI", 0x4F, it.h, it.state, 0xFFFF, 0, 0, it.img,
+                               it.simg, 1 if tv_has_kids(it) else 0, it.param & 0xFFFFFFFF)
+        extra = struct.pack("<I", action) + (bytes(4) if ps == 8 else b"") + tvi(old) + \
+            tvi(new) + struct.pack("<ii", pt[0], pt[1])
+        r, _a = notify(w, code, extra)
+        return r
+
+    def tv_select(w, h, cause=0):
+        s = tvst(w)
+        if h == s["sel"]:
+            return True
+        old, new = tv_item(w, s["sel"]), tv_item(w, h)
+        if tv_notify(w, -1, -50, cause, old, new) & 0xFFFFFFFF:     # TVN_SELCHANGING
+            return False
+        if old is not None:
+            old.state &= ~TVIS_SELECTED
+        if new is not None:
+            new.state |= TVIS_SELECTED
+            # make it visible: expand ancestors
+            a = new.parent
+            while a is not None and a.h:
+                a.state |= TVIS_EXPANDED
+                a = a.parent
+        s["sel"] = h
+        tv_notify(w, -2, -51, cause, old, new)                        # TVN_SELCHANGED
+        tv_ensure(w, h)
+        wm.invalidate(w, None, True)
+        return True
+
+    def tv_expand(w, it, code):
+        if it is None:
+            return False
+        was = bool(it.state & TVIS_EXPANDED)
+        want = {1: False, 2: True, 3: not was}.get(code & 3, was)
+        if want == was:
+            return True
+        if tv_notify(w, -5, -54, 2 if want else 1, None, it) & 0xFFFFFFFF:  # ITEMEXPANDING
+            return False
+        if want:
+            it.state |= TVIS_EXPANDED
+        else:
+            it.state &= ~TVIS_EXPANDED
+        tv_notify(w, -6, -55, 2 if want else 1, None, it)
+        tv_update_sb(w)
+        wm.invalidate(w, None, True)
+        return True
+
+    def tv_update_sb(w):
+        rows = len(tv_visible(w))
+        vis = max(1, (w.cl[3] - w.cl[1]) // tv_rowh(w))
+        s = tvst(w)
+        s["top"] = max(0, min(s["top"], max(0, rows - vis)))
+        _sb_set(wm, w, 1, 7, 0, max(0, rows - 1), vis, s["top"], True)
+
+    def tv_ensure(w, h):
+        s = tvst(w)
+        rows = tv_visible(w)
+        idx = next((i for i, (it, d) in enumerate(rows) if it.h == h), None)
+        if idx is None:
+            return
+        vis = max(1, (w.cl[3] - w.cl[1]) // tv_rowh(w))
+        if idx < s["top"]:
+            s["top"] = idx
+        elif idx >= s["top"] + vis:
+            s["top"] = idx - vis + 1
+        tv_update_sb(w)
+
+    def tv_x0(w, depth):
+        s = tvst(w)
+        return 2 + (depth + (1 if w.style & 4 else 0)) * s["indent"]   # TVS_LINESATROOT
+
+    def tv_text(w, it):
+        if it.text is None:                                         # LPSTR_TEXTCALLBACK
+            out = [""]
+
+            def after(a):
+                ptr = wm.rp(a + TVO["text"])
+                out[0] = wm.gstr(ptr, nf_unicode(w)) if ptr else ""
+            mark = wm.scratch_mark()
+            try:
+                buf = wm.scratch(520)
+                if ps == 8:
+                    tvi = struct.pack("<I4xQIIQiiiiQ", 1, it.h, it.state, 0, buf, 260, it.img,
+                                      it.simg, 0, it.param & M64)
+                else:
+                    tvi = struct.pack("<IIIIIiiiiI", 1, it.h, it.state, 0, buf, 260, it.img,
+                                      it.simg, 0, it.param & 0xFFFFFFFF)
+                notify(w, -452 if nf_unicode(w) else -403, tvi, after)   # TVN_GETDISPINFO
+            finally:
+                wm.scratch_release(mark)
+            return out[0]
+        return it.text
+
+    def tv_paint(w, pt):
+        s = tvst(w)
+        f = gfont(w)
+        Wd, Hd = w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]
+        pt.fill(0, 0, Wd, Hd, s["bk"])
+        rh = tv_rowh(w)
+        rows = tv_visible(w)
+        il = IL(s["il"].get(0, 0))
+        ils = IL(s["il"].get(2, 0))
+        focused = wm.focus == w.hwnd
+        grey = sysc(COLOR_BTNSHADOW)
+        for idx in range(s["top"], len(rows)):
+            it, depth = rows[idx]
+            y = (idx - s["top"]) * rh
+            if y >= Hd:
+                break
+            x0 = tv_x0(w, depth)
+            cy = y + rh // 2
+            ind = s["indent"]
+            if w.style & 2:                                         # TVS_HASLINES (dotted)
+                bx = x0 - ind // 2 - 1
+                if depth > 0 or w.style & 4:
+                    for xx in range(bx, x0 - 2, 2):
+                        pt.plot(xx, cy, grey)
+                    sibs = it.parent.kids
+                    last = sibs[-1] is it
+                    for yy in range(y if idx > 0 or depth else cy, cy if last else y + rh, 2):
+                        pt.plot(bx, yy, grey)
+                a = it.parent
+                d = depth - 1
+                while a is not None and a.parent is not None and d >= 0:
+                    if a.parent.kids[-1] is not a and (d > 0 or w.style & 4 or True):
+                        ax = tv_x0(w, d) - ind // 2 - 1
+                        if d >= 0 and (w.style & 4 or d > 0 or True):
+                            for yy in range(y, y + rh, 2):
+                                pt.plot(ax, yy, grey)
+                    a = a.parent
+                    d -= 1
+            if w.style & 1 and tv_has_kids(it) and (depth > 0 or w.style & 4):   # buttons
+                bx = x0 - ind // 2 - 5
+                pt.fill(bx, cy - 4, bx + 9, cy + 5, sysc(COLOR_WINDOW))
+                pt.frame(bx, cy - 4, bx + 9, cy + 5, grey)
+                pt.hline(bx + 2, bx + 7, cy, 0)
+                if not it.state & TVIS_EXPANDED:
+                    pt.vline(bx + 4, cy - 2, cy + 3, 0)
+            x = x0
+            if w.style & 0x100:                                     # TVS_CHECKBOXES
+                chk = ((it.state >> 12) & 0xF) == 2
+                _draw_frame_control(pt, (x, cy - 6, x + 13, cy + 7), 4, 0x400 if chk else 0)
+                x += 16
+            elif ils and (it.state >> 12) & 0xF:
+                X, Y = pt.xy(x, y)
+                ils.draw(pt.surf, pt.clip, X, Y, ((it.state >> 12) & 0xF) - 1)
+                x += ils.cx + 2
+            sel = it.state & TVIS_SELECTED
+            if il:
+                X, Y = pt.xy(x, y + (rh - il.cy) // 2)
+                il.draw(pt.surf, pt.clip, X, Y, it.simg if sel else it.img)
+                x += il.cx + 3
+            text = tv_text(w, it)
+            tw = f.width(text) + 4
+            if sel and (focused or w.style & 0x20):
+                pt.fill(x, y, x + tw, y + rh, sysc(COLOR_HIGHLIGHT) if focused else sysc(COLOR_BTNFACE))
+                col = sysc(COLOR_HIGHLIGHTTEXT) if focused else s["tc"]
+            else:
+                col = s["tc"]
+            pt.text(x + 2, y + (rh - f.height) // 2, text, f, col)
+            if sel and focused:
+                _focus_rect(pt, x, y, x + tw, y + rh)
+
+    def tv_hit(w, x, y):
+        """-> (item, part) with part in 'button', 'check', 'label', 'indent'."""
+        s = tvst(w)
+        rh = tv_rowh(w)
+        rows = tv_visible(w)
+        idx = s["top"] + y // rh
+        if not 0 <= idx < len(rows):
+            return None, None
+        it, depth = rows[idx]
+        x0 = tv_x0(w, depth)
+        if x < x0 - 2:
+            return it, "button" if x >= x0 - s["indent"] else "indent"
+        if w.style & 0x100 and x < x0 + 16:
+            return it, "check"
+        return it, "label"
+
+    def tv_insert(w, a, wide_):
+        s = tvst(w)
+        parent_h = wm.rp(a)
+        after_h = wm.rp(a + ps)
+        tvi = a + 2 * ps
+        mask = M_.read32(tvi)
+        par = s["root"] if _s32(parent_h & 0xFFFFFFFF) in (TVI_ROOT, 0) or parent_h in (0, M64 - 0xFFFF) \
+            else tv_item(w, parent_h)
+        if parent_h & 0xFFFFFFFF == (TVI_ROOT & 0xFFFFFFFF):
+            par = s["root"]
+        if par is None:
+            return 0
+        it = _TVItem(s["next"], par)
+        s["next"] += 4
+        tv_apply(w, it, tvi, mask, wide_)
+        after = _s32(after_h & 0xFFFFFFFF)
+        kids = par.kids
+        if after == TVI_FIRST:
+            kids.insert(0, it)
+        elif after == TVI_SORT:
+            i = 0
+            while i < len(kids) and (kids[i].text or "").lower() <= (it.text or "").lower():
+                i += 1
+            kids.insert(i, it)
+        elif after in (TVI_LAST, TVI_ROOT) or not after:
+            kids.append(it)
+        else:
+            ref = tv_item(w, after_h)
+            if ref is not None and ref in kids:
+                kids.insert(kids.index(ref) + 1, it)
+            else:
+                kids.append(it)
+        s["map"][it.h] = it
+        tv_update_sb(w)
+        wm.invalidate(w, None, True)
+        return it.h
+
+    TVO = {"hitem": 8 if ps == 8 else 4, "state": 16 if ps == 8 else 8,
+           "smask": 20 if ps == 8 else 12, "text": 24 if ps == 8 else 16,
+           "cch": 32 if ps == 8 else 20, "img": 36 if ps == 8 else 24,
+           "simg": 40 if ps == 8 else 28, "kids": 44 if ps == 8 else 32,
+           "param": 48 if ps == 8 else 36}
+
+    def tv_apply(w, it, a, mask, wide_):
+        if mask & 1:                                                # TVIF_TEXT
+            ptr = wm.rp(a + TVO["text"])
+            it.text = None if ptr == LPSTR_TEXTCALLBACK else (wm.gstr(ptr, wide_) if ptr else "")
+        if mask & 2:
+            it.img = _s32(M_.read32(a + TVO["img"]))
+        if mask & 0x20:
+            it.simg = _s32(M_.read32(a + TVO["simg"]))
+        if mask & 4:
+            it.param = wm.rp(a + TVO["param"])
+        if mask & 8:
+            smask = M_.read32(a + TVO["smask"])
+            it.state = (it.state & ~smask) | (M_.read32(a + TVO["state"]) & smask)
+        if mask & 0x40:
+            it.children_flag = _s32(M_.read32(a + TVO["kids"]))
+
+    def tv_delete(w, it):
+        s = tvst(w)
+        for ch in list(it.kids):
+            tv_delete(w, ch)
+        tv_notify(w, -9, -58, 0, it, None)                          # TVN_DELETEITEM
+        if it.parent is not None and it in it.parent.kids:
+            it.parent.kids.remove(it)
+        s["map"].pop(it.h, None)
+        if s["sel"] == it.h:
+            s["sel"] = 0
+
+    def treeview_proc(hwnd, msg, wp, lp, wide):
+        w = W(hwnd)
+        if w is None:
+            return 0
+        s = tvst(w)
+        if msg == WM_NCCREATE:
+            if w.style & WS_BORDER and not (w.exstyle & WS_EX_CLIENTEDGE):
+                w.style &= ~WS_BORDER
+                w.exstyle |= WS_EX_CLIENTEDGE
+            return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+        if msg in (0x000F, WM_PRINTCLIENT):
+            paint(w, lambda pt: tv_paint(w, pt), wp)
+            return 0
+        if msg == 0x0014:
+            return 1
+        if msg == 0x0005:
+            tv_update_sb(w)
+            return 0
+        if msg == WM_GETDLGCODE:
+            return DLGC_WANTARROWS | DLGC_WANTCHARS
+        if msg in (WM_SETFOCUS, WM_KILLFOCUS):
+            wm.invalidate(w, None, True)
+            notify(w, NM_SETFOCUS if msg == WM_SETFOCUS else NM_KILLFOCUS)
+            return 0
+        if msg == WM_SETFONT:
+            w.font = wp
+            if lp:
+                wm.invalidate(w, None, True)
+            return 0
+        if msg in (0x0201, 0x0203, 0x0204):
+            wm.set_focus(hwnd)
+            x, y = _xy_lparam(lp)
+            it, part = tv_hit(w, x, y)
+            if msg == 0x0204:
+                notify(w, NM_RCLICK)
+                return 0
+            if it is None:
+                notify(w, NM_CLICK)
+                return 0
+            if part == "button" and tv_has_kids(it):
+                tv_expand(w, it, 3)
+            elif part == "check":
+                cur = (it.state >> 12) & 0xF
+                it.state = (it.state & ~0xF000) | ((0x2000 if cur != 2 else 0x1000))
+                wm.invalidate(w, None, True)
+            else:
+                tv_select(w, it.h, 1)
+            r_ = notify(w, NM_DBLCLK if msg == 0x0203 else NM_CLICK)[0]
+            if msg == 0x0203 and part == "label" and not (r_ & 0xFFFFFFFF) and tv_has_kids(it):
+                tv_expand(w, it, 3)
+            return 0
+        if msg == WM_MOUSEWHEEL:
+            d = _s32(((wp >> 16) & 0xFFFF) << 16) >> 16
+            s["top"] = max(0, s["top"] + (-3 if d > 0 else 3))
+            tv_update_sb(w)
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == WM_VSCROLL:
+            code = wp & 0xFFFF
+            vis = max(1, (w.cl[3] - w.cl[1]) // tv_rowh(w))
+            top = s["top"]
+            s["top"] = {0: top - 1, 1: top + 1, 2: top - vis, 3: top + vis, 6: 0,
+                        7: 1 << 20}.get(code, (wp >> 16) & 0xFFFF if code in (4, 5) else top)
+            s["top"] = max(0, s["top"])
+            tv_update_sb(w)
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x0100:
+            vk = wp & 0xFF
+            notify(w, -12 if False else -412, struct.pack("<HI", vk, 0))   # TVN_KEYDOWN
+            rows = tv_visible(w)
+            if not rows:
+                return 0
+            idx = next((i for i, (it, d) in enumerate(rows) if it.h == s["sel"]), 0)
+            it = rows[idx][0]
+            if vk in (0x26, 0x28, 0x21, 0x22, 0x24, 0x23):
+                vis = max(1, (w.cl[3] - w.cl[1]) // tv_rowh(w))
+                new = {0x26: idx - 1, 0x28: idx + 1, 0x21: idx - vis, 0x22: idx + vis,
+                       0x24: 0, 0x23: len(rows) - 1}[vk]
+                tv_select(w, rows[max(0, min(len(rows) - 1, new))][0].h, 2)
+            elif vk == 0x27:
+                if tv_has_kids(it) and not it.state & TVIS_EXPANDED:
+                    tv_expand(w, it, 2)
+                elif it.kids:
+                    tv_select(w, it.kids[0].h, 2)
+            elif vk == 0x25:
+                if it.state & TVIS_EXPANDED:
+                    tv_expand(w, it, 1)
+                elif it.parent is not None and it.parent.h:
+                    tv_select(w, it.parent.h, 2)
+            elif vk == 0x20 and w.style & 0x100:
+                cur = (it.state >> 12) & 0xF
+                it.state = (it.state & ~0xF000) | ((0x2000 if cur != 2 else 0x1000))
+                wm.invalidate(w, None, True)
+            elif vk == 0x0D:
+                notify(w, NM_RETURN)
+            elif vk in (0x6B, 0x6D):
+                tv_expand(w, it, 2 if vk == 0x6B else 1)
+            return 0
+        # -- TVM_* ----------------------------------------------------------------------------
+        if msg in (0x1100, 0x1132):                                 # TVM_INSERTITEMA/W
+            return tv_insert(w, lp, msg == 0x1132)
+        if msg == 0x1101:                                           # TVM_DELETEITEM
+            if lp in (0, TVI_ROOT & (M64 if ps == 8 else 0xFFFFFFFF)) or \
+                    _s32(lp & 0xFFFFFFFF) == TVI_ROOT:
+                for ch in list(s["root"].kids):
+                    tv_delete(w, ch)
+            else:
+                it = tv_item(w, lp)
+                if it is None:
+                    return 0
+                tv_delete(w, it)
+            tv_update_sb(w)
+            wm.invalidate(w, None, True)
+            return 1
+        if msg == 0x1102:                                           # TVM_EXPAND
+            return 1 if tv_expand(w, tv_item(w, lp), wp) else 0
+        if msg == 0x1104:                                           # TVM_GETITEMRECT
+            h = wm.rp(lp)
+            rows = tv_visible(w)
+            rh = tv_rowh(w)
+            for i, (it, d) in enumerate(rows):
+                if it.h == (h & 0xFFFFFFFF):
+                    y = (i - s["top"]) * rh
+                    x0 = tv_x0(w, d) if wp else 0
+                    x1 = x0 + gfont(w).width(tv_text(w, it)) + 4 if wp else w.cl[2] - w.cl[0]
+                    _wr_rect(M_, lp, (x0, y, x1, y + rh))
+                    return 1
+            return 0
+        if msg == 0x1105:                                           # TVM_GETCOUNT
+            return len(s["map"])
+        if msg == 0x1106:
+            return s["indent"]
+        if msg == 0x1107:
+            s["indent"] = max(8, wp)
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x1108:
+            return s["il"].get(wp, 0)
+        if msg == 0x1109:
+            old = s["il"].get(wp, 0)
+            s["il"][wp] = lp
+            wm.invalidate(w, None, True)
+            return old
+        if msg == 0x110A:                                           # TVM_GETNEXTITEM
+            code = wp
+            it = tv_item(w, lp)
+            if code == 0:                                           # TVGN_ROOT
+                return s["root"].kids[0].h if s["root"].kids else 0
+            if code == 9:                                           # TVGN_CARET
+                return s["sel"]
+            if code == 5:                                           # TVGN_FIRSTVISIBLE
+                rows = tv_visible(w)
+                return rows[s["top"]][0].h if s["top"] < len(rows) else 0
+            if code == 8:                                           # TVGN_DROPHILITE
+                return 0
+            if it is None and code == 4:
+                return s["root"].kids[0].h if s["root"].kids else 0
+            if it is None:
+                return 0
+            if code == 1:                                           # TVGN_NEXT
+                sib = it.parent.kids
+                i = sib.index(it)
+                return sib[i + 1].h if i + 1 < len(sib) else 0
+            if code == 2:                                           # TVGN_PREVIOUS
+                sib = it.parent.kids
+                i = sib.index(it)
+                return sib[i - 1].h if i > 0 else 0
+            if code == 3:                                           # TVGN_PARENT
+                return it.parent.h if it.parent is not None else 0
+            if code == 4:                                           # TVGN_CHILD
+                return it.kids[0].h if it.kids else 0
+            if code in (6, 7):                                      # NEXTVISIBLE / PREVIOUSVISIBLE
+                rows = [r[0] for r in tv_visible(w)]
+                if it not in rows:
+                    return 0
+                i = rows.index(it) + (1 if code == 6 else -1)
+                return rows[i].h if 0 <= i < len(rows) else 0
+            if code == 0xA:                                         # TVGN_LASTVISIBLE
+                rows = tv_visible(w)
+                return rows[-1][0].h if rows else 0
+            return 0
+        if msg == 0x110B:                                           # TVM_SELECTITEM
+            if wp in (9,):
+                return 1 if tv_select(w, lp & 0xFFFFFFFF, 0) else 0
+            if wp == 5:
+                rows = tv_visible(w)
+                idx = next((i for i, (it, d) in enumerate(rows) if it.h == lp & 0xFFFFFFFF), None)
+                if idx is not None:
+                    s["top"] = idx
+                    tv_update_sb(w)
+                    wm.invalidate(w, None, True)
+                return 1
+            return 1
+        if msg in (0x110C, 0x113E):                                 # TVM_GETITEMA/W
+            mask = M_.read32(lp)
+            it = tv_item(w, wm.rp(lp + TVO["hitem"]))
+            if it is None:
+                return 0
+            if mask & 1:
+                wm.put_str(wm.rp(lp + TVO["text"]), M_.read32(lp + TVO["cch"]), tv_text(w, it),
+                           msg == 0x113E)
+            if mask & 2:
+                M_.write32(lp + TVO["img"], it.img & 0xFFFFFFFF)
+            if mask & 0x20:
+                M_.write32(lp + TVO["simg"], it.simg & 0xFFFFFFFF)
+            if mask & 4:
+                wm.wp(lp + TVO["param"], it.param)
+            if mask & 8:
+                M_.write32(lp + TVO["state"], it.state & M_.read32(lp + TVO["smask"]))
+            if mask & 0x40:
+                M_.write32(lp + TVO["kids"], 1 if tv_has_kids(it) else 0)
+            return 1
+        if msg in (0x110D, 0x113F):                                 # TVM_SETITEMA/W
+            mask = M_.read32(lp)
+            it = tv_item(w, wm.rp(lp + TVO["hitem"]))
+            if it is None:
+                return 0
+            tv_apply(w, it, lp, mask, msg == 0x113F)
+            wm.invalidate(w, None, True)
+            return 1
+        if msg == 0x1110:                                           # TVM_GETVISIBLECOUNT
+            return max(1, (w.cl[3] - w.cl[1]) // tv_rowh(w))
+        if msg == 0x1111:                                           # TVM_HITTEST
+            x, y = struct.unpack("<ii", M_.read(lp, 8))
+            it, part = tv_hit(w, x, y)
+            flags = {"button": 0x10, "check": 0x40, "label": 4, "indent": 8, None: 1}[part]
+            M_.write32(lp + 8, flags)
+            wm.wp(lp + (16 if ps == 8 else 12), it.h if it else 0)
+            return it.h if it else 0
+        if msg == 0x1114:                                           # TVM_ENSUREVISIBLE
+            it = tv_item(w, lp)
+            if it is not None:
+                a = it.parent
+                while a is not None and a.h:
+                    a.state |= TVIS_EXPANDED
+                    a = a.parent
+                tv_ensure(w, it.h)
+                wm.invalidate(w, None, True)
+            return 1
+        if msg == 0x1113:                                           # TVM_SORTCHILDREN
+            it = tv_item(w, lp) or s["root"]
+            it.kids.sort(key=lambda x: (x.text or "").lower())
+            wm.invalidate(w, None, True)
+            return 1
+        if msg == 0x1115:                                           # TVM_SORTCHILDRENCB
+            h = wm.rp(lp)
+            cmp = wm.rp(lp + ps)
+            lpar = wm.rp(lp + 2 * ps)
+            it = tv_item(w, h) or s["root"]
+            import functools
+            it.kids.sort(key=functools.cmp_to_key(lambda a, b: _s32(
+                p.call_guest(cmp, [a.param, b.param, lpar]) & 0xFFFFFFFF)))
+            wm.invalidate(w, None, True)
+            return 1
+        if msg == 0x111B:                                           # TVM_SETITEMHEIGHT
+            o = tv_rowh(w)
+            s["ih"] = 0 if _s32(wp & 0xFFFFFFFF) == -1 else wp
+            wm.invalidate(w, None, True)
+            return o
+        if msg == 0x111C:
+            return tv_rowh(w)
+        if msg == 0x111D:
+            o, s["bk"] = s["bk"], (sysc(COLOR_WINDOW) if lp == 0xFFFFFFFF else lp & 0xFFFFFF)
+            wm.invalidate(w, None, True)
+            return o
+        if msg == 0x111E:
+            o, s["tc"] = s["tc"], (sysc(COLOR_WINDOWTEXT) if lp == 0xFFFFFFFF else lp & 0xFFFFFF)
+            wm.invalidate(w, None, True)
+            return o
+        if msg == 0x111F:
+            return s["bk"]
+        if msg == 0x1120:
+            return s["tc"]
+        if msg == 0x1127:                                           # TVM_GETITEMSTATE
+            it = tv_item(w, wp)
+            return (it.state & lp) if it else 0
+        if msg in (0x110E, 0x1141, 0x110F, 0x1116, 0x1117, 0x1118, 0x1119, 0x111A, 0x1121,
+                   0x1122, 0x1123, 0x1124, 0x1125, 0x1126, 0x1128, 0x1129, 0x112A, 0x112B,
+                   0x112C, 0x112D, 0x112E):
+            return 0
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+
+    py_class("SysTreeView32", treeview_proc)
+
+
+# -- comctl32: toolbar, rebar, hot key, date/time, IP address, links, TaskDialog --------------------------
+
+def _cc_install_bars(k, notify, NMHDR_SZ, hfont, gfont, paint, IL, py_class):
+    R = k.reg
+    p = k.p
+    M_ = p.mem
+    wm = p.wm
+    gdi = p.gdi
+    ps = wm.ps
+    sysc = gdi.sys_color
+    W = wm.wnd
+
+    def reg(names, sig="", ret="i", dlls=_CC):
+        return R(names, sig, ret, dlls=dlls)
+
+    # ---- toolbar ---------------------------------------------------------------------------------
+    TB_SIZE = 32 if ps == 8 else 20
+
+    def tbst(w):
+        s = w.py.get("tbar")
+        if s is None:
+            s = w.py["tbar"] = {"btns": [], "il": 0, "bmp_il": None, "strings": [],
+                                "bsize": (24, 22), "bmsize": (16, 15), "press": -1, "hot": -1,
+                                "ex": 0, "indent": 0, "maxrows": 1}
+        return s
+
+    def tb_images(w):
+        s = tbst(w)
+        return IL(s["il"]) or s["bmp_il"]
+
+    def tb_text(w, b):
+        s = tbst(w)
+        it = b["str"]
+        if isinstance(it, int) and 0 <= it < len(s["strings"]):
+            return s["strings"][it]
+        if isinstance(it, str):
+            return it
+        return ""
+
+    def tb_layout(w):
+        s = tbst(w)
+        f = gfont(w)
+        il = tb_images(w)
+        iw, ih = (il.cx, il.cy) if il else s["bmsize"]
+        list_style = w.style & 0x1000                           # TBSTYLE_LIST
+        has_text = any(tb_text(w, b) for b in s["btns"])
+        bh = max(s["bsize"][1], ih + 7 + (f.height + 2 if has_text and not list_style else 0))
+        x = s["indent"] + (2 if w.style & 0x800 else 0)
+        rects = []
+        for b in s["btns"]:
+            if b["state"] & 8:                                  # TBSTATE_HIDDEN
+                rects.append(None)
+                continue
+            if b["style"] & 1:                                  # BTNS_SEP
+                wd = b["bitmap"] if b["bitmap"] > 0 else 8
+            else:
+                t = tb_text(w, b)
+                wd = max(s["bsize"][0], iw + 8)
+                if t:
+                    wd = max(wd, f.width(t) + 10 + ((iw + 4) if list_style else 0))
+                if b["style"] & 0x40 and False:
+                    pass
+            rects.append((x, 2, x + wd, 2 + bh))
+            x += wd
+        return rects, bh
+
+    def tb_autosize(w):
+        par = w.parent if w.parent is not wm.desktop else None
+        if par is None or w.style & 4:                           # CCS_NORESIZE
+            return
+        rects, bh = tb_layout(w)
+        pw = par.cl[2] - par.cl[0]
+        h = bh + 6 if not (w.style & 0x40) else bh + 4          # CCS_NODIVIDER
+        if w.style & 3 == 3:                                     # CCS_BOTTOM
+            ph = par.cl[3] - par.cl[1]
+            wm.set_pos(w, 0, 0, ph - h, pw, h, SWP_NOZORDER | SWP_NOACTIVATE)
+        elif not (w.style & 0x8):                                # !CCS_NOPARENTALIGN
+            wm.set_pos(w, 0, 0, 0, pw, h, SWP_NOZORDER | SWP_NOACTIVATE)
+
+    def read_tbbutton(a):
+        if ps == 8:
+            bmp, cmd, state, style = struct.unpack("<iiBB", M_.read(a, 10))
+            data, sidx = M_.read64(a + 16), M_.read64(a + 24)
+        else:
+            bmp, cmd, state, style = struct.unpack("<iiBB", M_.read(a, 10))
+            data, sidx = M_.read32(a + 12), M_.read32(a + 16)
+        return bmp, cmd, state, style, data, sidx
+
+    def toolbar_proc(hwnd, msg, wp, lp, wide):
+        w = W(hwnd)
+        if w is None:
+            return 0
+        s = tbst(w)
+
+        def find_cmd(cid):
+            for i, b in enumerate(s["btns"]):
+                if b["cmd"] == cid:
+                    return i
+            return -1
+
+        def add(a, n, at, wide_):
+            for j in range(n):
+                bmp, cmd, state, style, data, sidx = read_tbbutton(a + j * TB_SIZE)
+                if sidx >= 0x10000 and sidx not in (M64, 0xFFFFFFFF):
+                    st_ = wm.gstr(sidx, wide_)
+                else:
+                    st_ = _s32(sidx & 0xFFFFFFFF) if sidx not in (M64,) else -1
+                b = {"bitmap": bmp, "cmd": cmd, "state": state, "style": style, "data": data,
+                     "str": st_}
+                if at < 0 or at > len(s["btns"]):
+                    s["btns"].append(b)
+                else:
+                    s["btns"].insert(at + j, b)
+            wm.invalidate(w, None, True)
+
+        def hit(x, y):
+            rects, _bh = tb_layout(w)
+            for i, r in enumerate(rects):
+                if r and r[0] <= x < r[2] and r[1] <= y < r[3]:
+                    return i
+            return -1
+
+        if msg == 0x0001:
+            if w.style & 0x100:                                  # TBSTYLE_TOOLTIPS
+                pass
+            return 0
+        if msg in (0x000F, WM_PRINTCLIENT):
+            def draw(pt):
+                Wd, Hd = w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]
+                if not (w.style & 0x8000 and False):
+                    pt.fill(0, 0, Wd, Hd, sysc(COLOR_BTNFACE))
+                if not (w.style & 0x40):                         # divider line at the top
+                    pt.hline(0, Wd, 0, sysc(COLOR_BTNSHADOW))
+                    pt.hline(0, Wd, 1, sysc(COLOR_BTNHIGHLIGHT))
+                rects, bh = tb_layout(w)
+                il = tb_images(w)
+                f = gfont(w)
+                flat = w.style & 0x800
+                for i, (b, r) in enumerate(zip(s["btns"], rects)):
+                    if r is None:
+                        continue
+                    if b["style"] & 1:
+                        if flat:
+                            cx = (r[0] + r[2]) // 2
+                            pt.vline(cx - 1, r[1] + 2, r[3] - 2, sysc(COLOR_BTNSHADOW))
+                            pt.vline(cx, r[1] + 2, r[3] - 2, sysc(COLOR_BTNHIGHLIGHT))
+                        continue
+                    enabled = b["state"] & 4                     # TBSTATE_ENABLED
+                    pressed = s["press"] == i or b["state"] & 2
+                    checked = b["state"] & 1
+                    if pressed or checked:
+                        _draw_edge(pt, r, 2 if flat else 10, 15)
+                        if checked and not pressed:
+                            pt.dither(r[0] + 1, r[1] + 1, r[2] - 1, r[3] - 1,
+                                      sysc(COLOR_BTNHIGHLIGHT), sysc(COLOR_BTNFACE))
+                    elif flat:
+                        if s["hot"] == i and enabled:
+                            _draw_edge(pt, r, 4, 15)
+                    else:
+                        _draw_edge(pt, r, 5, 15 | 0x1000)
+                    off = 1 if pressed or checked else 0
+                    t = tb_text(w, b)
+                    list_style = w.style & 0x1000
+                    if il and b["bitmap"] >= 0:
+                        ix = r[0] + ((r[2] - r[0] - il.cx) // 2 if not list_style else 4) + off
+                        iy = r[1] + 3 + off if t and not list_style else \
+                            r[1] + (r[3] - r[1] - il.cy) // 2 + off
+                        X, Y = pt.xy(ix, iy)
+                        il.draw(pt.surf, pt.clip, X, Y, b["bitmap"] & 0xFFFF)
+                        if not enabled:
+                            pt.dither(ix, iy, ix + il.cx, iy + il.cy, sysc(COLOR_BTNFACE),
+                                      sysc(COLOR_BTNFACE))
+                    if t:
+                        col = sysc(COLOR_BTNTEXT) if enabled else sysc(COLOR_GRAYTEXT)
+                        if list_style:
+                            tr = (r[0] + 4 + (il.cx + 4 if il else 0) + off, r[1] + off,
+                                  r[2] + off, r[3] + off)
+                            pt.draw_text(tr, t, 0x20 | 4, hfont(w), col)
+                        else:
+                            tr = (r[0] + off, r[3] - f.height - 3 + off, r[2] + off, r[3] + off)
+                            pt.draw_text(tr, t, 1 | 0x20, hfont(w), col)
+            paint(w, draw, wp)
+            return 0
+        if msg == 0x0014:
+            return 1
+        if msg == 0x0200:
+            x, y = _xy_lparam(lp)
+            i = hit(x, y)
+            if i != s["hot"]:
+                s["hot"] = i
+                wm.invalidate(w, None, True)
+                wm.track_leave[hwnd] = 2
+            return 0
+        if msg == WM_MOUSELEAVE:
+            if s["hot"] != -1:
+                s["hot"] = -1
+                wm.invalidate(w, None, True)
+            return 0
+        if msg in (0x0201, 0x0203):
+            x, y = _xy_lparam(lp)
+            i = hit(x, y)
+            if i >= 0 and s["btns"][i]["state"] & 4 and not s["btns"][i]["style"] & 1:
+                b = s["btns"][i]
+                if b["style"] & 8:                               # BTNS_DROPDOWN
+                    r_, _a = notify(w, -710, struct.pack("<i", b["cmd"]))   # TBN_DROPDOWN
+                s["press"] = i
+                wm.set_capture(hwnd)
+                wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x0202:
+            i = s["press"]
+            s["press"] = -1
+            if wm.capture == hwnd:
+                wm.set_capture(0)
+            wm.invalidate(w, None, True)
+            x, y = _xy_lparam(lp)
+            if i >= 0 and hit(x, y) == i:
+                b = s["btns"][i]
+                if b["style"] & 2:                               # BTNS_CHECK
+                    if b["style"] & 0x10 and not b["state"] & 1:  # BTNS_GROUP
+                        j = i
+                        while j > 0 and s["btns"][j - 1]["style"] & 0x10:
+                            j -= 1
+                        while j < len(s["btns"]) and s["btns"][j]["style"] & 0x10:
+                            s["btns"][j]["state"] &= ~1
+                            j += 1
+                        b["state"] |= 1
+                    elif not b["style"] & 0x10:
+                        b["state"] ^= 1
+                notify(w, NM_CLICK, struct.pack("<i", b["cmd"]))
+                par = w.parent if w.parent is not wm.desktop else wm.wnd(w.owner)
+                if par is not None:
+                    wm.post(par.hwnd, 0x0111, b["cmd"] & 0xFFFF, hwnd)
+            return 0
+        if msg == 0x0005:
+            tb_autosize(w)
+            return 0
+        if msg == 0x41E:                                         # TB_BUTTONSTRUCTSIZE
+            return 0
+        if msg in (0x414, 0x444):                                # TB_ADDBUTTONSA/W
+            add(lp, wp, -1, msg == 0x444)
+            return 1
+        if msg in (0x415, 0x443):                                # TB_INSERTBUTTONA/W
+            add(lp, 1, _s32(wp & 0xFFFFFFFF), msg == 0x443)
+            return 1
+        if msg == 0x416:                                         # TB_DELETEBUTTON
+            if 0 <= wp < len(s["btns"]):
+                del s["btns"][wp]
+                wm.invalidate(w, None, True)
+                return 1
+            return 0
+        if msg == 0x418:                                         # TB_BUTTONCOUNT
+            return len(s["btns"])
+        if msg == 0x417:                                         # TB_GETBUTTON
+            if not 0 <= wp < len(s["btns"]):
+                return 0
+            b = s["btns"][wp]
+            if ps == 8:
+                M_.write(lp, struct.pack("<iiBB6xQq", b["bitmap"], b["cmd"], b["state"], b["style"],
+                                         b["data"] & M64, b["str"] if isinstance(b["str"], int) else -1))
+            else:
+                M_.write(lp, struct.pack("<iiBB2xIi", b["bitmap"], b["cmd"], b["state"], b["style"],
+                                         b["data"] & 0xFFFFFFFF, b["str"] if isinstance(b["str"], int) else -1))
+            return 1
+        if msg in (0x401, 0x402, 0x403, 0x404, 0x405):           # ENABLE/CHECK/PRESS/HIDE/INDETERMINATE
+            i = find_cmd(wp)
+            if i < 0:
+                return 0
+            bit = {0x401: 4, 0x402: 1, 0x403: 2, 0x404: 8, 0x405: 0x10}[msg]
+            on = bool(lp & 0xFFFF)
+            b = s["btns"][i]
+            b["state"] = (b["state"] | bit) if on else (b["state"] & ~bit)
+            wm.invalidate(w, None, True)
+            return 1
+        if msg in (0x409, 0x40A, 0x40B, 0x40C, 0x40D):           # IS* queries
+            i = find_cmd(wp)
+            if i < 0:
+                return 0
+            bit = {0x409: 4, 0x40A: 1, 0x40B: 2, 0x40C: 8, 0x40D: 0x10}[msg]
+            return 1 if s["btns"][i]["state"] & bit else 0
+        if msg == 0x411:                                         # TB_SETSTATE
+            i = find_cmd(wp)
+            if i < 0:
+                return 0
+            s["btns"][i]["state"] = lp & 0xFF
+            wm.invalidate(w, None, True)
+            return 1
+        if msg == 0x412:                                         # TB_GETSTATE
+            i = find_cmd(wp)
+            return s["btns"][i]["state"] if i >= 0 else 0xFFFFFFFF
+        if msg == 0x413:                                         # TB_ADDBITMAP
+            n = wp
+            inst = wm.rp(lp)
+            nid = wm.rp(lp + ps)
+            bw, bh = s["bmsize"]
+            if inst in (M64, 0xFFFFFFFF):                        # HINST_COMMCTRL
+                surf = _std_toolbar_bitmap(nid, 16)
+            else:
+                if inst == 0:
+                    bm = gdi.get(nid, "bitmap")
+                    surf = bm.surf if bm is not None else None
+                else:
+                    data = _res_bytes(p, inst, 2, nid)
+                    bm = _bitmap_from_packed(p, data) if data else None
+                    surf = bm.surf if bm is not None else None
+            if surf is None:
+                return 0xFFFFFFFF
+            if s["bmp_il"] is None:
+                s["bmp_il"] = _ImageList(bw if bw else 16, surf.h, 1)
+            il = s["bmp_il"]
+            first = len(il.images)
+            il.add_surface(surf, key=bytes(surf.px[0:3]) if inst not in (M64, 0xFFFFFFFF)
+                           else b"\xc0\xc0\xc0")
+            wm.invalidate(w, None, True)
+            return first
+        if msg in (0x41C, 0x44D):                                # TB_ADDSTRINGA/W
+            first = len(s["strings"])
+            if wp == 0 and lp:
+                a = lp
+                wide_ = msg == 0x44D
+                while True:
+                    t = wm.gstr(a, wide_)
+                    if not t:
+                        break
+                    s["strings"].append(t)
+                    a += (len(t.encode("utf-16-le")) + 2) if wide_ else len(t.encode("utf-8")) + 1
+            elif wp:
+                data = _res_bytes(p, wp, 6, ((lp & 0xFFFF) >> 4) + 1)
+                if data:
+                    s["strings"].append("?")
+            return first
+        if msg == 0x421:                                         # TB_AUTOSIZE
+            tb_autosize(w)
+            return 0
+        if msg in (0x430, 0x434, 0x436):                         # TB_SETIMAGELIST / hot / disabled
+            if msg == 0x430:
+                o, s["il"] = s["il"], lp
+                wm.invalidate(w, None, True)
+                return o
+            return 0
+        if msg == 0x431:
+            return s["il"]
+        if msg == 0x41D:                                         # TB_GETITEMRECT
+            rects, _bh = tb_layout(w)
+            if not 0 <= wp < len(rects) or rects[wp] is None:
+                return 0
+            _wr_rect(M_, lp, rects[wp])
+            return 1
+        if msg == 0x433:                                         # TB_GETRECT (by command)
+            i = find_cmd(wp)
+            rects, _bh = tb_layout(w)
+            if i < 0 or rects[i] is None:
+                return 0
+            _wr_rect(M_, lp, rects[i])
+            return 1
+        if msg == 0x41F:                                         # TB_SETBUTTONSIZE
+            s["bsize"] = (lp & 0xFFFF, (lp >> 16) & 0xFFFF)
+            return 1
+        if msg == 0x420:                                         # TB_SETBITMAPSIZE
+            s["bmsize"] = (lp & 0xFFFF, (lp >> 16) & 0xFFFF)
+            return 1
+        if msg == 0x43A:                                         # TB_GETBUTTONSIZE
+            rects, bh = tb_layout(w)
+            return (s["bsize"][0] & 0xFFFF) | ((bh & 0xFFFF) << 16)
+        if msg == 0x454:                                         # TB_SETEXTENDEDSTYLE
+            o, s["ex"] = s["ex"], lp
+            return o
+        if msg == 0x455:
+            return s["ex"]
+        if msg == 0x42F:                                         # TB_SETINDENT
+            s["indent"] = wp
+            return 1
+        if msg == 0x419:                                         # TB_COMMANDTOINDEX
+            return find_cmd(wp) & 0xFFFFFFFF
+        if msg in (0x43F, 0x440):                                # TB_GET/SETBUTTONINFO
+            i = find_cmd(wp)
+            if i < 0:
+                return 0xFFFFFFFF
+            b = s["btns"][i]
+            mask = M_.read32(lp + 4)
+            if msg == 0x440:
+                if mask & 4:
+                    b["state"] = M_.read8(lp + 16)
+                if mask & 8:
+                    b["style"] = M_.read8(lp + 17)
+                if mask & 2:
+                    t_off = 24 + (2 * ps if ps == 8 else 2 * ps)
+                wm.invalidate(w, None, True)
+                return 1
+            if mask & 4:
+                M_.write8(lp + 16, b["state"])
+            if mask & 8:
+                M_.write8(lp + 17, b["style"])
+            if mask & 0x20:
+                M_.write32(lp + 12, b["cmd"] & 0xFFFFFFFF)
+            return i
+        if msg == 0x445:                                         # TB_HITTEST
+            x, y = struct.unpack("<ii", M_.read(lp, 8))
+            i = hit(x, y)
+            return i & 0xFFFFFFFF if i >= 0 else 0xFFFFFFFF
+        if msg == 0x423:                                         # TB_SETPARENT
+            return 0
+        if msg == 0x428:                                         # TB_GETROWS
+            return 1
+        if msg == 0x43D:                                         # TB_GETMAXSIZE
+            rects, bh = tb_layout(w)
+            mx = max([r[2] for r in rects if r] or [0])
+            M_.write(lp, struct.pack("<ii", mx, bh))
+            return 1
+        if msg in (0x425, 0x426, 0x427, 0x429, 0x42A, 0x42B, 0x42C, 0x42D, 0x42E, 0x43B,
+                   0x43C, 0x446, 0x447, 0x448, 0x457, 0x458, 0x44B, 0x44C, 0x422, 0x424,
+                   0x437, 0x438, 0x439, 0x441, 0x442, 0x44F, 0x450, 0x451, 0x452, 0x453, 0x456):
+            return 0
+        if msg == WM_SETFONT:
+            w.font = wp
+            return 0
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+
+    py_class("ToolbarWindow32", toolbar_proc)
+
+    @reg("CreateToolbarEx", "puuipppiiiiiu", "p")
+    def _ctbex(c, par, style, cid, nbmp, inst, bmid, btns, nbtn, dxb, dyb, dxbm, dybm, size):
+        h = wm.create(0, wm.find_class("ToolbarWindow32"), "", style, 0, 0, 100, 30, par, cid,
+                      inst, 0, True)
+        if not h:
+            return 0
+        if dxbm and dybm:
+            wm.send(h, 0x420, 0, (dybm << 16) | dxbm)
+        if dxb and dyb:
+            wm.send(h, 0x41F, 0, (dyb << 16) | dxb)
+        mark = wm.scratch_mark()
+        try:
+            a = wm.scratch(2 * ps)
+            wm.wp(a, inst)
+            wm.wp(a + ps, bmid)
+            wm.send(h, 0x413, nbmp, a)
+        finally:
+            wm.scratch_release(mark)
+        if btns and nbtn:
+            wm.send(h, 0x414, nbtn, btns)
+        wm.send(h, 0x421, 0, 0)
+        return h
+
+    reg("CreateToolbar", "puuipppi", "p")(lambda c, par, st, cid, nb, inst, bm, btns, n:
+                                          _ctbex(c, par, st, cid, nb, inst, bm, btns, n, 0, 0, 0, 0, 0))
+
+    reg("CreateMappedBitmap", "ppupi", "p")(lambda c, inst, cid, fl, cmap, n:
+                                             p.api.table[("user32.dll", "loadbitmapa")](c)
+                                             if False else _load_mapped(inst, cid))
+
+    def _load_mapped(inst, cid):
+        data = _res_bytes(p, inst, 2, cid)
+        if data is None:
+            return 0
+        bm = _bitmap_from_packed(p, data)
+        return gdi.add(bm) if bm is not None else 0
+
+    # ---- rebar: bands laid out left to right, one row --------------------------------------------
+    def rebar_proc(hwnd, msg, wp, lp, wide):
+        w = W(hwnd)
+        if w is None:
+            return 0
+        s = w.py.setdefault("rb", {"bands": []})
+
+        def layout():
+            x = 2
+            h = 0
+            for b in s["bands"]:
+                ch = W(b["child"])
+                bh = max(b["minh"], ch.h if ch is not None else 0)
+                h = max(h, bh)
+            for b in s["bands"]:
+                ch = W(b["child"])
+                if ch is None:
+                    continue
+                tw = gfont(w).width(b["text"]) + 6 if b["text"] else 0
+                cw = b["cx"] or max(b["minw"], ch.w)
+                wm.set_pos(ch, 0, x + tw + 6, 2, cw, h, SWP_NOZORDER | SWP_NOACTIVATE)
+                x += tw + 6 + cw + 4
+            par = w.parent if w.parent is not wm.desktop else None
+            if par is not None and not (w.style & 4):
+                wm.set_pos(w, 0, 0, 0, par.cl[2] - par.cl[0], h + 4, SWP_NOZORDER | SWP_NOACTIVATE)
+
+        if msg in (0x000F, WM_PRINTCLIENT):
+            def draw(pt):
+                Wd, Hd = w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]
+                pt.fill(0, 0, Wd, Hd, sysc(COLOR_BTNFACE))
+                x = 2
+                for b in s["bands"]:
+                    ch = W(b["child"])
+                    _draw_edge(pt, (x, 0, x + 3, Hd), 4, 15)
+                    if b["text"]:
+                        pt.draw_text((x + 5, 0, Wd, Hd), b["text"], 0x20 | 4, hfont(w),
+                                     sysc(COLOR_BTNTEXT))
+                    if ch is not None:
+                        x = ch.x + ch.w + 4
+            paint(w, draw, wp)
+            return 0
+        if msg == 0x0014:
+            return 1
+        if msg in (0x401, 0x40A, 0x406, 0x40B):                   # RB_INSERTBAND(A/W)/SETBANDINFO
+            wide_ = msg in (0x40A, 0x40B)
+            mask = M_.read32(lp + 4)
+            off_text = 16 if ps == 4 else 16
+            b = {"child": 0, "text": "", "minw": 0, "minh": 0, "cx": 0}
+            if msg in (0x406, 0x40B):
+                if not 0 <= wp < len(s["bands"]):
+                    return 0
+                b = s["bands"][wp]
+            fields = {"text": 16 if ps == 4 else 16, "child": 28 if ps == 4 else 40,
+                      "minw": 32 if ps == 4 else 48, "minh": 36 if ps == 4 else 52,
+                      "cx": 40 if ps == 4 else 56}
+            if mask & 4:
+                b["text"] = wm.gstr(wm.rp(lp + fields["text"]), wide_)
+            if mask & 0x10:
+                b["child"] = wm.rp(lp + fields["child"]) & 0xFFFFFFFF
+                ch = W(b["child"])
+                if ch is not None and ch.parent is not w:
+                    ch.parent.children.remove(ch)
+                    ch.parent = w
+                    w.children.append(ch)
+            if mask & 0x20:
+                b["minw"] = M_.read32(lp + fields["minw"])
+                b["minh"] = M_.read32(lp + fields["minh"])
+            if mask & 0x40:
+                b["cx"] = M_.read32(lp + fields["cx"])
+            if msg in (0x401, 0x40A):
+                i = _s32(wp & 0xFFFFFFFF)
+                if i < 0 or i > len(s["bands"]):
+                    s["bands"].append(b)
+                else:
+                    s["bands"].insert(i, b)
+            layout()
+            wm.invalidate(w, None, True)
+            return 1
+        if msg == 0x402:                                          # RB_DELETEBAND
+            if 0 <= wp < len(s["bands"]):
+                del s["bands"][wp]
+                layout()
+                return 1
+            return 0
+        if msg == 0x40C:                                          # RB_GETBANDCOUNT
+            return len(s["bands"])
+        if msg == 0x40D:                                          # RB_GETROWCOUNT
+            return 1 if s["bands"] else 0
+        if msg in (0x40E, 0x41D):                                 # RB_GETROWHEIGHT / BARHEIGHT
+            return w.h
+        if msg == 0x0005:
+            layout()
+            return 0
+        if msg in (0x404, 0x405, 0x403, 0x408, 0x409, 0x410, 0x411, 0x413, 0x414, 0x415,
+                   0x416, 0x417, 0x41C, 0x41E, 0x41F, 0x420, 0x421, 0x425):
+            return 0
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+
+    py_class("ReBarWindow32", rebar_proc)
+
+    # ---- small controls ------------------------------------------------------------------------
+    def simple_text_proc(kind):
+        def proc(hwnd, msg, wp, lp, wide):
+            w = W(hwnd)
+            if w is None:
+                return 0
+            if msg in (0x000F, WM_PRINTCLIENT):
+                def draw(pt):
+                    Wd, Hd = w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]
+                    if kind == "link":
+                        br = _ctl_color(wm, w, WM_CTLCOLORSTATIC, pt.dc)
+                        pt.fill_brush(0, 0, Wd, Hd, br)
+                        t = re.sub(r"</?a[^>]*>", "", w.text, flags=re.I)
+                        f = gfont(w)
+                        pt.text(0, 0, t, f, _rgb(0, 102, 204))
+                        pt.hline(0, f.width(t), f.ascent + 1, _rgb(0, 102, 204))
+                    else:
+                        pt.fill(0, 0, Wd, Hd, sysc(COLOR_WINDOW))
+                        pt.draw_text((3, 0, Wd - 18, Hd), w.py.get("disp", w.text), 0x20 | 4,
+                                     hfont(w), sysc(COLOR_WINDOWTEXT))
+                        if kind == "date":
+                            _draw_frame_control(pt, (Wd - 17, 1, Wd - 1, Hd - 1), 3, 5)
+                paint(w, draw, wp)
+                return 0
+            if msg == 0x0014:
+                return 1
+            if msg == WM_NCCREATE and kind in ("date", "ip", "hotkey"):
+                w.exstyle |= WS_EX_CLIENTEDGE
+                if kind == "date":
+                    import datetime as _dt
+                    now = _dt.datetime.now()
+                    w.py["dt"] = now
+                    w.py["disp"] = now.strftime("%m/%d/%Y") if not (w.style & 2) else \
+                        now.strftime("%H:%M:%S")
+                elif kind == "ip":
+                    w.py["disp"] = "0 . 0 . 0 . 0"
+                return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+            if kind == "date" and msg in (0x1001, 0x1002):           # DTM_GETSYSTEMTIME / SET
+                import datetime as _dt
+                if msg == 0x1001:
+                    t = w.py.get("dt") or _dt.datetime.now()
+                    M_.write(lp, struct.pack("<8H", t.year, t.month, (t.weekday() + 1) % 7, t.day,
+                                             t.hour, t.minute, t.second, 0))
+                    return 0
+                if lp:
+                    y, mo, _d, d, h, mi, s_, _ms = struct.unpack("<8H", M_.read(lp, 16))
+                    try:
+                        w.py["dt"] = _dt.datetime(y, mo, d, h, mi, s_)
+                        w.py["disp"] = w.py["dt"].strftime("%m/%d/%Y") if not (w.style & 2) \
+                            else w.py["dt"].strftime("%H:%M:%S")
+                    except ValueError:
+                        return 0
+                wm.invalidate(w, None, True)
+                return 1
+            if kind == "ip":
+                if msg == 0x466:                                     # IPM_GETADDRESS
+                    v = w.py.get("ip", 0)
+                    if lp:
+                        M_.write32(lp, v)
+                    return 4
+                if msg == 0x465:                                     # IPM_SETADDRESS
+                    w.py["ip"] = lp & 0xFFFFFFFF
+                    w.py["disp"] = " . ".join(str((lp >> s_) & 255) for s_ in (24, 16, 8, 0))
+                    wm.invalidate(w, None, True)
+                    return 0
+                if msg == 0x464:                                     # IPM_CLEARADDRESS
+                    w.py["ip"] = 0
+                    return 0
+                if msg == 0x469:                                     # IPM_ISBLANK
+                    return 0 if w.py.get("ip") else 1
+            if kind == "hotkey" and msg in (0x401, 0x402):
+                if msg == 0x402:
+                    return w.py.get("hk", 0)
+                w.py["hk"] = wp & 0xFFFF
+                return 0
+            if kind == "link" and msg == 0x0201:
+                notify(w, -2, struct.pack("<I", 0) + bytes(64))          # NM_CLICK (NMLINK)
+                return 0
+            if msg == WM_SETTEXT:
+                r = _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+                wm.invalidate(w, None, True)
+                return r
+            return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+        return proc
+
+    py_class("SysDateTimePick32", simple_text_proc("date"))
+    py_class("SysMonthCal32", simple_text_proc("date"))
+    py_class("SysIPAddress32", simple_text_proc("ip"))
+    py_class("msctls_hotkey32", simple_text_proc("hotkey"))
+    py_class("SysLink", simple_text_proc("link"))
+    py_class("SysAnimate32", simple_text_proc("anim"))
+    py_class("SysPager", simple_text_proc("pager"))
+    py_class("NativeFontCtrl", simple_text_proc("font"))
+
+    # ComboBoxEx32 hosts a real combo box and forwards the CB_* messages
+    def comboex_proc(hwnd, msg, wp, lp, wide):
+        w = W(hwnd)
+        if w is None:
+            return 0
+        combo = W(w.py.get("combo", 0))
+        if msg == 0x0001:
+            h = wm.create(0, wm.find_class("ComboBox"), "", WS_CHILD | WS_VISIBLE | WS_VSCROLL |
+                          (w.style & 3 or 2), 0, 0, w.w, max(w.h, 150), hwnd, w.id, w.inst, 0, True)
+            w.py["combo"] = h
+            return 0
+        if msg in (0x404, 0x40B):                                     # CBEM_INSERTITEMA/W
+            if combo is None:
+                return 0xFFFFFFFF
+            mask = M_.read32(lp)
+            idx = _s32(wm.rp(lp + ps) & 0xFFFFFFFF)
+            text = wm.gstr(wm.rp(lp + 2 * ps), msg == 0x40B) if mask & 1 else ""
+            mark = wm.scratch_mark()
+            try:
+                a = wm.scratch(text.encode("utf-16-le") + b"\0\0")
+                return wm.send(combo.hwnd, 0x14A, idx & 0xFFFFFFFF, a, True)
+            finally:
+                wm.scratch_release(mark)
+        if msg == 0x406:                                              # CBEM_GETCOMBOCONTROL
+            return combo.hwnd if combo else 0
+        if msg == 0x407:
+            e = combo.py.get("cb", {}).get("edit", 0) if combo else 0
+            return e
+        if msg == 0x402:                                              # CBEM_SETIMAGELIST
+            return 0
+        if msg == 0x0111 and combo is not None and lp == combo.hwnd:
+            par = w.parent
+            if par is not None:
+                return wm.send(par.hwnd, 0x0111, (w.id & 0xFFFF) | (wp & 0xFFFF0000), hwnd)
+            return 0
+        if 0x140 <= msg <= 0x164 and combo is not None:
+            return wm.send(combo.hwnd, msg, wp, lp, wide)
+        if msg == WM_SETFONT and combo is not None:
+            wm.send(combo.hwnd, msg, wp, lp)
+            return 0
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+
+    py_class("ComboBoxEx32", comboex_proc)
+
+    # ---- TaskDialog: a MessageBox-style dialog ----------------------------------------------
+    def _task_dialog(c, owner, inst, title, main, content, buttons, icon, pbutton):
+        def s_(a):
+            if not a:
+                return ""
+            if a < 0x10000:
+                data = _res_bytes(p, inst, 6, (a >> 4) + 1)
+                return ""
+            return wm.gstr(a, True)
+        parts = [t for t in (s_(main), s_(content)) if t]
+        text = "\n\n".join(parts)
+        style = 0
+        cb = buttons & 0x3F
+        if cb & 4 and cb & 8:                                         # YES | NO
+            style = 3 if cb & 2 else 4
+        elif cb & 0x10 and cb & 2:
+            style = 5
+        elif cb & 2:
+            style = 1
+        ic = icon & 0xFFFF
+        style |= {0xFFFF: 0x30, 0xFFFE: 0x10, 0xFFFD: 0x40}.get(ic, 0)
+        r = _message_box(wm, owner & 0xFFFFFFFF, text, s_(title) or "Information", style)
+        if pbutton:
+            M_.write32(pbutton, r)
+        return 0
+
+    reg("TaskDialog", "pppppuup")(_task_dialog)
+
+    @reg("TaskDialogIndirect", "pppp")
+    def _tdi(c, cfg, pbutton, pradio, pverify):
+        if ps == 8:
+            owner = M_.read64(cfg + 4 + 4)
+            inst = M_.read64(cfg + 16)
+            flags = M_.read32(cfg + 24)
+            common = M_.read32(cfg + 28)
+            title = M_.read64(cfg + 32)
+            icon = M_.read64(cfg + 40)
+            main = M_.read64(cfg + 48)
+            content = M_.read64(cfg + 56)
+        else:
+            owner, inst, flags, common, title, icon, main, content = \
+                struct.unpack("<8I", M_.read(cfg + 4, 32))
+        if pradio:
+            M_.write32(pradio, 0)
+        if pverify:
+            M_.write32(pverify, 0)
+        return _task_dialog(c, owner, inst, title, main, content, common or 1, icon, pbutton)
+
+    # ---- property sheets: pages shown one at a time in a tab dialog ---------------------------
+    reg("CreatePropertySheetPageA CreatePropertySheetPageW", "p", "p")(
+        lambda c, a: gdi.add(_GMisc("psp", addr=a, copy=bytes(M_.read(a, 0x60)))))
+    reg("DestroyPropertySheetPage", "p")(lambda c, h: 1)
+
+    @reg("PropertySheetA PropertySheetW", "p", "p")
+    def _psheet(c, hdr):
+        p.log.warn("PropertySheet: property sheets are not implemented yet — returning cancel")
+        return 0
 
 
 # Bitmap glyphs rasterized from the DejaVu fonts (c) Bitstream / DejaVu
@@ -43830,12 +48439,42 @@ _ORDINAL_EXPORTS = {
                    52: "gethostbyname", 53: "getprotobyname", 54: "getprotobynumber",
                    55: "getservbyname", 56: "getservbyport", 57: "gethostname",
                    111: "WSAGetLastError", 112: "WSASetLastError", 115: "WSAStartup",
-                   116: "WSACleanup", 151: "__WSAFDIsSet"},
+                   116: "WSACleanup", 151: "__WSAFDIsSet", 101: "WSAAsyncSelect",
+                   102: "WSAAsyncGetHostByAddr", 103: "WSAAsyncGetHostByName",
+                   108: "WSACancelAsyncRequest", 113: "WSACancelBlockingCall",
+                   114: "WSAIsBlocking", 109: "WSASetBlockingHook", 110: "WSAUnhookBlockingHook"},
     "oleaut32.dll": {2: "SysAllocString", 3: "SysReAllocString", 4: "SysAllocStringLen",
                      5: "SysReAllocStringLen", 6: "SysFreeString", 7: "SysStringLen",
                      8: "VariantInit", 9: "VariantClear", 10: "VariantCopy",
-                     12: "VariantChangeType", 147: "VariantChangeTypeEx",
-                     149: "SysStringByteLen", 150: "SysAllocStringByteLen"},
+                     11: "VariantCopyInd", 12: "VariantChangeType",
+                     13: "VariantTimeToDosDateTime", 14: "DosDateTimeToVariantTime",
+                     15: "SafeArrayCreate", 16: "SafeArrayDestroy", 17: "SafeArrayGetDim",
+                     18: "SafeArrayGetElemsize", 19: "SafeArrayGetUBound",
+                     20: "SafeArrayGetLBound", 21: "SafeArrayLock", 22: "SafeArrayUnlock",
+                     23: "SafeArrayAccessData", 24: "SafeArrayUnaccessData",
+                     25: "SafeArrayGetElement", 26: "SafeArrayPutElement", 27: "SafeArrayCopy",
+                     28: "DispGetParam", 29: "DispGetIDsOfNames", 30: "DispInvoke",
+                     31: "CreateDispTypeInfo", 32: "CreateStdDispatch",
+                     33: "RegisterActiveObject", 34: "RevokeActiveObject",
+                     35: "GetActiveObject", 36: "SafeArrayAllocDescriptor",
+                     37: "SafeArrayAllocData", 38: "SafeArrayDestroyDescriptor",
+                     39: "SafeArrayDestroyData", 40: "SafeArrayRedim",
+                     41: "SafeArrayAllocDescriptorEx", 42: "SafeArrayCreateEx",
+                     43: "SafeArrayCreateVectorEx", 46: "VarParseNumFromStr",
+                     47: "VarNumFromParseNum", 54: "VarI2FromStr", 64: "VarI4FromStr",
+                     74: "VarR4FromStr", 77: "SafeArrayGetVartype", 84: "VarR8FromStr",
+                     94: "VarDateFromStr", 110: "VarBstrFromI4", 112: "VarBstrFromR8",
+                     116: "VarBstrFromBool", 146: "DispCallFunc",
+                     147: "VariantChangeTypeEx", 148: "SafeArrayPtrOfIndex",
+                     149: "SysStringByteLen", 150: "SysAllocStringByteLen",
+                     161: "LoadTypeLib", 162: "LoadRegTypeLib", 163: "RegisterTypeLib",
+                     170: "OaBuildVersion", 183: "LoadTypeLibEx",
+                     184: "SystemTimeToVariantTime", 185: "VariantTimeToSystemTime",
+                     186: "UnRegisterTypeLib", 200: "GetErrorInfo", 201: "SetErrorInfo",
+                     202: "CreateErrorInfo", 277: "VarUI4FromStr", 313: "VarBstrCat",
+                     314: "VarBstrCmp", 411: "SafeArrayCreateVector",
+                     418: "OleLoadPicture", 419: "OleCreatePictureIndirect",
+                     420: "OleCreateFontIndirect", 421: "OleTranslateColor"},
     "comctl32.dll": {17: "InitCommonControls", 236: "Str_SetPtrW", 413: "SetWindowSubclass",
                      410: "DefSubclassProc", 412: "RemoveWindowSubclass"},
     "shell32.dll": {680: "IsUserAnAdmin"},
