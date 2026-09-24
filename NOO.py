@@ -3926,6 +3926,7 @@ class CPU(_DecoderMixin, _SSEMixin, _FPUMixin):
         self.eflags_hi = 0       # AC / ID bits (CPU-detection probes toggle ID)
         self.api_handler = None  # set by NOOProcess: fn(api_id, cpu) -> retval
         self.api_convention = None
+        self.api_cleanup = None
         self._arg_hi = None
         self._yield_pending = False
         self._yield_clean = 0
@@ -4194,16 +4195,28 @@ class CPU(_DecoderMixin, _SSEMixin, _FPUMixin):
         except NOOYield:
             hi = self._arg_hi if self._arg_hi is not None else -1
             self._yield_pending = True
-            self._yield_clean = (hi + 1) * 4 \
-                if self.mode == 32 and hi >= 0 and self._stdcall_api(api_id) else 0
+            self._yield_clean = self._clean_bytes(api_id, hi) if self.mode == 32 else 0
             raise
+        except NOOContextSet:
+            return                  # the API installed a whole new context
         finally:
             self._arg_hi = prev_hi
         if ret is not None:
             self.set_reg(RAX, ret, 64 if self.mode == 64 else 32)
         self.eip = self.pop()
-        if self.mode == 32 and hi >= 0 and self._stdcall_api(api_id):
-            self.regs[RSP] = (self.regs[RSP] + (hi + 1) * 4) & 0xFFFFFFFF
+        if self.mode == 32:
+            n = self._clean_bytes(api_id, hi)
+            if n:
+                self.regs[RSP] = (self.regs[RSP] + n) & 0xFFFFFFFF
+
+    def _clean_bytes(self, api_id, hi):
+        """Bytes a 32-bit API pops on return: the declared stdcall argument
+        size when known, else the arguments the implementation read."""
+        f = self.api_cleanup
+        n = f(api_id) if f is not None else -1
+        if n >= 0:
+            return n
+        return (hi + 1) * 4 if hi >= 0 and self._stdcall_api(api_id) else 0
 
     def _div(self, size, v, signed):
         m = (1 << size) - 1
@@ -4469,14 +4482,21 @@ class VirtualFileSystem:
     @staticmethod
     def normalize(win_path, cwd="C:\\"):
         p = win_path.replace("/", "\\")
+        cwd = (cwd or "C:\\").replace("/", "\\")
+        if len(cwd) >= 2 and cwd[1] == ":":
+            cdrive, crest = cwd[0].upper(), cwd[2:]
+        else:
+            cdrive, crest = "C", cwd
         if len(p) >= 2 and p[1] == ":":
             drive, rest = p[0].upper(), p[2:]
+            if not rest.startswith("\\"):          # drive-relative ("C:foo")
+                rest = (crest.rstrip("\\") if drive == cdrive else "") + "\\" + rest
         elif p.startswith("\\\\"):           # UNC — refuse politely
             raise NOOSandboxViolation("UNC paths are not supported: %s" % win_path)
         else:
-            drive, rest = "C", p
+            drive, rest = cdrive, p
             if not p.startswith("\\"):
-                rest = cwd.rstrip("\\") + "\\" + rest
+                rest = crest.rstrip("\\") + "\\" + rest
         parts = []
         for comp in rest.split("\\"):
             if comp in ("", "."):
@@ -7791,8 +7811,9 @@ class WinAPI:
                                                    "msvcr100.dll", "msvcr110.dll",
                                                    "msvcr120.dll", "msvcp140.dll"):
             return (self.lookup("ucrtbase.dll", name) or self.lookup("msvcrt.dll", name))
-        if d.startswith("api-ms-win-core"):
-            return self.lookup("kernel32.dll", name)
+        if d.startswith("api-ms-win-core") or d.startswith("api-ms-win-eventing") or \
+                d.startswith("ext-ms-win") or d in ("kernelbase.dll", "ntdll.dll"):
+            return self.lookup("kernel32.dll", name) or self.lookup("kernelbase.dll", name)
         return None
 
     def data_export_value(self, dll, name):
@@ -12310,13 +12331,17 @@ def _crt_install(crt):
     def _clock(c):
         return int((time.monotonic() - crt.clock_start) * 1000)
 
-    @R("difftime _difftime64", "qq", "d")
+    @R("_difftime64", "qq", "d")
     def _difftime(c, a, b):
         return float(a - b)
 
-    @R("_difftime32", "ii", "d")
+    # msvcrt.dll's own difftime/time/gmtime... use the 32-bit time_t on x86
+    @R("_difftime32" if crt.x64 else "_difftime32 difftime", "ii", "d")
     def _difftime32(c, a, b):
         return float(a - b)
+
+    if crt.x64:
+        R("difftime", "qq", "d")(_difftime)
 
     def _tm_tuple(t, local):
         st = time.localtime(t) if local else time.gmtime(t)
@@ -12513,6 +12538,6494 @@ def _crt_install(crt):
     return crt
 
 
+
+# ==============================================================================
+# 10c. Win32 core: kernel objects, stdcall marshalling, structured exceptions
+# ==============================================================================
+
+class NOOContextSet(NOOError):
+    """Raised by an API implementation that has installed a complete new CPU
+    context (exception dispatch, RtlUnwindEx, NtContinue...): the API thunk
+    must not perform its normal `ret` epilogue."""
+
+
+# Legacy (pre-rewrite) handlers: stdcall stack bytes / 4 on x86. The Win32
+# API pops exactly its declared arguments; deriving the count from which
+# arguments a Python handler happened to read corrupted the stack whenever
+# a handler ignored a parameter.
+_LEGACY_ARGC = {
+    "getusernamea": 2, "getusernamew": 2, "regclosekey": 1, "regcreatekeyexa": 9,
+    "regcreatekeyexw": 9, "regdeletekeya": 2, "regdeletekeyw": 2, "regopenkeyexa": 5,
+    "regopenkeyexw": 5, "regqueryvalueexa": 6, "regqueryvalueexw": 6, "regsetvalueexa": 6,
+    "regsetvalueexw": 6, "imagelist_create": 5, "imagelist_destroy": 1, "initcommoncontrols": 0,
+    "initcommoncontrolsex": 1, "choosecolora": 1, "choosecolorw": 1, "commdlgextendederror": 0,
+    "getopenfilenamea": 1, "getopenfilenamew": 1, "getsavefilenamea": 1, "getsavefilenamew": 1,
+    "bitblt": 9, "choosepixelformat": 2, "createcompatiblebitmap": 3, "createcompatibledc": 1,
+    "createfonta": 14, "createfontw": 14, "createpen": 3, "createsolidbrush": 1, "deletedc": 1,
+    "deleteobject": 1, "describepixelformat": 4, "drawtexta": 5, "drawtextw": 5, "ellipse": 5,
+    "getdevicecaps": 2, "getstockobject": 1, "lineto": 3, "movetoex": 4, "rectangle": 5,
+    "selectobject": 2, "setbkcolor": 2, "setbkmode": 2, "setpixelformat": 3, "setrop2": 2,
+    "settextcolor": 2, "swapbuffers": 1, "textouta": 5, "textoutw": 5,
+    "ntgettickcount": 0, "rtlallocateheap": 3, "rtlfreeheap": 3, "rtlgetlastwin32error": 0,
+    "rtlgetversion": 1, "clsidfromprogid": 2, "clsidfromprogidex": 2, "clsidfromstring": 2,
+    "cocreateguid": 1, "cocreateinstance": 5, "cogetclassobject": 5, "coinitialize": 1,
+    "coinitializeex": 2, "cotaskmemalloc": 1, "cotaskmemfree": 1, "couninitialize": 0,
+    "iidfromstring": 2, "isequalguid": 2, "oleinitialize": 1, "oleuninitialize": 0,
+    "stringfromclsid": 2, "stringfromguid2": 3, "stringfromiid": 2, "sysallocstring": 1,
+    "sysallocstringlen": 2, "sysfreestring": 1, "sysstringbytelen": 1, "sysstringlen": 1,
+    "variantclear": 1, "variantinit": 1, "glbegin": 1, "glblendfunc": 2, "glclear": 1,
+    "glclearcolor": 4, "glcleardepth": 2, "glcolor3f": 3, "glcolor3ub": 3, "glcolor4f": 4,
+    "glcolor4ub": 4, "glcullface": 1, "gldepthfunc": 1, "gldepthmask": 1, "gldisable": 1,
+    "glenable": 1, "glend": 0, "glfinish": 0, "glflush": 0, "glfrontface": 1, "glgeterror": 0,
+    "glgetstring": 1, "glhint": 2, "gllinewidth": 1, "glloadidentity": 0, "glmatrixmode": 1,
+    "glnormal3f": 3, "glortho": 12, "glpixelstorei": 2, "glpointsize": 1, "glpopattrib": 0,
+    "glpopmatrix": 0, "glpushattrib": 1, "glpushmatrix": 0, "glrotatef": 4, "glscalef": 3,
+    "glshademodel": 1, "gltexcoord2f": 2, "gltexparameteri": 3, "gltranslatef": 3,
+    "glvertex2f": 2, "glvertex2i": 2, "glvertex3f": 3, "glvertex3i": 3, "glviewport": 4,
+    "wglchoosepixelformat": 2, "wglcreatecontext": 1, "wgldeletecontext": 1,
+    "wglgetprocaddress": 1, "wglmakecurrent": 2, "wglsetpixelformat": 3, "wglswapbuffers": 1,
+    "wglswaplayerbuffers": 2, "commandlinetoargvw": 2, "beginpaint": 2, "bringwindowtotop": 1,
+    "createwindowexa": 12, "createwindowexw": 12, "defwindowproca": 4, "defwindowprocw": 4,
+    "destroywindow": 1, "dispatchmessagea": 1, "dispatchmessagew": 1, "endpaint": 2,
+    "fillrect": 3, "getactivewindow": 0, "getclientrect": 2, "getdc": 1, "getdcex": 3,
+    "getdesktopwindow": 0, "getdlgitem": 2, "getdlgitemtexta": 4, "getdlgitemtextw": 4,
+    "getfocus": 0, "getforegroundwindow": 0, "getmessagea": 4, "getmessagew": 4,
+    "getsystemmetrics": 1, "getwindowdc": 1, "getwindowtexta": 3, "invalidaterect": 3,
+    "iswindow": 1, "iswindowenabled": 1, "iswindowvisible": 1, "killtimer": 2,
+    "loadcursora": 2, "loadcursorw": 2, "loadicona": 2, "loadiconw": 2, "loadstringa": 4,
+    "loadstringw": 4, "messagebeep": 1, "messageboxa": 4, "messageboxw": 4, "movewindow": 6,
+    "peekmessagea": 5, "peekmessagew": 5, "postmessagea": 4, "postmessagew": 4,
+    "postquitmessage": 1, "registerclassa": 1, "registerclassexa": 1, "registerclassexw": 1,
+    "registerclassw": 1, "releasedc": 2, "sendmessagea": 4, "sendmessagew": 4,
+    "setdlgitemtexta": 3, "setdlgitemtextw": 3, "setfocus": 1, "setforegroundwindow": 1,
+    "settimer": 4, "setwindowpos": 7, "setwindowtexta": 2, "setwindowtextw": 2,
+    "showwindow": 2, "translatemessage": 1, "updatewindow": 1, "timebeginperiod": 1,
+    "timeendperiod": 1, "timegettime": 0, "closesocket": 1, "connect": 3, "gethostname": 2,
+    "htonl": 1, "htons": 1, "inet_addr": 1, "ntohs": 1, "recv": 4, "send": 4, "socket": 3,
+    "wsacleanup": 0, "wsagetlasterror": 0, "wsastartup": 2,
+    "findresourcea": 3, "findresourcew": 3, "findresourceexa": 4, "findresourceexw": 4,
+    "loadresource": 2, "lockresource": 1, "sizeofresource": 2,
+}
+_LEGACY_CDECL = {"wsprintfa", "wsprintfw"}
+
+
+# -- kernel objects ----------------------------------------------------------------
+class _KEvent:
+    def __init__(self, manual, signaled):
+        self.manual, self.signaled = bool(manual), bool(signaled)
+
+
+class _KMutex:
+    def __init__(self):
+        self.owner = 0
+        self.count = 0
+
+
+class _KSemaphore:
+    def __init__(self, count, maximum):
+        self.count, self.maximum = count, maximum
+
+
+class _KFileMapping:
+    def __init__(self, f, size, prot, name):
+        self.f, self.size, self.prot, self.name = f, size, prot, name
+
+
+# Win32 exception codes / constants
+STATUS_ACCESS_VIOLATION = 0xC0000005
+STATUS_ILLEGAL_INSTRUCTION = 0xC000001D
+STATUS_INTEGER_DIVIDE_BY_ZERO = 0xC0000094
+STATUS_INTEGER_OVERFLOW = 0xC0000095
+STATUS_PRIVILEGED_INSTRUCTION = 0xC0000096
+STATUS_BREAKPOINT = 0x80000003
+STATUS_NONCONTINUABLE_EXCEPTION = 0xC0000025
+STATUS_UNWIND = 0xC0000027
+STATUS_STACK_OVERFLOW = 0xC00000FD
+EXCEPTION_NONCONTINUABLE, EXCEPTION_UNWINDING, EXCEPTION_EXIT_UNWIND, \
+    EXCEPTION_TARGET_UNWIND = 0x1, 0x2, 0x4, 0x20
+
+_X64_GPR_CTX = [(RAX, 0x78), (RCX, 0x80), (RDX, 0x88), (RBX, 0x90), (RSP, 0x98),
+                (RBP, 0xA0), (RSI, 0xA8), (RDI, 0xB0), (R8, 0xB8), (R9, 0xC0),
+                (R10, 0xC8), (R11, 0xD0), (R12, 0xD8), (R13, 0xE0), (R14, 0xE8),
+                (R15, 0xF0)]
+_X86_GPR_CTX = [(RDI, 0x9C), (RSI, 0xA0), (RBX, 0xA4), (RDX, 0xA8), (RCX, 0xAC),
+                (RAX, 0xB0), (RBP, 0xB4), (RSP, 0xC4)]
+
+
+def _fault_code(f):
+    """Map an emulator fault to the Win32 exception code and parameters."""
+    msg = str(f).lower()
+    if isinstance(f, NOOMemoryFault) or "unmapped" in msg or "protection fault" in msg:
+        acc = getattr(f, "access", 0)
+        return STATUS_ACCESS_VIOLATION, [acc, (f.addr or 0)]
+    if "divide by zero" in msg:
+        return STATUS_INTEGER_DIVIDE_BY_ZERO, []
+    if "overflow in" in msg or "divide overflow" in msg:
+        return STATUS_INTEGER_OVERFLOW, []
+    if "breakpoint" in msg:
+        return STATUS_BREAKPOINT, [0]
+    if "privileged" in msg:
+        return STATUS_PRIVILEGED_INSTRUCTION, []
+    if "raised exception" in msg:
+        return getattr(f, "code", 0xE0000001), []
+    return STATUS_ILLEGAL_INSTRUCTION, []
+
+
+class _SEH:
+    """Windows exception dispatch for one process.
+
+    Dispatch runs on the guest thread like ntdll's KiUserExceptionDispatcher:
+    every handler call is set up on the guest stack with its return address
+    pointing at an internal thunk; when the handler returns there, the state
+    machine continues. Handlers that never return (MSVC __except, C++
+    landing pads reached through RtlUnwind/RtlUnwindEx) simply abandon the
+    dispatch — exactly like on Windows — so nothing nests on the Python
+    stack and other threads keep running."""
+
+    MAX_NESTED = 24
+
+    def __init__(self, proc):
+        self.p = proc
+        self.vectored = []          # [handler, ...] in call order
+        self.continue_handlers = []
+        self.filter = 0
+        self.ret_thunk = 0
+        self.uw_thunk = 0
+        self.states = {}            # tid -> list of dispatch states (stack)
+
+    # -- thunks ---------------------------------------------------------------------
+    def install_thunks(self):
+        p = self.p
+        def seh_return(cpu):
+            return self._on_handler_return(cpu)
+
+        def unwind_return(cpu):
+            return self._on_unwind_return(cpu)
+
+        seh_return._noo_cc = unwind_return._noo_cc = "cdecl"
+        p.api.table[("!noo!", "seh_return")] = seh_return
+        p.api.table[("!noo!", "unwind_return")] = unwind_return
+        self.ret_thunk = p.api_thunk("!noo!", "seh_return")
+        self.uw_thunk = p.api_thunk("!noo!", "unwind_return")
+
+    # -- CONTEXT marshalling ------------------------------------------------------------
+    def ctx_size(self):
+        return 0x4D0 if self.p.cpu_mode == 64 else 0x2CC
+
+    def write_context(self, cpu, addr, regs=None, eip=None, flags=None):
+        """Serialize a CPU state (or a register dict) into a Win32 CONTEXT."""
+        m = self.p.mem
+        regs = regs if regs is not None else list(cpu.regs)
+        eip = cpu.eip if eip is None else eip
+        fl = cpu.pack_flags() if flags is None else flags
+        if self.p.cpu_mode == 64:
+            buf = bytearray(0x4D0)
+            struct.pack_into("<IIHHHHHHI", buf, 0x30, 0x10001F, cpu.mxcsr, 0x33, 0x2B, 0x2B,
+                             0x53, 0x2B, 0x2B, fl & 0xFFFFFFFF)
+            for r, off in _X64_GPR_CTX:
+                struct.pack_into("<Q", buf, off, regs[r] & M64)
+            struct.pack_into("<Q", buf, 0xF8, eip & M64)
+            struct.pack_into("<HHB", buf, 0x100, cpu.fpu_cw, cpu._fsw(), (~cpu.ftag) & 0xFF)
+            struct.pack_into("<I", buf, 0x118, cpu.mxcsr)
+            for k in range(16):
+                buf[0x1A0 + 16 * k:0x1B0 + 16 * k] = cpu.xmm[k].to_bytes(16, "little")
+            m.write(addr, bytes(buf))
+        else:
+            buf = bytearray(0x2CC)
+            struct.pack_into("<I", buf, 0, 0x1003F)
+            struct.pack_into("<III", buf, 0x1C, cpu.fpu_cw | 0xFFFF0000, cpu._fsw() | 0xFFFF0000,
+                             cpu._ftagword() | 0xFFFF0000)
+            struct.pack_into("<IIII", buf, 0x8C, 0x2B, 0x53, 0x2B, 0x2B)
+            for r, off in _X86_GPR_CTX:
+                struct.pack_into("<I", buf, off, regs[r] & 0xFFFFFFFF)
+            struct.pack_into("<IIII", buf, 0xB8, eip & 0xFFFFFFFF, 0x23, fl & 0xFFFFFFFF,
+                             regs[RSP] & 0xFFFFFFFF)
+            struct.pack_into("<I", buf, 0xC8, 0x2B)
+            struct.pack_into("<I", buf, 0xCC + 24, cpu.mxcsr)
+            for k in range(8):
+                buf[0xCC + 160 + 16 * k:0xCC + 176 + 16 * k] = cpu.xmm[k].to_bytes(16, "little")
+            m.write(addr, bytes(buf))
+
+    def read_context(self, addr):
+        """CONTEXT in guest memory -> (regs list, eip, eflags, xmm list, mxcsr)."""
+        m = self.p.mem
+        regs = [0] * 16
+        if self.p.cpu_mode == 64:
+            buf = m.read(addr, 0x4D0)
+            for r, off in _X64_GPR_CTX:
+                regs[r] = struct.unpack_from("<Q", buf, off)[0]
+            eip = struct.unpack_from("<Q", buf, 0xF8)[0]
+            fl = struct.unpack_from("<I", buf, 0x44)[0]
+            mx = struct.unpack_from("<I", buf, 0x34)[0]
+            xmm = [int.from_bytes(buf[0x1A0 + 16 * k:0x1B0 + 16 * k], "little") for k in range(16)]
+        else:
+            buf = m.read(addr, 0x2CC)
+            for r, off in _X86_GPR_CTX:
+                regs[r] = struct.unpack_from("<I", buf, off)[0]
+            eip = struct.unpack_from("<I", buf, 0xB8)[0]
+            fl = struct.unpack_from("<I", buf, 0xC0)[0]
+            mx = struct.unpack_from("<I", buf, 0xCC + 24)[0] or 0x1F80
+            xmm = [int.from_bytes(buf[0xCC + 160 + 16 * k:0xCC + 176 + 16 * k], "little")
+                   for k in range(8)]
+        return regs, eip, fl, xmm, mx
+
+    def load_context(self, cpu, addr):
+        regs, eip, fl, xmm, mx = self.read_context(addr)
+        n = 16 if self.p.cpu_mode == 64 else 8
+        for i in range(n):
+            cpu.regs[i] = regs[i]
+        cpu.eip = eip
+        cpu.unpack_flags(fl)
+        for i, x in enumerate(xmm):
+            cpu.xmm[i] = x
+        cpu.mxcsr = mx or 0x1F80
+
+    def write_record(self, addr, code, flags, address, params, nested=0):
+        m = self.p.mem
+        params = list(params)[:15]
+        if self.p.cpu_mode == 64:
+            buf = struct.pack("<IIQQI4x", code & 0xFFFFFFFF, flags, nested, address & M64, len(params))
+            buf += b"".join(struct.pack("<Q", v & M64) for v in params)
+            m.write(addr, buf.ljust(0x98, b"\x00"))
+        else:
+            buf = struct.pack("<IIIII", code & 0xFFFFFFFF, flags, nested, address & 0xFFFFFFFF,
+                              len(params))
+            buf += b"".join(struct.pack("<I", v & 0xFFFFFFFF) for v in params)
+            m.write(addr, buf.ljust(0x50, b"\x00"))
+
+    def rec_size(self):
+        return 0x98 if self.p.cpu_mode == 64 else 0x50
+
+    # -- guest call plumbing ------------------------------------------------------------
+    def _call(self, cpu, fn, args, thunk, sp):
+        """Arrange for the thread to call fn(args) and return into `thunk`."""
+        m = self.p.mem
+        if self.p.cpu_mode == 64:
+            n = max(4, len(args))
+            sp = (sp - 8 * n) & ~0xF
+            for i, v in enumerate(args):
+                m.write64(sp + 8 * i, v & M64)
+            for reg, v in zip((RCX, RDX, R8, R9), args[:4]):
+                cpu.regs[reg] = v & M64
+            sp -= 8
+            m.write64(sp, thunk)
+        else:
+            sp &= ~0x3
+            for v in reversed(args):
+                sp -= 4
+                m.write32(sp, v & 0xFFFFFFFF)
+            sp -= 4
+            m.write32(sp, thunk)
+        cpu.regs[RSP] = sp
+        cpu.eip = fn
+        cpu.df = 0
+
+    def _state(self, t):
+        st = self.states.get(t.tid)
+        return st[-1] if st else None
+
+    def _push_state(self, t, s):
+        lst = self.states.setdefault(t.tid, [])
+        # dispatches whose stack region the thread has already left were
+        # abandoned by a handler that never returned (MSVC __except, C++
+        # landing pads): they are over
+        cur = t.cpu.regs[RSP]
+        lst[:] = [x for x in lst if cur < x["sp"]]
+        lst.append(s)
+        if len(self.states[t.tid]) > self.MAX_NESTED:
+            self.p.log.error("exception dispatch nested %d levels deep — terminating (stack "
+                             "overflow / recursive faults)" % self.MAX_NESTED)
+            raise NOOExitProcess(STATUS_STACK_OVERFLOW)
+
+    def _pop_state(self, t, s):
+        st = self.states.get(t.tid)
+        if st and s in st:
+            while st and st[-1] is not s:
+                st.pop()
+            if st:
+                st.pop()
+
+    # -- entry points --------------------------------------------------------------------
+    def dispatch_fault(self, t, f):
+        """A CPU fault on thread t (state: at the faulting instruction)."""
+        code, params = _fault_code(f)
+        if code == STATUS_ILLEGAL_INSTRUCTION and "not implemented" in str(f).lower() or \
+                "unsupported" in str(f).lower():
+            self.p.log.warn("NOO limitation: %s — delivering STATUS_ILLEGAL_INSTRUCTION to the "
+                            "program" % f)
+        addr = f.eip if f.eip is not None else t.cpu.eip
+        t.cpu.eip = addr
+        return self.begin(t, code, 0, addr, params, t.cpu.eip, list(t.cpu.regs),
+                          t.cpu.pack_flags())
+
+    def begin(self, t, code, flags, address, params, eip, regs, eflags):
+        """Start dispatching. The context describes where execution resumes
+        on EXCEPTION_CONTINUE_EXECUTION. Returns True when the thread has been
+        redirected into the dispatcher, False when no handler exists at all."""
+        cpu = t.cpu
+        p = self.p
+        ps = 8 if p.cpu_mode == 64 else 4
+        sp = regs[RSP]
+        base = (sp - 0x100 - self.ctx_size() - self.rec_size() - 0x80) & ~0x3F
+        ctx = base
+        rec = (ctx + self.ctx_size() + 0x3F) & ~0x3F
+        ep = rec + self.rec_size() + 8
+        dctx = ep + 2 * ps + 8
+        try:
+            self.write_context(cpu, ctx, regs, eip, eflags)
+            self.write_record(rec, code, flags, address, params)
+            if ps == 8:
+                p.mem.write64(ep, rec)
+                p.mem.write64(ep + 8, ctx)
+            else:
+                p.mem.write32(ep, rec)
+                p.mem.write32(ep + 4, ctx)
+        except NOOCPUFault:
+            p.log.error("exception 0x%08X: stack unusable for dispatch (esp=%#x) — terminating"
+                        % (code, sp))
+            raise NOOExitProcess(code)
+        s = {"code": code, "rec": rec, "ctx": ctx, "ep": ep, "dctx": dctx, "sp": base - 0x40,
+             "phase": "vectored", "vi": 0, "frame": None, "wctx": None, "filtered": False}
+        self._push_state(t, s)
+        self._next(t, s)
+        return True
+
+    # -- the state machine -----------------------------------------------------------------
+    def _next(self, t, s):
+        """Advance dispatch until a guest handler must be called (thread set
+        up to call it) or dispatch completes (context restored / terminate)."""
+        p = self.p
+        cpu = t.cpu
+        while True:
+            ph = s["phase"]
+            if ph == "vectored":
+                if s["vi"] < len(self.vectored):
+                    h = self.vectored[s["vi"]]
+                    s["vi"] += 1
+                    s["await"] = "vectored"
+                    self._call(cpu, h, [s["ep"]], self.ret_thunk, s["sp"])
+                    return
+                s["phase"] = "frames"
+                continue
+            if ph == "frames":
+                if p.cpu_mode == 64:
+                    if self._next_frame64(t, s):
+                        return
+                else:
+                    if self._next_frame32(t, s):
+                        return
+                s["phase"] = "filter"
+                continue
+            if ph == "filter":
+                s["phase"] = "default"
+                if self.filter and not s["filtered"]:
+                    s["filtered"] = True
+                    s["await"] = "filter"
+                    self._call(cpu, self.filter, [s["ep"]], self.ret_thunk, s["sp"])
+                    return
+                continue
+            if ph == "default":
+                self._pop_state(t, s)
+                self.p.log.error("unhandled exception 0x%08X at %#x — process terminated"
+                                 % (s["code"], self._rec_address(s["rec"])))
+                try:
+                    regs, eip, fl, xmm, mx = self.read_context(s["ctx"])
+                    names = ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"] if p.cpu_mode == 32 else \
+                        ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10",
+                         "r11", "r12", "r13", "r14", "r15"]
+                    self.p.log.error("context: " + " ".join("%s=%x" % (nm, regs[i]) for i, nm in enumerate(names))
+                                     + " eip=%x" % eip)
+                except Exception:
+                    pass
+                raise NOOExitProcess(s["code"])
+            raise NOOError("bad SEH state")
+
+    def _rec_address(self, rec):
+        m = self.p.mem
+        return m.read64(rec + 0x10) if self.p.cpu_mode == 64 else m.read32(rec + 0x0C)
+
+    def _continue_execution(self, t, s):
+        self._pop_state(t, s)
+        self.load_context(t.cpu, s["ctx"])
+        raise NOOContextSet()
+
+    # x86: fs:[0] frame chain --------------------------------------------------------------
+    def _next_frame32(self, t, s):
+        p = self.p
+        m = p.mem
+        cpu = t.cpu
+        if s["frame"] is None:
+            s["frame"] = m.read32(t.teb)
+        frame = s["frame"]
+        lo, hi = t.stack_base, t.stack_base + t.stack_size
+        while frame not in (0xFFFFFFFF, 0):
+            if not (lo <= frame < hi):
+                p.log.warn("SEH frame %#x outside the thread's stack — chain walk stopped" % frame)
+                return False
+            try:
+                nxt = m.read32(frame)
+                handler = m.read32(frame + 4)
+            except NOOCPUFault:
+                return False
+            s["frame"] = nxt
+            s["cur_frame"] = frame
+            if handler:
+                s["await"] = "frame"
+                # EXCEPTION_DISPOSITION __cdecl h(rec, frame, ctx, dispatcher)
+                self._call(cpu, handler, [s["rec"], frame, s["ctx"], s["dctx"]], self.ret_thunk, s["sp"])
+                return True
+            frame = nxt
+        return False
+
+    def _thunk_frame(self, t, cur, w):
+        """The walk reached one of our dispatcher thunks (a fault or an unwind
+        started inside a handler): continue from the context the enclosing
+        dispatch was started for, like ntdll's dispatcher frames do."""
+        if w["rip"] not in (self.ret_thunk, self.uw_thunk) or not w["rip"]:
+            return False
+        lst = self.states.get(t.tid, [])
+        idx = len(lst)
+        for i, x in enumerate(lst):
+            if x is cur:
+                idx = i
+                break
+        for x in reversed(lst[:idx]):
+            if x.get("ctx"):
+                regs, eip, fl, xmm, mx = self.read_context(x["ctx"])
+                w["regs"][:] = regs
+                w["rip"] = eip
+                return True
+        return False
+
+    # x64: table-based -----------------------------------------------------------------------
+    def _next_frame64(self, t, s):
+        p = self.p
+        cpu = t.cpu
+        if s["wctx"] is None:
+            regs, eip, fl, xmm, mx = self.read_context(s["ctx"])
+            s["wctx"] = {"regs": regs, "rip": eip}
+            s["depth"] = 0
+        w = s["wctx"]
+        lo, hi = t.stack_base, t.stack_base + t.stack_size
+        while s["depth"] < 256:
+            s["depth"] += 1
+            if self._thunk_frame(t, s, w):
+                continue
+            rip = w["rip"]
+            if not rip:
+                return False
+            fe = p.unwinder.lookup(rip)
+            if fe is None:                          # leaf: return address on top of stack
+                sp = w["regs"][RSP]
+                if not (lo <= sp < hi):
+                    return False
+                try:
+                    w["rip"] = p.mem.read64(sp)
+                except NOOCPUFault:
+                    return False
+                w["regs"][RSP] = sp + 8
+                continue
+            image_base, entry_addr, begin = fe
+            ctrl_pc = rip
+            handler, hdata, establisher = p.unwinder.virtual_unwind(1, image_base, rip, entry_addr, w)
+            if not (lo <= establisher <= hi + 0x10000):
+                return False
+            if handler:
+                dc = s["dctx"]
+                m = p.mem
+                m.write(dc, struct.pack("<QQQQQQQQQII", ctrl_pc, image_base, entry_addr, establisher,
+                                        0, s["ctx"], handler, hdata, 0, 0, 0))
+                s["await"] = "frame"
+                s["cur_frame"] = establisher
+                self._call(cpu, handler, [s["rec"], establisher, s["ctx"], dc], self.ret_thunk, s["sp"])
+                return True
+        return False
+
+    # -- handler returned into the thunk --------------------------------------------------
+    def _on_handler_return(self, cpu):
+        p = self.p
+        t = p.current_thread
+        s = self._state(t)
+        if s is None:
+            raise NOOError("SEH return thunk reached with no active dispatch")
+        r = cpu.regs[RAX] & 0xFFFFFFFF
+        kind = s.get("await")
+        if kind == "vectored" or kind == "filter":
+            if r == 0xFFFFFFFF:                     # EXCEPTION_CONTINUE_EXECUTION
+                self._continue_execution(t, s)
+            if kind == "filter" and r == 1:         # EXCEPTION_EXECUTE_HANDLER -> terminate
+                self._pop_state(t, s)
+                p.log.info("unhandled-exception filter chose EXCEPTION_EXECUTE_HANDLER: "
+                           "process exits with 0x%08X" % s["code"])
+                raise NOOExitProcess(s["code"])
+        elif kind == "frame":
+            if r == 0:                              # ExceptionContinueExecution
+                flags = p.mem.read32(s["rec"] + 4)
+                if flags & EXCEPTION_NONCONTINUABLE:
+                    self._pop_state(t, s)
+                    return self.begin_nested_noncontinuable(t, s)
+                self._continue_execution(t, s)
+            # 1 = ContinueSearch, 2 = NestedException, 3 = Collided: keep searching
+        self._next(t, s)
+        raise NOOContextSet()
+
+    def begin_nested_noncontinuable(self, t, s):
+        cpu = t.cpu
+        regs, eip, fl, xmm, mx = self.read_context(s["ctx"])
+        self.begin(t, STATUS_NONCONTINUABLE_EXCEPTION, EXCEPTION_NONCONTINUABLE, eip, [],
+                   eip, regs, fl)
+        raise NOOContextSet()
+
+    # -- RaiseException ------------------------------------------------------------------
+    def raise_exception(self, cpu, code, flags, params):
+        """RaiseException(): the context is the caller's, resuming after the call."""
+        t = self.p.current_thread
+        regs = list(cpu.regs)
+        sp = regs[RSP]
+        if self.p.cpu_mode == 64:
+            ret = self.p.mem.read64(sp)
+            regs[RSP] = sp + 8
+        else:
+            ret = self.p.mem.read32(sp)
+            regs[RSP] = sp + 4 + 16                # stdcall: 4 arguments
+        self.begin(t, code, flags & EXCEPTION_NONCONTINUABLE, ret, params, ret, regs,
+                   cpu.pack_flags())
+        raise NOOContextSet()
+
+    # -- x86 RtlUnwind ---------------------------------------------------------------------
+    def rtl_unwind32(self, cpu, target_frame, target_ip, rec_ptr, retval):
+        p = self.p
+        t = p.current_thread
+        m = p.mem
+        sp = cpu.regs[RSP]
+        ret = m.read32(sp)
+        resume_sp = sp + 4 + 16
+        base = (sp - 0x100 - 0x2CC - 0x60) & ~0x3F
+        ctx = base
+        rec = ctx + 0x300
+        regs = list(cpu.regs)
+        regs[RSP] = resume_sp
+        self.write_context(cpu, ctx, regs, ret)
+        if rec_ptr:
+            data = bytearray(m.read(rec_ptr, 0x50))
+            flags = struct.unpack_from("<I", data, 4)[0] | EXCEPTION_UNWINDING
+            if not target_frame:
+                flags |= EXCEPTION_EXIT_UNWIND
+            struct.pack_into("<I", data, 4, flags)
+            m.write(rec, bytes(data))
+        else:
+            self.write_record(rec, STATUS_UNWIND, EXCEPTION_UNWINDING |
+                              (0 if target_frame else EXCEPTION_EXIT_UNWIND), ret, [])
+        u = {"kind": "u32", "target": target_frame, "target_ip": target_ip or ret,
+             "retval": retval, "ctx": ctx, "rec": rec, "sp": base - 0x40, "resume_sp": resume_sp,
+             "dctx": rec + 0x60}
+        self._push_state(t, u)
+        self._unwind32_next(t, u)
+        raise NOOContextSet()
+
+    def _unwind32_next(self, t, u):
+        m = self.p.mem
+        cpu = t.cpu
+        frame = m.read32(t.teb)
+        if frame not in (0xFFFFFFFF, 0) and frame != u["target"]:
+            handler = m.read32(frame + 4)
+            nxt = m.read32(frame)
+            m.write32(t.teb, nxt)                   # unlink before calling (like ntdll)
+            if handler:
+                u["await"] = "unwind"
+                self._call(cpu, handler, [u["rec"], frame, u["ctx"], u["dctx"]], self.uw_thunk, u["sp"])
+                return
+            return self._unwind32_next(t, u)
+        # finished: continue at the target with EAX = return value
+        self._pop_state(t, u)
+        self.load_context(cpu, u["ctx"])
+        cpu.eip = u["target_ip"]
+        cpu.regs[RAX] = u["retval"] & 0xFFFFFFFF
+
+    def _on_unwind_return(self, cpu):
+        p = self.p
+        t = p.current_thread
+        u = self._state(t)
+        if u is None:
+            raise NOOError("unwind return thunk reached with no active unwind")
+        if u["kind"] == "u32":
+            self._unwind32_next(t, u)
+        else:
+            self._unwind64_next(t, u)
+        raise NOOContextSet()
+
+    # -- x64 RtlUnwindEx ---------------------------------------------------------------------
+    def rtl_unwind64(self, cpu, target_frame, target_ip, rec_ptr, retval, orig_ctx):
+        p = self.p
+        t = p.current_thread
+        m = p.mem
+        sp = cpu.regs[RSP]
+        ret = m.read64(sp)
+        regs = list(cpu.regs)
+        regs[RSP] = sp + 8
+        base = (sp - 0x200 - 2 * 0x4D0 - 0x200) & ~0x3F
+        ctx = base                                  # context handed to handlers
+        rec = ctx + 0x500
+        dctx = rec + 0xA0
+        if rec_ptr:
+            data = bytearray(m.read(rec_ptr, 0x98))
+        else:
+            data = bytearray(0x98)
+            struct.pack_into("<IIQQ", data, 0, STATUS_UNWIND, 0, 0, ret)
+        flags = struct.unpack_from("<I", data, 4)[0] | EXCEPTION_UNWINDING
+        if not target_frame:
+            flags |= EXCEPTION_EXIT_UNWIND
+        struct.pack_into("<I", data, 4, flags)
+        m.write(rec, bytes(data))
+        u = {"kind": "u64", "target": target_frame, "target_ip": target_ip, "retval": retval,
+             "ctx": ctx, "rec": rec, "dctx": dctx, "sp": base - 0x80,
+             "w": {"regs": regs, "rip": ret}, "depth": 0}
+        self._push_state(t, u)
+        self._unwind64_next(t, u)
+        raise NOOContextSet()
+
+    def _unwind64_next(self, t, u):
+        p = self.p
+        m = p.mem
+        cpu = t.cpu
+        if u.get("finish") is not None:
+            return self._unwind64_finish(t, u)
+        w = u["w"]
+        lo, hi = t.stack_base, t.stack_base + t.stack_size
+        while u["depth"] < 512:
+            u["depth"] += 1
+            if self._thunk_frame(t, u, w):
+                continue
+            rip = w["rip"]
+            fe = p.unwinder.lookup(rip) if rip else None
+            if fe is None:
+                sp = w["regs"][RSP]
+                if not rip or not (lo <= sp < hi):
+                    break
+                w["rip"] = m.read64(sp)
+                w["regs"][RSP] = sp + 8
+                continue
+            image_base, entry_addr, begin = fe
+            before = {"regs": list(w["regs"]), "rip": rip}
+            handler, hdata, establisher = p.unwinder.virtual_unwind(2, image_base, rip, entry_addr, w)
+            is_target = establisher == u["target"]
+            if is_target:
+                m.write32(u["rec"] + 4, m.read32(u["rec"] + 4) | EXCEPTION_TARGET_UNWIND)
+            if handler:
+                self.write_context(cpu, u["ctx"], before["regs"], before["rip"])
+                m.write(u["dctx"], struct.pack("<QQQQQQQQQII", rip, image_base, entry_addr,
+                                               establisher, u["target_ip"], u["ctx"], handler,
+                                               hdata, 0, 0, 0))
+                if is_target:
+                    u["finish"] = "ctx"             # the handler may edit the target context
+                u["await"] = "unwind"
+                self._call(cpu, handler, [u["rec"], establisher, u["ctx"], u["dctx"]],
+                           self.uw_thunk, u["sp"])
+                return
+            if is_target:
+                u["finish"] = before
+                return self._unwind64_finish(t, u)
+            if not (lo <= w["regs"][RSP] <= hi):
+                break
+        self._pop_state(t, u)
+        p.log.error("RtlUnwindEx: target frame %#x not found — terminating" % u["target"])
+        raise NOOExitProcess(STATUS_UNWIND)
+
+    def _unwind64_finish(self, t, u):
+        cpu = t.cpu
+        fin = u["finish"]
+        self._pop_state(t, u)
+        if fin == "ctx":
+            regs, eip, fl, xmm, mx = self.read_context(u["ctx"])
+        else:
+            regs = fin["regs"]
+        for i in range(16):
+            cpu.regs[i] = regs[i] & M64
+        cpu.eip = u["target_ip"]
+        cpu.regs[RAX] = u["retval"] & M64
+
+
+class _Unwinder:
+    """x64 .pdata / UNWIND_INFO interpretation (RtlLookupFunctionEntry /
+    RtlVirtualUnwind) over every loaded image plus dynamic tables."""
+
+    def __init__(self, proc):
+        self.p = proc
+        self.dynamic = []            # (base, table_addr, count)
+
+    def _images(self):
+        p = self.p
+        mods = getattr(p, "modules", None)
+        out = []
+        if mods is not None:
+            for base, mod in list(getattr(mods, "by_handle", {}).items()):
+                pe = getattr(mod, "pe", None)
+                if pe is not None:
+                    out.append((base, pe))
+        return out
+
+    def lookup(self, rip):
+        """-> (image_base, runtime_function_addr, begin_rva) or None."""
+        m = self.p.mem
+        for base, pe in self._images():
+            size = pe.size_of_image
+            if not (base <= rip < base + size):
+                continue
+            rva_d, sz = pe.directories[DIR_EXCEPTION]
+            if not rva_d or not sz:
+                return None
+            rel = rip - base
+            n = sz // 12
+            lo, hi = 0, n - 1
+            tbl = base + rva_d
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                b, e = struct.unpack("<II", m.read(tbl + 12 * mid, 8))
+                if rel < b:
+                    hi = mid - 1
+                elif rel >= e:
+                    lo = mid + 1
+                else:
+                    return base, tbl + 12 * mid, b
+            return None
+        for base, tbl, count in self.dynamic:
+            for k in range(count):
+                b, e = struct.unpack("<II", m.read(tbl + 12 * k, 8))
+                if base + b <= rip < base + e:
+                    return base, tbl + 12 * k, b
+        return None
+
+    def virtual_unwind(self, want, image_base, rip, rf_addr, w):
+        """Unwind one frame of the working context w (dict with 'regs' list
+        and 'rip'). Returns (handler, handler_data, establisher_frame).
+        `want`: 1 = UNW_FLAG_EHANDLER, 2 = UNW_FLAG_UHANDLER."""
+        m = self.p.mem
+        regs = w["regs"]
+        begin, end, uw_rva = struct.unpack("<III", m.read(rf_addr, 12))
+        # the low bit of the unwind RVA marks an indirect (chained) entry
+        while uw_rva & 1:
+            begin, end, uw_rva = struct.unpack("<III", m.read(image_base + (uw_rva & ~1), 12))
+        uw = image_base + uw_rva
+        ver_flags, prolog_size, count, fr = struct.unpack("<BBBB", m.read(uw, 4))
+        flags = ver_flags >> 3
+        frame_reg, frame_off = fr & 0xF, (fr >> 4) & 0xF
+        offset_in_func = rip - (image_base + begin)
+        # establisher frame
+        if frame_reg:
+            establisher = (regs[frame_reg] - frame_off * 16) & M64
+        else:
+            establisher = regs[RSP]
+        # epilogue detection: if rip sits in an epilogue, emulate it instead
+        if self._in_epilogue(rip, regs, w):
+            return 0, 0, establisher
+        handler = hdata = 0
+        info = uw
+        first = True
+        while True:
+            ver_flags, prolog_size, count, fr = struct.unpack("<BBBB", m.read(info, 4))
+            flags = ver_flags >> 3
+            fr_reg, fr_off = fr & 0xF, (fr >> 4) & 0xF
+            codes = m.read(info + 4, 2 * count)
+            i = 0
+            while i < count:
+                off, opinfo = codes[2 * i], codes[2 * i + 1]
+                op, oi = opinfo & 0xF, opinfo >> 4
+                nslots = {0: 1, 1: 2 if oi == 0 else 3, 2: 1, 3: 1, 4: 2, 5: 3, 8: 2, 9: 3, 10: 1}.get(op, 1)
+                if first and off > offset_in_func:
+                    i += nslots                     # prologue op not yet executed
+                    continue
+                if op == 0:                         # UWOP_PUSH_NONVOL
+                    regs[oi] = m.read64(regs[RSP])
+                    regs[RSP] += 8
+                elif op == 1:                       # UWOP_ALLOC_LARGE
+                    if oi == 0:
+                        regs[RSP] += struct.unpack_from("<H", codes, 2 * i + 2)[0] * 8
+                    else:
+                        regs[RSP] += struct.unpack_from("<I", codes, 2 * i + 2)[0]
+                elif op == 2:                       # UWOP_ALLOC_SMALL
+                    regs[RSP] += oi * 8 + 8
+                elif op == 3:                       # UWOP_SET_FPREG
+                    regs[RSP] = (regs[fr_reg] - fr_off * 16) & M64
+                elif op == 4:                       # UWOP_SAVE_NONVOL
+                    o = struct.unpack_from("<H", codes, 2 * i + 2)[0] * 8
+                    regs[oi] = m.read64(regs[RSP] + o) if False else m.read64(self._frame_base(regs, fr_reg, fr_off, w, establisher) + o)
+                elif op == 5:                       # UWOP_SAVE_NONVOL_FAR
+                    o = struct.unpack_from("<I", codes, 2 * i + 2)[0]
+                    regs[oi] = m.read64(self._frame_base(regs, fr_reg, fr_off, w, establisher) + o)
+                elif op == 10:                      # UWOP_PUSH_MACHFRAME
+                    base_sp = regs[RSP] + (8 if oi else 0)
+                    w["rip"] = m.read64(base_sp)
+                    regs[RSP] = m.read64(base_sp + 24)
+                    w["machframe"] = True
+                i += nslots
+            if flags & 4:                           # UNW_FLAG_CHAININFO
+                k = (count + 1) & ~1
+                cb, ce, cu = struct.unpack("<III", m.read(info + 4 + 2 * k, 12))
+                info = image_base + cu
+                first = False
+                continue
+            if first and flags & 3 & want:
+                k = (count + 1) & ~1
+                handler = image_base + m.read32(uw + 4 + 2 * k)
+                hdata = uw + 4 + 2 * k + 4
+            break
+        if w.pop("machframe", False):
+            return handler, hdata, establisher
+        w["rip"] = m.read64(regs[RSP])
+        regs[RSP] += 8
+        return handler, hdata, establisher
+
+    def _frame_base(self, regs, fr_reg, fr_off, w, establisher):
+        # save-nonvol offsets are relative to the stack pointer after the
+        # fixed allocation, i.e. the establisher frame for frameless code
+        # (for frame-pointer functions, the RSP value before SET_FPREG undo
+        # is the same as the establisher frame)
+        return establisher
+
+    def _in_epilogue(self, rip, regs, w):
+        """Recognise `add rsp,imm / lea rsp,[..] ; pop reg* ; ret` at rip and
+        emulate it (Windows does the same instead of undoing the prologue)."""
+        m = self.p.mem
+        try:
+            code = m.read(rip, 32)
+        except NOOCPUFault:
+            return False
+        i = 0
+        sp = regs[RSP]
+        new = list(regs)
+        if code[i:i + 3] == b"\x48\x83\xC4":
+            sp += code[i + 3]
+            i += 4
+        elif code[i:i + 3] == b"\x48\x81\xC4":
+            sp += struct.unpack_from("<I", code, i + 3)[0]
+            i += 7
+        elif code[i:i + 3] == b"\x48\x8D\x65" or code[i:i + 3] == b"\x48\x8D\xA5":
+            return False
+        pops = []
+        while i < len(code):
+            b = code[i]
+            if 0x58 <= b <= 0x5F:
+                pops.append(b - 0x58)
+                i += 1
+            elif b == 0x41 and i + 1 < len(code) and 0x58 <= code[i + 1] <= 0x5F:
+                pops.append(8 + code[i + 1] - 0x58)
+                i += 2
+            else:
+                break
+        if i < len(code) and code[i] in (0xC3, 0xC2) or \
+                (code[i:i + 2] == b"\xF3\xC3"):
+            if i == 0 and code[0] != 0xC3:
+                return False
+            for r in pops:
+                new[r] = m.read64(sp)
+                sp += 8
+            w["rip"] = m.read64(sp)
+            new[RSP] = sp + 8
+            regs[:] = new
+            return True
+        return False
+
+
+# ==============================================================================
+# 10d. kernel32 / kernelbase / ntdll (Win32 base API)
+# ==============================================================================
+
+
+_K32_DLLS = ("kernel32.dll", "kernelbase.dll")
+INFINITE = 0xFFFFFFFF
+WAIT_OBJECT_0, WAIT_TIMEOUT, WAIT_FAILED, WAIT_ABANDONED = 0, 0x102, 0xFFFFFFFF, 0x80
+ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE = 2, 3, 5, 6
+ERROR_NOT_ENOUGH_MEMORY, ERROR_INVALID_PARAMETER, ERROR_INSUFFICIENT_BUFFER = 8, 87, 122
+ERROR_NO_MORE_FILES, ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS, ERROR_ENVVAR_NOT_FOUND = 18, 80, 183, 203
+ERROR_DIR_NOT_EMPTY, ERROR_MOD_NOT_FOUND, ERROR_PROC_NOT_FOUND, ERROR_NOT_SUPPORTED = 145, 126, 127, 50
+ERROR_HANDLE_EOF, ERROR_NO_UNICODE_TRANSLATION, ERROR_SHARING_VIOLATION = 38, 1113, 32
+ERROR_NOT_OWNER, ERROR_TOO_MANY_POSTS = 288, 298
+_EPOCH_DIFF = 11644473600          # seconds between 1601-01-01 and 1970-01-01
+
+_SYS_ERRORS = {
+    0: "The operation completed successfully.",
+    1: "Incorrect function.", 2: "The system cannot find the file specified.",
+    3: "The system cannot find the path specified.", 4: "The system cannot open the file.",
+    5: "Access is denied.", 6: "The handle is invalid.",
+    8: "Not enough memory resources are available to process this command.",
+    13: "The data is invalid.", 18: "There are no more files.",
+    32: "The process cannot access the file because it is being used by another process.",
+    38: "Reached the end of the file.", 50: "The request is not supported.",
+    80: "The file exists.", 87: "The parameter is incorrect.",
+    122: "The data area passed to a system call is too small.",
+    123: "The filename, directory name, or volume label syntax is incorrect.",
+    126: "The specified module could not be found.", 127: "The specified procedure could not be found.",
+    145: "The directory is not empty.", 183: "Cannot create a file when that file already exists.",
+    203: "The system could not find the environment option that was entered.",
+    258: "The wait operation timed out.", 997: "Overlapped I/O operation is in progress.",
+    1113: "No mapping for the Unicode character exists in the target multi-byte code page.",
+}
+
+
+def _ft_from_unix(t):
+    return int((t + _EPOCH_DIFF) * 10_000_000)
+
+
+def _unix_from_ft(ft):
+    return ft / 10_000_000 - _EPOCH_DIFF
+
+
+class _K32:
+    """kernel32 / kernelbase (+ the ntdll pieces programs call directly)."""
+
+    def __init__(self, api):
+        self.api = api
+        self.p = api.p
+        self.live = getattr(self.p, "handles", None) is not None and \
+            getattr(self.p, "mem", None) is not None
+        self.cs = {}                 # CRITICAL_SECTION addr -> [owner_tid, recursion]
+        self.srw = {}                # SRWLOCK addr -> [writer_tid, readers]
+        self.cv = {}                 # CONDITION_VARIABLE addr -> set of woken tids
+        self.fls = {}
+        self.find = {}
+        self.atoms = {}
+        self.console_mode = {}
+        self.console_attr = 7
+        self.console_title = ""
+        self.cursor = [0, 0]
+        self.file_meta = {}          # handle -> dict(path, append, access)
+
+    # ------------------------------------------------------------------------
+    def reg(self, names, sig="", ret="i", dlls=_K32_DLLS, cc="stdcall"):
+        if isinstance(names, str):
+            names = names.split()
+        slots = 0
+        for ch in sig:
+            if ch == ".":
+                cc = "cdecl"
+                break
+            slots += 2 if ch in "qQd" else 1
+
+        def deco(fn):
+            def handler(cpu, _fn=fn, _sig=sig, _ret=ret):
+                a = _CallArgs(cpu)
+                vals = []
+                for ch in _sig:
+                    if ch in "pz":
+                        vals.append(a.int())
+                    elif ch == "u":
+                        vals.append(a.i32())
+                    elif ch == "i":
+                        vals.append(_s32(a.i32()))
+                    elif ch == "q":
+                        vals.append(_s64(a.i64()))
+                    elif ch == "Q":
+                        vals.append(a.i64() & M64)
+                    elif ch == "d":
+                        vals.append(a.dbl())
+                    elif ch == "f":
+                        vals.append(a.flt())
+                    elif ch == ".":
+                        vals.append(_VarArgs(cpu, a.pos))
+                        break
+                r = _fn(cpu, *vals)
+                if _ret == "q":
+                    return _ret_i64(cpu, 0 if r is None else r)
+                if _ret == "d":
+                    return _ret_double(cpu, r or 0.0)
+                if _ret == "v":
+                    return None
+                return 0 if r is None else int(r)
+            handler._noo_cc = cc
+            handler._noo_slots = slots
+            handler.__name__ = "k32_" + names[0]
+            for d in dlls:
+                for n in names:
+                    self.api.table[(d, n.lower())] = handler
+            return fn
+        return deco
+
+    # -- helpers -----------------------------------------------------------------
+    def err(self, e):
+        self.p.last_error = e
+        return 0
+
+    def cs_(self, a):
+        return self.p.mem.read_cstring(a, 1 << 30).decode("utf-8", "replace") if a else ""
+
+    def ws_(self, a):
+        return self.p.mem.read_wstring(a, 1 << 29).decode("utf-16-le", "replace") if a else ""
+
+    def s(self, a, wide):
+        return self.ws_(a) if wide else self.cs_(a)
+
+    def put(self, buf, n, text, wide, count_nul_on_fail=True):
+        """Copy text into a caller buffer of n chars (Win32 convention):
+        returns chars written (without NUL) or the required size incl. NUL."""
+        data = text.encode("utf-16-le") if wide else text.encode("utf-8", "replace")
+        units = len(data) // 2 if wide else len(data)
+        if not buf or n <= units:
+            return units + 1
+        self.p.mem.write(buf, data + (b"\x00\x00" if wide else b"\x00"))
+        return units
+
+    def wptr(self, a, v):
+        if self.p.cpu_mode == 64:
+            self.p.mem.write64(a, v)
+        else:
+            self.p.mem.write32(a, v)
+
+    def ptr_size(self):
+        return 8 if self.p.cpu_mode == 64 else 4
+
+    def host_path(self, path, for_write=False):
+        return self.p.vfs.resolve(path, for_write=for_write)
+
+    # -- waits ---------------------------------------------------------------------
+    def _ready(self, h, tid, take):
+        p = self.p
+        if h in (0xFFFFFFFF, M64, 0xFFFFFFFFFFFFFFFF):      # current process
+            return False
+        kind = p.handles.kind(h)
+        obj = p.handles.get(h)
+        if kind == "thread":
+            return obj.state == "dead"
+        if kind == "kevent":
+            if obj.signaled:
+                if take and not obj.manual:
+                    obj.signaled = False
+                return True
+            return False
+        if kind == "kmutex":
+            if obj.owner in (0, tid):
+                if take:
+                    obj.owner = tid
+                    obj.count += 1
+                return True
+            return False
+        if kind == "ksem":
+            if obj.count > 0:
+                if take:
+                    obj.count -= 1
+                return True
+            return False
+        if kind == "event":                     # legacy dict-based events
+            if obj["signaled"]:
+                if take and not obj.get("manual"):
+                    obj["signaled"] = False
+                return True
+            return False
+        if kind == "mutex":
+            if not obj["owned"] or obj.get("owner_tid") == tid:
+                if take:
+                    obj["owned"] = True
+                    obj["owner_tid"] = tid
+                return True
+            return False
+        if kind == "process":
+            return obj.get("exited", True)
+        return True if kind is not None else None
+
+    def _try_wait(self, handles, wait_all, tid):
+        if wait_all:
+            for h in handles:
+                if not self._ready(h, tid, False):
+                    return None
+            for h in handles:
+                self._ready(h, tid, True)
+            return WAIT_OBJECT_0
+        for i, h in enumerate(handles):
+            if self._ready(h, tid, True):
+                return WAIT_OBJECT_0 + i
+        return None
+
+    def wait(self, cpu, handles, wait_all, timeout):
+        p = self.p
+        t = p.current_thread
+        for h in handles:
+            if p.handles.kind(h) is None and h not in (0xFFFFFFFF, M64):
+                p.last_error = ERROR_INVALID_HANDLE
+                return WAIT_FAILED
+        r = self._try_wait(handles, wait_all, t.tid)
+        if r is not None:
+            return r
+        if timeout == 0:
+            return WAIT_TIMEOUT
+        deadline = None if timeout == INFINITE else time.monotonic() + timeout / 1000.0
+        t.state = "blocked"
+        t.waiting_on = ("kwait", list(handles), wait_all, deadline)
+        cpu.regs[RAX] = WAIT_TIMEOUT
+        raise NOOYield()
+
+    def block(self, cpu, what, deadline=None, rax=0):
+        t = self.p.current_thread
+        t.state = "blocked"
+        t.waiting_on = (what[0],) + tuple(what[1:]) + (deadline,)
+        cpu.regs[RAX] = rax
+        raise NOOYield()
+
+    def wake_check(self, t):
+        """Scheduler hook for the wait kinds implemented here. Returns
+        True/False, or None when the kind is not ours."""
+        w = t.waiting_on
+        kind = w[0]
+        now = time.monotonic()
+        if kind == "kwait":
+            _k, handles, wait_all, deadline = w
+            r = self._try_wait(handles, wait_all, t.tid)
+            if r is not None:
+                t.cpu.regs[RAX] = r
+                return True
+            if deadline is not None and now >= deadline:
+                t.cpu.regs[RAX] = WAIT_TIMEOUT
+                return True
+            return False
+        if kind == "sleep":
+            return now >= w[1]
+        if kind == "pipe":
+            _k, pipe, buf, n, pread, deadline = w
+            if not pipe.buf and pipe.writers > 0:
+                return False
+            if not pipe.buf:
+                self.p.last_error = 109             # ERROR_BROKEN_PIPE
+                t.cpu.regs[RAX] = 0
+                return True
+            data = self.wait_pipe(pipe, buf, n)
+            if pread:
+                self.p.mem.write32(pread, len(data))
+            t.cpu.regs[RAX] = 1
+            return True
+        if kind == "cs":
+            _k, addr, deadline = w
+            st = self.cs.setdefault(addr, [0, 0])
+            if st[0] in (0, t.tid):
+                st[0] = t.tid
+                st[1] += 1
+                self._cs_fields(addr, st)
+                return True
+            return False
+        if kind == "srw":
+            _k, addr, excl, deadline = w
+            st = self.srw.setdefault(addr, [0, 0])
+            if excl and st[0] == 0 and st[1] == 0:
+                st[0] = t.tid
+                return True
+            if not excl and st[0] == 0:
+                st[1] += 1
+                return True
+            return False
+        if kind == "cv":
+            _k, cvaddr, lock, lkind, excl, deadline = w
+            woken = t.tid in self.cv.get(cvaddr, set())
+            timed_out = deadline is not None and now >= deadline
+            if not (woken or timed_out):
+                return False
+            # re-acquire the lock before returning
+            if lkind == "cs":
+                st = self.cs.setdefault(lock, [0, 0])
+                if st[0] not in (0, t.tid):
+                    return False
+                st[0] = t.tid
+                st[1] = t.cv_saved_count if hasattr(t, "cv_saved_count") else 1
+                self._cs_fields(lock, st)
+            else:
+                st = self.srw.setdefault(lock, [0, 0])
+                if excl:
+                    if st[0] or st[1]:
+                        return False
+                    st[0] = t.tid
+                else:
+                    if st[0]:
+                        return False
+                    st[1] += 1
+            self.cv.get(cvaddr, set()).discard(t.tid)
+            t.cpu.regs[RAX] = 1 if woken else 0
+            if not woken:
+                self.p.last_error = 1460          # ERROR_TIMEOUT
+            return True
+        return None
+
+    def _cs_fields(self, addr, st):
+        """Mirror the owner into the guest CRITICAL_SECTION (some code peeks)."""
+        m = self.p.mem
+        try:
+            if self.p.cpu_mode == 64:
+                m.write32(addr + 8, (st[1] - 1) & 0xFFFFFFFF if st[1] else 0xFFFFFFFF)
+                m.write32(addr + 12, st[1])
+                m.write64(addr + 16, st[0])
+            else:
+                m.write32(addr + 4, (st[1] - 1) & 0xFFFFFFFF if st[1] else 0xFFFFFFFF)
+                m.write32(addr + 8, st[1])
+                m.write32(addr + 12, st[0])
+        except NOOCPUFault:
+            pass
+
+
+def _k32_install(k):
+    R = k.reg
+    p = k.p
+    api = k.api
+    NT = ("ntdll.dll",)
+
+    # =====================================================================
+    # errors / process / module information
+    # =====================================================================
+    @R("GetLastError", "")
+    def _gle(c):
+        return p.last_error
+
+    @R("SetLastError RestoreLastError", "u", "v")
+    def _sle(c, e):
+        p.last_error = e
+
+    @R("RtlGetLastWin32Error", "", "u", NT)
+    def _rgle(c):
+        return p.last_error
+
+    @R("RtlSetLastWin32Error", "u", "v", NT)
+    def _rsle(c, e):
+        p.last_error = e
+
+    @R("SetErrorMode SetThreadErrorMode", "u")
+    def _sem(c, m):
+        old = getattr(k, "errmode", 0)
+        k.errmode = m
+        return old
+
+    @R("GetErrorMode GetThreadErrorMode", "")
+    def _gem(c):
+        return getattr(k, "errmode", 0)
+
+    @R("ExitProcess FatalExit", "u", "v")
+    def _exitproc(c, code):
+        raise NOOExitProcess(code)
+
+    @R("TerminateProcess", "pu")
+    def _termproc(c, h, code):
+        if h in (0xFFFFFFFF, M64):
+            raise NOOExitProcess(code)
+        return k.err(ERROR_ACCESS_DENIED)
+
+    @R("FatalAppExitA FatalAppExitW", "up", "v")
+    def _fatalapp(c, act, msg):
+        p.log.error("FatalAppExit: %s" % k.s(msg, False))
+        raise NOOExitProcess(0xC0000409)
+
+    @R("GetCurrentProcess", "", "p")
+    def _gcp(c):
+        return M64 if p.cpu_mode == 64 else 0xFFFFFFFF
+
+    @R("GetCurrentThread", "", "p")
+    def _gct(c):
+        return 0xFFFFFFFFFFFFFFFE if p.cpu_mode == 64 else 0xFFFFFFFE
+
+    @R("GetCurrentProcessId", "")
+    def _gcpid(c):
+        return p.pid
+
+    @R("GetCurrentThreadId", "")
+    def _gctid(c):
+        return p.current_thread.tid
+
+    @R("GetProcessId", "p")
+    def _gpid(c, h):
+        return p.pid
+
+    @R("GetThreadId", "p")
+    def _gtid(c, h):
+        t = p.handles.get(h, "thread")
+        if h in (0xFFFFFFFE, 0xFFFFFFFFFFFFFFFE):
+            return p.current_thread.tid
+        return t.tid if t else 0
+
+    @R("GetCurrentProcessorNumber", "")
+    def _gcpn(c):
+        return 0
+
+    @R("GetCommandLineA", "", "p")
+    def _gcla(c):
+        return p.cmdline_a_addr
+
+    @R("GetCommandLineW", "", "p")
+    def _gclw(c):
+        return p.cmdline_w_addr
+
+    def _startup(c, si, wide):
+        ps = k.ptr_size()
+        size = 104 if ps == 8 else 68
+        c.mem.write(si, bytes(size))
+        c.mem.write32(si, size)
+        off_std = 80 if ps == 8 else 56
+        k.wptr(si + off_std, HandleTable.STDIN_HANDLE)
+        k.wptr(si + off_std + ps, HandleTable.STDOUT_HANDLE)
+        k.wptr(si + off_std + 2 * ps, HandleTable.STDERR_HANDLE)
+
+    @R("GetStartupInfoA", "p", "v")
+    def _gsia(c, si):
+        _startup(c, si, False)
+
+    @R("GetStartupInfoW", "p", "v")
+    def _gsiw(c, si):
+        _startup(c, si, True)
+
+    @R("GetVersion", "")
+    def _gv(c):
+        return (19045 << 16) | (0 << 8) | 10
+
+    def _verinfo(c, buf, wide):
+        size = c.mem.read32(buf)
+        c.mem.write32(buf + 4, 10)
+        c.mem.write32(buf + 8, 0)
+        c.mem.write32(buf + 12, 19045)
+        c.mem.write32(buf + 16, 2)
+        csd = 20
+        if wide:
+            c.mem.write(buf + csd, b"\x00\x00")
+            if size >= 284:
+                c.mem.write(buf + 276, struct.pack("<HHHBB", 0, 0, 0x100, 1, 0))
+        else:
+            c.mem.write8(buf + csd, 0)
+            if size >= 156:
+                c.mem.write(buf + 148, struct.pack("<HHHBB", 0, 0, 0x100, 1, 0))
+        return 1
+
+    @R("GetVersionExA", "p")
+    def _gvea(c, buf):
+        return _verinfo(c, buf, False)
+
+    @R("GetVersionExW", "p")
+    def _gvew(c, buf):
+        return _verinfo(c, buf, True)
+
+    @R("RtlGetVersion", "p", "i", NT)
+    def _rgv(c, buf):
+        _verinfo(c, buf, True)
+        return 0
+
+    @R("VerifyVersionInfoA VerifyVersionInfoW", "puQ")
+    def _vvi(c, info, mask, cond):
+        return 1
+
+    @R("IsProcessorFeaturePresent", "u")
+    def _ipfp(c, f):
+        # PF_FLOATING_POINT_EMULATED 1: no; MMX 3, XMMI 6, XMMI64 10, SSE3 13,
+        # RDTSC 8, CMPXCHG_DOUBLE 2, NX 12, COMPARE_EXCHANGE128 14, FASTFAIL 23
+        return 1 if f in (2, 3, 6, 8, 10, 12, 13, 14, 17, 23) else 0
+
+    @R("IsDebuggerPresent", "")
+    def _idp(c):
+        return 0
+
+    @R("CheckRemoteDebuggerPresent", "pp")
+    def _crdp(c, h, out):
+        c.mem.write32(out, 0)
+        return 1
+
+    @R("OutputDebugStringA", "p", "v")
+    def _odsa(c, s):
+        p.log.info("[OutputDebugString] " + k.cs_(s).rstrip("\n"))
+
+    @R("OutputDebugStringW", "p", "v")
+    def _odsw(c, s):
+        p.log.info("[OutputDebugString] " + k.ws_(s).rstrip("\n"))
+
+    @R("DebugBreak", "", "v")
+    def _dbgbrk(c):
+        raise NOOCPUFault("breakpoint (DebugBreak)", eip=c.eip)
+
+    def _sysinfo(c, buf):
+        x64 = p.cpu_mode == 64
+        if x64:
+            c.mem.write(buf, struct.pack("<HHIQQQIIIHH", 9, 0, 0x1000, 0x10000, 0x7FFFFFFEFFFF,
+                                         (1 << (os.cpu_count() or 1)) - 1, os.cpu_count() or 1,
+                                         8664, 0x10000, 6, 0x3A09))
+        else:
+            c.mem.write(buf, struct.pack("<HHIIIIIIIHH", 0, 0, 0x1000, 0x10000, 0x7FFEFFFF,
+                                         (1 << min(32, os.cpu_count() or 1)) - 1 & 0xFFFFFFFF,
+                                         os.cpu_count() or 1, 586, 0x10000, 6, 0x3A09))
+
+    @R("GetSystemInfo GetNativeSystemInfo", "p", "v")
+    def _gsi(c, buf):
+        _sysinfo(c, buf)
+
+    @R("GetSystemDirectoryA GetSystemWow64DirectoryA", "pu")
+    def _gsda(c, buf, n):
+        return k.put(buf, n, "C:\\Windows\\System32", False)
+
+    @R("GetSystemDirectoryW GetSystemWow64DirectoryW", "pu")
+    def _gsdw(c, buf, n):
+        return k.put(buf, n, "C:\\Windows\\System32", True)
+
+    @R("GetWindowsDirectoryA GetSystemWindowsDirectoryA", "pu")
+    def _gwda(c, buf, n):
+        return k.put(buf, n, "C:\\Windows", False)
+
+    @R("GetWindowsDirectoryW GetSystemWindowsDirectoryW", "pu")
+    def _gwdw(c, buf, n):
+        return k.put(buf, n, "C:\\Windows", True)
+
+    def _compname(c, buf, pn, wide):
+        n = c.mem.read32(pn)
+        name = "NOO-PC"
+        if n <= len(name):
+            c.mem.write32(pn, len(name) + 1)
+            return k.err(111)
+        k.put(buf, n, name, wide)
+        c.mem.write32(pn, len(name))
+        return 1
+
+    @R("GetComputerNameA", "pp")
+    def _gcna(c, buf, pn):
+        return _compname(c, buf, pn, False)
+
+    @R("GetComputerNameW", "pp")
+    def _gcnw(c, buf, pn):
+        return _compname(c, buf, pn, True)
+
+    @R("GetComputerNameExA", "upp")
+    def _gcnxa(c, f, buf, pn):
+        return _compname(c, buf, pn, False)
+
+    @R("GetComputerNameExW", "upp")
+    def _gcnxw(c, f, buf, pn):
+        return _compname(c, buf, pn, True)
+
+    @R("Beep", "uu")
+    def _beep(c, f, d):
+        return 1
+
+    @R("SetConsoleCtrlHandler", "pi")
+    def _scch(c, fn, add):
+        return 1
+
+    @R("GetExitCodeProcess", "pp")
+    def _gecp(c, h, out):
+        c.mem.write32(out, 259)
+        return 1
+
+    @R("CreateProcessA CreateProcessW", "pppppiupppp")
+    def _cproc(c, *a):
+        p.log.warn("CreateProcess refused: the sandbox does not start host or guest processes")
+        return k.err(ERROR_ACCESS_DENIED)
+
+    @R("WinExec", "pu")
+    def _winexec(c, cmd, show):
+        p.log.warn("WinExec refused by the sandbox")
+        return 2
+
+    @R("GetPriorityClass", "p")
+    def _gpc(c, h):
+        return 0x20
+
+    @R("SetPriorityClass SetProcessAffinityMask SetProcessPriorityBoost SetProcessWorkingSetSize", "pp")
+    def _spc(c, h, v):
+        return 1
+
+    @R("GetProcessAffinityMask", "ppp")
+    def _gpam(c, h, pm, sm):
+        k.wptr(pm, 1)
+        k.wptr(sm, 1)
+        return 1
+
+    def _ft(c, a, t):
+        c.mem.write64(a, _ft_from_unix(t)) if a else None
+
+    @R("GetProcessTimes GetThreadTimes", "ppppp")
+    def _gpt(c, h, cr, ex, kt, ut):
+        _ft(c, cr, p.start_wall if hasattr(p, "start_wall") else time.time())
+        if ex:
+            c.mem.write64(ex, 0)
+        if kt:
+            c.mem.write64(kt, 0)
+        if ut:
+            c.mem.write64(ut, int((time.monotonic() - p.start_time) * 1e7))
+        return 1
+
+    @R("GetSystemTimes", "ppp")
+    def _gst(c, idle, kt, ut):
+        for a in (idle, kt, ut):
+            if a:
+                c.mem.write64(a, int((time.monotonic() - p.start_time) * 1e7))
+        return 1
+
+    @R("GetProcessHeap", "", "p")
+    def _gph(c):
+        p._heap(p.process_heap_handle)
+        return p.process_heap_handle
+
+    @R("GetProcessHeaps", "up")
+    def _gphs(c, n, out):
+        if n >= 1 and out:
+            k.wptr(out, p.process_heap_handle)
+        return 1
+
+    # modules --------------------------------------------------------------------------
+    def _modname(name, wide):
+        return name
+
+    @R("GetModuleHandleA", "p", "p")
+    def _gmha(c, name):
+        if not name:
+            return p.image_base
+        h = p.modules.handle_for(k.cs_(name))
+        return h or k.err(ERROR_MOD_NOT_FOUND)
+
+    @R("GetModuleHandleW", "p", "p")
+    def _gmhw(c, name):
+        if not name:
+            return p.image_base
+        h = p.modules.handle_for(k.ws_(name))
+        return h or k.err(ERROR_MOD_NOT_FOUND)
+
+    def _gmhex(c, flags, name, out, wide):
+        if flags & 4:                              # FROM_ADDRESS
+            h = 0
+            for base, mod in p.modules.by_handle.items():
+                if base <= name < base + max(mod.size, 0x1000):
+                    h = base
+        elif not name:
+            h = p.image_base
+        else:
+            h = p.modules.handle_for(k.s(name, wide))
+        if out:
+            k.wptr(out, h)
+        return 1 if h else k.err(ERROR_MOD_NOT_FOUND)
+
+    @R("GetModuleHandleExA", "upp")
+    def _gmhxa(c, f, name, out):
+        return _gmhex(c, f, name, out, False)
+
+    @R("GetModuleHandleExW", "upp")
+    def _gmhxw(c, f, name, out):
+        return _gmhex(c, f, name, out, True)
+
+    def _modpath(h):
+        if not h or h == p.image_base:
+            return p.exe_win_path
+        mod = p.modules.by_handle.get(h)
+        if mod is None:
+            return None
+        if mod.kind == "internal":
+            return "C:\\Windows\\System32\\" + mod.name
+        return "C:\\app\\" + mod.name if "\\" not in mod.name else mod.name
+
+    def _gmfn(c, h, buf, n, wide):
+        path = _modpath(h)
+        if path is None:
+            return k.err(ERROR_MOD_NOT_FOUND)
+        units = len(path)
+        if n == 0:
+            return k.err(ERROR_INSUFFICIENT_BUFFER)
+        if units >= n:
+            txt = path[:n - 1]
+            k.put(buf, n, txt, wide)
+            p.last_error = ERROR_INSUFFICIENT_BUFFER
+            return n
+        k.put(buf, n, path, wide)
+        return units
+
+    @R("GetModuleFileNameA", "ppu")
+    def _gmfna(c, h, buf, n):
+        return _gmfn(c, h, buf, n, False)
+
+    @R("GetModuleFileNameW", "ppu")
+    def _gmfnw(c, h, buf, n):
+        return _gmfn(c, h, buf, n, True)
+
+    def _gpa(c, h, name):
+        if name < 0x10000:
+            mod = p.modules.by_handle.get(h)
+            if mod is not None and mod.kind == "pe":
+                a = mod.export_ordinals.get(name)
+                return a or k.err(ERROR_PROC_NOT_FOUND)
+            return k.err(ERROR_PROC_NOT_FOUND)
+        nm = c.mem.read_cstring(name, 512).decode("latin-1")
+        mod = p.modules.by_handle.get(h)
+        if mod is None:
+            return k.err(ERROR_MOD_NOT_FOUND)
+        if mod.kind == "internal":
+            if api.lookup_any(mod.name, nm) is None and not api.is_data_export(mod.name, nm) \
+                    and api.data_export_value(mod.name, nm) is None:
+                # like an older Windows without that export: callers fall back
+                return k.err(ERROR_PROC_NOT_FOUND)
+            dv = api.data_export_value(mod.name, nm)
+            if dv is not None or api.is_data_export(mod.name, nm):
+                return p.data_export_cell(mod.name, nm)
+            return p.api_thunk(mod.name, nm)
+        a = mod.exports.get(nm)
+        if not a:
+            fwd = getattr(mod, "forwards", {}).get(nm)
+            if fwd:
+                return p.modules.resolve_forward(fwd) or k.err(ERROR_PROC_NOT_FOUND)
+            return k.err(ERROR_PROC_NOT_FOUND)
+        return a
+
+    @R("GetProcAddress", "pp", "p")
+    def _getprocaddress(c, h, name):
+        return _gpa(c, h, name)
+
+    @R("LoadLibraryA", "p", "p")
+    def _lla(c, name):
+        return p.modules.load(k.cs_(name)) or 0
+
+    @R("LoadLibraryW", "p", "p")
+    def _llw(c, name):
+        return p.modules.load(k.ws_(name)) or 0
+
+    @R("LoadLibraryExA", "ppu", "p")
+    def _llxa(c, name, f, flags):
+        if flags & 2:                             # LOAD_LIBRARY_AS_DATAFILE
+            return p.modules.load(k.cs_(name)) or 0
+        return p.modules.load(k.cs_(name)) or 0
+
+    @R("LoadLibraryExW", "ppu", "p")
+    def _llxw(c, name, f, flags):
+        return p.modules.load(k.ws_(name)) or 0
+
+    @R("FreeLibrary", "p")
+    def _freelib(c, h):
+        return 1
+
+    @R("FreeLibraryAndExitThread", "pu", "v")
+    def _flaet(c, h, code):
+        raise NOOExitThread(code)
+
+    @R("DisableThreadLibraryCalls", "p")
+    def _dtlc(c, h):
+        return 1
+
+    @R("SetDllDirectoryA SetDllDirectoryW SetDefaultDllDirectories AddDllDirectory", "p", "p")
+    def _sdd(c, x):
+        return 1
+
+    # =====================================================================
+    # environment
+    # =====================================================================
+    def _env_get(name):
+        u = name.upper()
+        for kk, v in p.env.items():
+            if kk.upper() == u:
+                return v
+        return None
+
+    def _gev(c, name, buf, n, wide):
+        v = _env_get(k.s(name, wide))
+        if v is None:
+            return k.err(ERROR_ENVVAR_NOT_FOUND)
+        return k.put(buf, n, v, wide)
+
+    @R("GetEnvironmentVariableA", "ppu")
+    def _geva(c, name, buf, n):
+        return _gev(c, name, buf, n, False)
+
+    @R("GetEnvironmentVariableW", "ppu")
+    def _gevw(c, name, buf, n):
+        return _gev(c, name, buf, n, True)
+
+    def _sev(c, name, val, wide):
+        nm = k.s(name, wide)
+        for kk in list(p.env):
+            if kk.upper() == nm.upper():
+                del p.env[kk]
+        if val:
+            p.env[nm] = k.s(val, wide)
+        return 1
+
+    @R("SetEnvironmentVariableA", "pp")
+    def _seva(c, name, val):
+        return _sev(c, name, val, False)
+
+    @R("SetEnvironmentVariableW", "pp")
+    def _sevw(c, name, val):
+        return _sev(c, name, val, True)
+
+    def _env_block(wide):
+        items = ["%s=%s" % kv for kv in sorted(p.env.items(), key=lambda kv: kv[0].upper())]
+        if wide:
+            data = b"".join(s.encode("utf-16-le") + b"\x00\x00" for s in items) + b"\x00\x00"
+        else:
+            data = b"".join(s.encode("utf-8") + b"\x00" for s in items) + b"\x00"
+        a = p.heap_alloc(p.process_heap_handle, len(data) + 4)
+        p.mem.write(a, data)
+        return a
+
+    @R("GetEnvironmentStrings GetEnvironmentStringsA", "", "p")
+    def _gesa(c):
+        return _env_block(False)
+
+    @R("GetEnvironmentStringsW", "", "p")
+    def _gesw(c):
+        return _env_block(True)
+
+    @R("FreeEnvironmentStringsA FreeEnvironmentStringsW", "p")
+    def _fes(c, a):
+        p.heap_free(p.process_heap_handle, a)
+        return 1
+
+    def _expand(s):
+        out = []
+        i = 0
+        while i < len(s):
+            if s[i] == "%":
+                j = s.find("%", i + 1)
+                if j > i + 1:
+                    v = _env_get(s[i + 1:j])
+                    if v is not None:
+                        out.append(v)
+                        i = j + 1
+                        continue
+            out.append(s[i])
+            i += 1
+        return "".join(out)
+
+    @R("ExpandEnvironmentStringsA", "ppu")
+    def _eesa(c, src, dst, n):
+        r = _expand(k.cs_(src))
+        need = len(r.encode("utf-8")) + 1
+        if dst and n >= need:
+            c.mem.write(dst, r.encode("utf-8") + b"\x00")
+        return need
+
+    @R("ExpandEnvironmentStringsW", "ppu")
+    def _eesw(c, src, dst, n):
+        r = _expand(k.ws_(src))
+        need = len(r) + 1
+        if dst and n >= need:
+            c.mem.write(dst, r.encode("utf-16-le") + b"\x00\x00")
+        return need
+
+    # =====================================================================
+    # memory
+    # =====================================================================
+    MEM_RESERVE_, MEM_COMMIT_, MEM_RELEASE_ = 0x2000, 0x1000, 0x8000
+    k.vregions = {}                              # base -> [size, protect, state]
+
+    @R("VirtualAlloc", "pzuu", "p")
+    def _valloc(c, addr, size, typ, prot):
+        if size == 0:
+            return k.err(ERROR_INVALID_PARAMETER)
+        perm = _prot_from_win(prot)
+        size = (size + 0xFFF) & ~0xFFF
+        if addr:
+            base = addr & ~0xFFF
+            if all(p.mem.is_mapped(base + o) for o in range(0, size, 0x1000)):
+                # commit inside an existing reservation
+                p.mem.protect(base, size, perm)
+                for b0, ent in k.vregions.items():
+                    if b0 <= base < b0 + ent[0]:
+                        ent[2] = MEM_COMMIT_
+                return base
+            if any(p.mem.is_mapped(base + o) for o in range(0, size, 0x1000)):
+                return k.err(ERROR_INVALID_PARAMETER)
+            base = (addr & ~0xFFFF) if not (typ & MEM_COMMIT_) or True else base
+            base = addr & ~0xFFF
+            try:
+                a = p.mem.alloc(size, perm, addr=base, tag="VirtualAlloc")
+            except NOOMemoryFault:
+                return k.err(ERROR_NOT_ENOUGH_MEMORY)
+        else:
+            try:
+                a = p.mem.alloc(size + 0x10000, perm, tag="VirtualAlloc")
+            except NOOMemoryFault:
+                return k.err(ERROR_NOT_ENOUGH_MEMORY)
+            # 64K allocation granularity: free the slack before the aligned base
+            aligned = (a + 0xFFFF) & ~0xFFFF
+            if aligned != a:
+                p.mem.free(a)
+                a = p.mem.alloc(size, perm, addr=aligned, tag="VirtualAlloc")
+            else:
+                p.mem.free(a)
+                a = p.mem.alloc(size, perm, addr=aligned, tag="VirtualAlloc")
+        k.vregions[a] = [size, prot, MEM_COMMIT_ if typ & MEM_COMMIT_ else MEM_RESERVE_]
+        return a
+
+    @R("VirtualAllocEx", "ppzuu", "p")
+    def _vallocex(c, h, addr, size, typ, prot):
+        return _valloc(c, addr, size, typ, prot)
+
+    @R("VirtualFree", "pzu")
+    def _vfree(c, addr, size, typ):
+        if typ & MEM_RELEASE_:
+            k.vregions.pop(addr, None)
+            return 1 if p.mem.free(addr) else k.err(ERROR_INVALID_PARAMETER)
+        return 1                                  # decommit: keep the pages
+
+    @R("VirtualFreeEx", "ppzu")
+    def _vfreeex(c, h, addr, size, typ):
+        return _vfree(c, addr, size, typ)
+
+    def _cur_prot(addr):
+        for b0, ent in k.vregions.items():
+            if b0 <= addr < b0 + ent[0]:
+                pass
+        perm = p.mem.perms.get(addr >> 12, 0)
+        return _prot_to_win(perm) if addr >> 12 in p.mem.pages else 1
+
+    @R("VirtualProtect", "pzup")
+    def _vprot(c, addr, size, prot, oldp):
+        if not p.mem.is_mapped(addr):
+            return k.err(487)                      # ERROR_INVALID_ADDRESS
+        old = _cur_prot(addr)
+        p.mem.protect(addr, size, _prot_from_win(prot))
+        if oldp:
+            c.mem.write32(oldp, old)
+        return 1
+
+    @R("VirtualProtectEx", "ppzup")
+    def _vprotex(c, h, addr, size, prot, oldp):
+        return _vprot(c, addr, size, prot, oldp)
+
+    def _vquery(c, addr, buf, n):
+        pg = addr & ~0xFFF
+        reg = p.mem.region_of(addr)
+        x64 = p.cpu_mode == 64
+        if reg is None:
+            # free region: find the next mapped region
+            nxt = min([r[0] for r in p.mem.regions if r[0] > pg] + [pg + 0x10000])
+            vals = (pg, 0, 0, nxt - pg, 0x10000, 1, 0)
+        else:
+            base, size, perm, tag = reg
+            prot = _prot_to_win(p.mem.perms.get(pg >> 12, perm))
+            end = pg
+            while end < base + size and p.mem.perms.get(end >> 12) == p.mem.perms.get(pg >> 12):
+                end += 0x1000
+            typ = 0x1000000 if tag.startswith("image") else 0x20000
+            vals = (pg, base, prot, end - pg, 0x1000, prot, typ)
+        b0, ab, ap, rs, st, pr, ty = vals
+        if x64:
+            data = struct.pack("<QQI4xQIII4x", b0, ab, ap, rs, st, pr, ty)
+        else:
+            data = struct.pack("<IIIIIII", b0, ab, ap, rs, st, pr, ty)
+        c.mem.write(buf, data[:n])
+        return len(data)
+
+    @R("VirtualQuery", "ppz", "z")
+    def _vq(c, addr, buf, n):
+        return _vquery(c, addr, buf, n)
+
+    @R("VirtualQueryEx", "pppz", "z")
+    def _vqx(c, h, addr, buf, n):
+        return _vquery(c, addr, buf, n)
+
+    @R("VirtualLock VirtualUnlock", "pz")
+    def _vlock(c, a, n):
+        return 1
+
+    @R("FlushInstructionCache", "ppz")
+    def _fic(c, h, a, n):
+        return 1
+
+    @R("GetLargePageMinimum", "", "z")
+    def _glpm(c):
+        return 0x200000
+
+    # heaps -----------------------------------------------------------------------------
+    HEAP_ZERO_MEMORY = 0x8
+
+    @R("HeapCreate", "uzz", "p")
+    def _hcreate(c, opts, init, maxs):
+        return p.heap_create()
+
+    @R("HeapDestroy", "p")
+    def _hdestroy(c, h):
+        return 1
+
+    @R("HeapAlloc", "puz", "p")
+    def _halloc(c, h, flags, n):
+        a = p.heap_alloc(h, max(n, 1))
+        if not a:
+            return k.err(ERROR_NOT_ENOUGH_MEMORY)
+        if flags & HEAP_ZERO_MEMORY:
+            c.mem.write(a, bytes(max(n, 1)))
+        return a
+
+    @R("RtlAllocateHeap", "puz", "p", NT)
+    def _rtlalloc(c, h, flags, n):
+        return _halloc(c, h, flags, n)
+
+    @R("HeapReAlloc", "pupz", "p")
+    def _hrealloc(c, h, flags, a, n):
+        if not a:
+            return k.err(ERROR_INVALID_PARAMETER)
+        old = p.heap_size(h, a)
+        if flags & 0x10 and n > old:               # HEAP_REALLOC_IN_PLACE_ONLY
+            return k.err(ERROR_NOT_ENOUGH_MEMORY)
+        new = p.heap_realloc(h, a, max(n, 1))
+        if new and flags & HEAP_ZERO_MEMORY and n > old:
+            c.mem.write(new + old, bytes(n - old))
+        return new or k.err(ERROR_NOT_ENOUGH_MEMORY)
+
+    @R("RtlReAllocateHeap", "pupz", "p", NT)
+    def _rtlrealloc(c, h, flags, a, n):
+        return _hrealloc(c, h, flags, a, n)
+
+    @R("HeapFree", "pup")
+    def _hfree(c, h, flags, a):
+        if not a:
+            return 1
+        return 1 if p.heap_free(h, a) else k.err(ERROR_INVALID_PARAMETER)
+
+    @R("RtlFreeHeap", "pup", "i", NT)
+    def _rtlfree(c, h, flags, a):
+        return _hfree(c, h, flags, a)
+
+    @R("HeapSize", "pup", "z")
+    def _hsize(c, h, flags, a):
+        if a and a in (p._heap(h) or {}).get("allocs", {}):
+            return p.heap_size(h, a)
+        p.last_error = ERROR_INVALID_PARAMETER
+        return M64 if p.cpu_mode == 64 else 0xFFFFFFFF
+
+    @R("RtlSizeHeap", "pup", "z", NT)
+    def _rtlsize(c, h, flags, a):
+        return p.heap_size(h, a)
+
+    @R("HeapValidate", "pup")
+    def _hvalid(c, h, flags, a):
+        return 1
+
+    @R("HeapCompact", "pu", "z")
+    def _hcompact(c, h, flags):
+        return 0x100000
+
+    @R("HeapLock HeapUnlock", "p")
+    def _hlock(c, h):
+        return 1
+
+    @R("HeapSetInformation", "pupz")
+    def _hsetinfo(c, h, cls, info, n):
+        return 1
+
+    @R("HeapQueryInformation", "pupzp")
+    def _hqinfo(c, h, cls, info, n, ret):
+        if info and n >= 4:
+            c.mem.write32(info, 2)
+        return 1
+
+    @R("HeapWalk", "pp")
+    def _hwalk(c, h, e):
+        return k.err(ERROR_NO_MORE_FILES)
+
+    # Global / Local (moveable memory is emulated as fixed) ------------------------------
+    def _galloc(c, flags, n):
+        a = p.heap_alloc(p.process_heap_handle, max(n, 1))
+        if a and flags & 0x40:                     # GMEM_ZEROINIT / LMEM_ZEROINIT
+            c.mem.write(a, bytes(max(n, 1)))
+        return a or k.err(ERROR_NOT_ENOUGH_MEMORY)
+
+    for pre in ("Global", "Local"):
+        R(pre + "Alloc", "uz", "p")(_galloc)
+        R(pre + "Free", "p", "p")(lambda c, h: (p.heap_free(p.process_heap_handle, h), 0)[1] if h else 0)
+        R(pre + "Lock", "p", "p")(lambda c, h: h)
+        R(pre + "Unlock", "p")(lambda c, h: 1)
+        R(pre + "Handle", "p", "p")(lambda c, a: a)
+        R(pre + "Size", "p", "z")(lambda c, h: p.heap_size(p.process_heap_handle, h))
+        R(pre + "Flags", "p")(lambda c, h: 0)
+        R(pre + "ReAlloc", "pzu", "p")(
+            lambda c, h, n, f: p.heap_realloc(p.process_heap_handle, h, max(n, 1)) if h
+            else _galloc(c, f, n))
+
+    def _memstatus(c, buf, ex):
+        total = p.sandbox.max_memory_mb * 1024 * 1024
+        avail = max(0, total - p.mem.committed)
+        if ex:
+            c.mem.write(buf + 4, struct.pack("<IQQQQQQQ", 30, total, avail, total * 2, avail * 2,
+                                             0x7FFE0000 if p.cpu_mode == 32 else 0x7FFFFFFE0000,
+                                             0x7FFE0000 - p.mem.committed if p.cpu_mode == 32 else
+                                             0x7FFFFFFE0000 - p.mem.committed, 0))
+        else:
+            ps = k.ptr_size()
+            fmt = "<II" + ("Q" * 6 if ps == 8 else "I" * 6)
+            c.mem.write(buf, struct.pack(fmt, 32 if ps == 4 else 56, 30, total, avail, total * 2,
+                                         avail * 2, 0x7FFE0000, 0x7FFE0000 - p.mem.committed))
+        return 1
+
+    @R("GlobalMemoryStatusEx", "p")
+    def _gmsx(c, buf):
+        return _memstatus(c, buf, True)
+
+    @R("GlobalMemoryStatus", "p", "v")
+    def _gms(c, buf):
+        _memstatus(c, buf, False)
+
+    def _isbad(c, a, n, need):
+        if not a:
+            return 1
+        try:
+            for o in range(0, max(n, 1), 0x1000):
+                p.mem._check(a + o, need)
+            if n:
+                p.mem._check(a + n - 1, need)
+            return 0
+        except NOOCPUFault:
+            return 1
+
+    @R("IsBadReadPtr IsBadHugeReadPtr", "pz")
+    def _ibrp(c, a, n):
+        return _isbad(c, a, n, MEM_READ)
+
+    @R("IsBadWritePtr IsBadHugeWritePtr", "pz")
+    def _ibwp(c, a, n):
+        return _isbad(c, a, n, MEM_WRITE)
+
+    @R("IsBadCodePtr", "p")
+    def _ibcp(c, a):
+        return _isbad(c, a, 1, MEM_EXEC)
+
+    @R("IsBadStringPtrA IsBadStringPtrW", "pz")
+    def _ibsp(c, a, n):
+        return _isbad(c, a, 1, MEM_READ)
+
+    @R("RtlMoveMemory RtlCopyMemory", "ppz", "v", _K32_DLLS + NT)
+    def _rmm(c, d, s, n):
+        if n:
+            c.mem.write(d, c.mem.read(s, n))
+
+    @R("RtlZeroMemory", "pz", "v", _K32_DLLS + NT)
+    def _rzm(c, d, n):
+        if n:
+            c.mem.write(d, bytes(n))
+
+    @R("RtlFillMemory", "pzi", "v", _K32_DLLS + NT)
+    def _rfm(c, d, n, v):
+        if n:
+            c.mem.write(d, bytes([v & 0xFF]) * n)
+
+    @R("RtlCompareMemory", "ppz", "z", NT)
+    def _rcm(c, a, b, n):
+        x, y = c.mem.read(a, n), c.mem.read(b, n)
+        i = 0
+        while i < n and x[i] == y[i]:
+            i += 1
+        return i
+
+    # =====================================================================
+    # strings, code pages, locale
+    # =====================================================================
+    def _cp_codec(cp):
+        cp &= 0xFFFFFFFF
+        if cp in (0, 1, 2, 3, 65001):                 # CP_ACP/OEMCP/MACCP/THREAD_ACP = UTF-8 here
+            return "utf-8"
+        if cp == 437:
+            return "cp437"
+        if cp == 1252:
+            return "cp1252"
+        if cp == 20127:
+            return "ascii"
+        if cp == 28591:
+            return "latin-1"
+        if cp == 65000:
+            return "utf-7"
+        try:
+            import codecs
+            codecs.lookup("cp%d" % cp)
+            return "cp%d" % cp
+        except LookupError:
+            return None
+
+    @R("MultiByteToWideChar", "uupipi")
+    def _mb2wc(c, cp, flags, src, n, dst, dn):
+        codec = _cp_codec(cp)
+        if codec is None or not src or n == 0 or dn < 0:
+            return k.err(ERROR_INVALID_PARAMETER)
+        if n < 0:
+            raw = c.mem.read_cstring(src, 1 << 30) + b"\x00"
+        else:
+            raw = c.mem.read(src, n)
+        strict = flags & 8                              # MB_ERR_INVALID_CHARS
+        try:
+            text = raw.decode(codec, "strict" if strict else "replace")
+        except UnicodeDecodeError:
+            return k.err(ERROR_NO_UNICODE_TRANSLATION)
+        w = text.encode("utf-16-le")
+        units = len(w) // 2
+        if dn == 0:
+            return units
+        if units > dn:
+            c.mem.write(dst, w[:2 * dn])
+            return k.err(ERROR_INSUFFICIENT_BUFFER)
+        c.mem.write(dst, w)
+        return units
+
+    @R("WideCharToMultiByte", "uupipipp")
+    def _wc2mb(c, cp, flags, src, n, dst, dn, default, used):
+        codec = _cp_codec(cp)
+        if codec is None or not src or n == 0 or dn < 0:
+            return k.err(ERROR_INVALID_PARAMETER)
+        if n < 0:
+            raw = c.mem.read_wstring(src, 1 << 29) + b"\x00\x00"
+        else:
+            raw = c.mem.read(src, 2 * n)
+        text = raw.decode("utf-16-le", "surrogatepass")
+        defchar = c.mem.read_cstring(default, 4).decode("latin-1") if default else "?"
+        bad = False
+        out = bytearray()
+        for ch in text:
+            try:
+                out += ch.encode(codec)
+            except UnicodeEncodeError:
+                bad = True
+                out += defchar.encode("latin-1", "replace")
+        if used:
+            c.mem.write32(used, 1 if bad else 0)
+        if dn == 0:
+            return len(out)
+        if len(out) > dn:
+            c.mem.write(dst, bytes(out[:dn]))
+            return k.err(ERROR_INSUFFICIENT_BUFFER)
+        c.mem.write(dst, bytes(out))
+        return len(out)
+
+    @R("GetACP GetOEMCP GetConsoleCP GetConsoleOutputCP", "")
+    def _getacp(c):
+        return 65001
+
+    @R("SetConsoleCP SetConsoleOutputCP", "u")
+    def _setcp(c, cp):
+        return 1
+
+    @R("IsValidCodePage", "u")
+    def _ivcp(c, cp):
+        return 1 if _cp_codec(cp) else 0
+
+    def _cpinfo(c, cp, buf, ex, wide):
+        c.mem.write(buf, bytes(20 if not ex else (544 if wide else 288)))
+        c.mem.write32(buf, 4 if cp in (0, 65001, 1, 3) else 1)
+        c.mem.write(buf + 4, b"?\x00")
+        if ex:
+            c.mem.write16(buf + 20, ord("?"))
+            c.mem.write32(buf + 24, cp if cp else 65001)
+        return 1
+
+    @R("GetCPInfo", "up")
+    def _gcpi(c, cp, buf):
+        return _cpinfo(c, cp, buf, False, False)
+
+    @R("GetCPInfoExA", "uup")
+    def _gcpixa(c, cp, f, buf):
+        return _cpinfo(c, cp, buf, True, False)
+
+    @R("GetCPInfoExW", "uup")
+    def _gcpixw(c, cp, f, buf):
+        return _cpinfo(c, cp, buf, True, True)
+
+    @R("IsDBCSLeadByte", "u")
+    def _idlb(c, b):
+        return 0
+
+    @R("IsDBCSLeadByteEx", "uu")
+    def _idlbx(c, cp, b):
+        return 0
+
+    @R("lstrlenA", "p")
+    def _lstrlena(c, s):
+        return len(c.mem.read_cstring(s, 1 << 30)) if s else 0
+
+    @R("lstrlenW", "p")
+    def _lstrlenw(c, s):
+        return len(c.mem.read_wstring(s, 1 << 29)) // 2 if s else 0
+
+    @R("lstrcpyA", "pp", "p")
+    def _lstrcpya(c, d, s):
+        c.mem.write(d, c.mem.read_cstring(s, 1 << 30) + b"\x00")
+        return d
+
+    @R("lstrcpyW", "pp", "p")
+    def _lstrcpyw(c, d, s):
+        c.mem.write(d, c.mem.read_wstring(s, 1 << 29) + b"\x00\x00")
+        return d
+
+    @R("lstrcpynA", "ppi", "p")
+    def _lstrcpyna(c, d, s, n):
+        if n <= 0:
+            return d
+        c.mem.write(d, c.mem.read_cstring(s, n - 1) + b"\x00")
+        return d
+
+    @R("lstrcpynW", "ppi", "p")
+    def _lstrcpynw(c, d, s, n):
+        if n <= 0:
+            return d
+        c.mem.write(d, c.mem.read_wstring(s, n - 1) + b"\x00\x00")
+        return d
+
+    @R("lstrcatA", "pp", "p")
+    def _lstrcata(c, d, s):
+        c.mem.write(d + len(c.mem.read_cstring(d, 1 << 30)), c.mem.read_cstring(s, 1 << 30) + b"\x00")
+        return d
+
+    @R("lstrcatW", "pp", "p")
+    def _lstrcatw(c, d, s):
+        c.mem.write(d + len(c.mem.read_wstring(d, 1 << 29)), c.mem.read_wstring(s, 1 << 29) + b"\x00\x00")
+        return d
+
+    def _natcmp(a, b, icase):
+        # CompareString/lstrcmp use linguistic order; approximate with a
+        # case-folded comparison that sorts lowercase before uppercase on ties
+        ka, kb = (a.lower(), b.lower())
+        if ka != kb:
+            return -1 if ka < kb else 1
+        if icase or a == b:
+            return 0
+        return -1 if a.swapcase() < b.swapcase() else 1
+
+    @R("lstrcmpA", "pp")
+    def _lstrcmpa(c, a, b):
+        return _natcmp(k.cs_(a), k.cs_(b), False)
+
+    @R("lstrcmpW", "pp")
+    def _lstrcmpw(c, a, b):
+        return _natcmp(k.ws_(a), k.ws_(b), False)
+
+    @R("lstrcmpiA", "pp")
+    def _lstrcmpia(c, a, b):
+        return _natcmp(k.cs_(a), k.cs_(b), True)
+
+    @R("lstrcmpiW", "pp")
+    def _lstrcmpiw(c, a, b):
+        return _natcmp(k.ws_(a), k.ws_(b), True)
+
+    def _cmpstr(c, flags, a, na, b, nb, wide):
+        def get(ptr, n):
+            if n < 0:
+                return k.s(ptr, wide)
+            raw = c.mem.read(ptr, 2 * n if wide else n)
+            return raw.decode("utf-16-le" if wide else "utf-8", "replace")
+        x, y = get(a, na), get(b, nb)
+        icase = flags & 1
+        if flags & 0x10000000 or flags == 0 and False:          # SORT_STRINGSORT etc.
+            pass
+        r = _natcmp(x, y, bool(icase)) if not (flags & 0x40000000) else \
+            ((x > y) - (x < y))
+        return r + 2                               # CSTR_LESS_THAN=1 EQUAL=2 GREATER=3
+
+    @R("CompareStringA", "uupipi")
+    def _csa(c, lcid, flags, a, na, b, nb):
+        return _cmpstr(c, flags, a, na, b, nb, False)
+
+    @R("CompareStringW", "uupipi")
+    def _csw(c, lcid, flags, a, na, b, nb):
+        return _cmpstr(c, flags, a, na, b, nb, True)
+
+    @R("CompareStringEx", "pupipippp")
+    def _csex(c, name, flags, a, na, b, nb, v, r1, r2):
+        return _cmpstr(c, flags, a, na, b, nb, True)
+
+    @R("CompareStringOrdinal", "pipii")
+    def _cso(c, a, na, b, nb, icase):
+        x = c.mem.read(a, 2 * na).decode("utf-16-le") if na >= 0 else k.ws_(a)
+        y = c.mem.read(b, 2 * nb).decode("utf-16-le") if nb >= 0 else k.ws_(b)
+        if icase:
+            x, y = x.upper(), y.upper()
+        return ((x > y) - (x < y)) + 2
+
+    def _lcmap(c, flags, src, n, dst, dn, wide):
+        if n < 0:
+            t = k.s(src, wide)
+        else:
+            t = c.mem.read(src, 2 * n if wide else n).decode("utf-16-le" if wide else "utf-8", "replace")
+        if flags & 0x200:                             # LCMAP_UPPERCASE
+            t = t.upper()
+        elif flags & 0x100:                           # LCMAP_LOWERCASE
+            t = t.lower()
+        if flags & 0x400:                             # LCMAP_SORTKEY
+            key = t.lower().encode("utf-8") + b"\x01\x01\x01\x01\x00"
+            if dn == 0:
+                return len(key)
+            c.mem.write(dst, key[:dn])
+            return min(len(key), dn)
+        data = t.encode("utf-16-le") if wide else t.encode("utf-8")
+        units = len(data) // 2 if wide else len(data)
+        if n < 0:
+            units += 1
+            data += b"\x00\x00" if wide else b"\x00"
+        if dn == 0:
+            return units
+        if units > dn:
+            return k.err(ERROR_INSUFFICIENT_BUFFER)
+        c.mem.write(dst, data)
+        return units
+
+    @R("LCMapStringA", "uupipi")
+    def _lcmsa(c, lcid, flags, src, n, dst, dn):
+        return _lcmap(c, flags, src, n, dst, dn, False)
+
+    @R("LCMapStringW", "uupipi")
+    def _lcmsw(c, lcid, flags, src, n, dst, dn):
+        return _lcmap(c, flags, src, n, dst, dn, True)
+
+    @R("LCMapStringEx", "pupipippp")
+    def _lcmsx(c, name, flags, src, n, dst, dn, v, r, s2):
+        return _lcmap(c, flags, src, n, dst, dn, True)
+
+    def _ctype_w(ch):
+        o = ord(ch)
+        v = 0
+        if ch.isupper():
+            v |= 1
+        if ch.islower():
+            v |= 2
+        if ch.isdigit():
+            v |= 4
+        if ch.isspace():
+            v |= 8
+        if not ch.isalnum() and ch.isprintable() and not ch.isspace():
+            v |= 0x10
+        if o < 32 or o == 127:
+            v |= 0x20
+        if ch == " ":
+            v |= 0x40
+        if ch in "0123456789abcdefABCDEF":
+            v |= 0x80
+        if ch.isalpha():
+            v |= 0x100
+        return v
+
+    def _gst_impl(c, typ, src, n, out, wide):
+        t = (c.mem.read(src, 2 * n).decode("utf-16-le", "replace") if wide else
+             c.mem.read(src, n).decode("latin-1")) if n >= 0 else k.s(src, wide)
+        vals = []
+        for ch in t:
+            if typ == 1:
+                vals.append(_ctype_w(ch))
+            elif typ == 2:
+                vals.append(1 if ord(ch) < 128 else 0)
+            else:
+                vals.append(0)
+        c.mem.write(out, struct.pack("<%dH" % len(vals), *vals))
+        return 1
+
+    @R("GetStringTypeW", "upip")
+    def _gstw(c, typ, src, n, out):
+        return _gst_impl(c, typ, src, n, out, True)
+
+    @R("GetStringTypeExW", "uupip")
+    def _gstxw(c, lcid, typ, src, n, out):
+        return _gst_impl(c, typ, src, n, out, True)
+
+    @R("GetStringTypeA GetStringTypeExA", "uupip")
+    def _gsta(c, lcid, typ, src, n, out):
+        return _gst_impl(c, typ, src, n, out, False)
+
+    @R("FoldStringW", "upipi")
+    def _foldw(c, flags, src, n, dst, dn):
+        t = c.mem.read(src, 2 * n).decode("utf-16-le") if n >= 0 else k.ws_(src) + "\x00"
+        if dn == 0:
+            return len(t)
+        c.mem.write(dst, t[:dn].encode("utf-16-le"))
+        return min(len(t), dn)
+
+    LOCALE = {0x1: "0409", 0x2: "English (United States)", 0x3: "ENU", 0x4: "English",
+              0x5: "1", 0x6: "United States", 0x7: "USA", 0x9: "0409", 0xB: "437", 0xC: ",",
+              0xD: "0", 0xE: ".", 0xF: ",", 0x10: "3;0", 0x11: "2", 0x12: "0", 0x13: "0",
+              0x14: "$", 0x15: ".", 0x16: ",", 0x18: "2", 0x19: "2", 0x1A: "3;0", 0x1B: "0",
+              0x1C: "0", 0x1D: "/", 0x1E: ":", 0x1F: "M/d/yyyy", 0x20: "dddd, MMMM d, yyyy",
+              0x21: "0", 0x22: "0", 0x23: "0", 0x24: "0", 0x25: "0", 0x26: "0", 0x28: "AM",
+              0x29: "PM", 0x2A: "Monday", 0x31: "Mon", 0x38: "January", 0x44: "Jan",
+              0x50: "", 0x51: "-", 0x59: "en", 0x5A: "US", 0x5C: "en-US", 0x1004: "1252",
+              0x1003: "437", 0x1001: "English", 0x1002: "United States", 0x1009: "1",
+              0x100C: "1", 0x1000: "0", 0x1011: "\u00a4", 0x1014: "1", 0x1001: "English",
+              0x1016: "0", 0x6A: "Unit", 0x70: "0", 0x7B: "en-US"}
+
+    def _gli(c, lctype, buf, n, wide):
+        base = lctype & 0xFFFF
+        if lctype & 0x20000000:                         # LOCALE_RETURN_NUMBER
+            v = LOCALE.get(base, "0")
+            try:
+                num = int(v)
+            except ValueError:
+                num = 0
+            if n >= (2 if wide else 4) and buf:
+                c.mem.write32(buf, num)
+            return 2 if wide else 4
+        v = LOCALE.get(base)
+        if v is None:
+            return k.err(ERROR_INVALID_PARAMETER) if base not in (0x58,) else k.put(buf, n, "", wide)
+        if n == 0:
+            return len(v) + 1
+        if len(v) + 1 > n:
+            return k.err(ERROR_INSUFFICIENT_BUFFER)
+        k.put(buf, n, v, wide)
+        return len(v) + 1
+
+    @R("GetLocaleInfoA", "uupi")
+    def _glia(c, lcid, t, buf, n):
+        return _gli(c, t, buf, n, False)
+
+    @R("GetLocaleInfoW", "uupi")
+    def _gliw(c, lcid, t, buf, n):
+        return _gli(c, t, buf, n, True)
+
+    @R("GetLocaleInfoEx", "pupi")
+    def _gliex(c, name, t, buf, n):
+        return _gli(c, t, buf, n, True)
+
+    @R("GetUserDefaultLCID GetSystemDefaultLCID GetThreadLocale GetUserDefaultLangID "
+       "GetSystemDefaultLangID GetUserDefaultUILanguage GetSystemDefaultUILanguage", "")
+    def _lcid(c):
+        return 0x409
+
+    @R("SetThreadLocale SetThreadUILanguage", "u")
+    def _stl(c, l):
+        return 1
+
+    @R("IsValidLocale", "uu")
+    def _ivl(c, l, f):
+        return 1
+
+    @R("IsValidLocaleName", "p")
+    def _ivln(c, n):
+        return 1
+
+    @R("GetUserDefaultLocaleName GetSystemDefaultLocaleName", "pi")
+    def _gudln(c, buf, n):
+        return k.put(buf, n, "en-US", True) + 1 if n > 5 else 0
+
+    @R("LocaleNameToLCID", "pu")
+    def _lnt(c, n, f):
+        return 0x409
+
+    @R("LCIDToLocaleName", "upiu")
+    def _lcidtn(c, l, buf, n, f):
+        if n == 0:
+            return 6
+        k.put(buf, n, "en-US", True)
+        return 6
+
+    @R("EnumSystemLocalesA EnumSystemLocalesW", "pu")
+    def _esl(c, fn, f):
+        return 1
+
+    @R("GetDateFormatA", "uuppp" "i")
+    def _gdfa(c, lcid, flags, st, fmt, buf, n):
+        return _datefmt(c, st, fmt, buf, n, False)
+
+    @R("GetDateFormatW", "uupppi")
+    def _gdfw(c, lcid, flags, st, fmt, buf, n):
+        return _datefmt(c, st, fmt, buf, n, True)
+
+    @R("GetDateFormatEx", "puppppip")
+    def _gdfx(c, name, flags, st, fmt, buf, n, cal):
+        return _datefmt(c, st, fmt, buf, n, True)
+
+    @R("GetTimeFormatA", "uupppi")
+    def _gtfa(c, lcid, flags, st, fmt, buf, n):
+        return _timefmt(c, st, fmt, buf, n, False)
+
+    @R("GetTimeFormatW", "uupppi")
+    def _gtfw(c, lcid, flags, st, fmt, buf, n):
+        return _timefmt(c, st, fmt, buf, n, True)
+
+    @R("GetTimeFormatEx", "pupppi")
+    def _gtfx(c, name, flags, st, fmt, buf, n):
+        return _timefmt(c, st, fmt, buf, n, True)
+
+    def _systime_tuple(c, st):
+        if st:
+            return struct.unpack("<8H", c.mem.read(st, 16))
+        lt = time.localtime()
+        return (lt.tm_year, lt.tm_mon, (lt.tm_wday + 1) % 7, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec, 0)
+
+    def _fmt_picture(pic, tup):
+        y, mo, dow, d, h, mi, s, ms = tup
+        days = ("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")
+        months = ("January", "February", "March", "April", "May", "June", "July", "August",
+                  "September", "October", "November", "December")
+        out = []
+        i = 0
+        while i < len(pic):
+            ch = pic[i]
+            if ch == "'":
+                j = pic.find("'", i + 1)
+                j = len(pic) if j < 0 else j
+                out.append(pic[i + 1:j])
+                i = j + 1
+                continue
+            j = i
+            while j < len(pic) and pic[j] == ch:
+                j += 1
+            run = j - i
+            if ch == "d":
+                out.append(str(d) if run == 1 else "%02d" % d if run == 2 else
+                           days[dow][:3] if run == 3 else days[dow])
+            elif ch == "M":
+                out.append(str(mo) if run == 1 else "%02d" % mo if run == 2 else
+                           months[mo - 1][:3] if run == 3 else months[mo - 1])
+            elif ch == "y":
+                out.append(str(y % 100) if run == 1 else "%02d" % (y % 100) if run == 2 else "%d" % y)
+            elif ch == "h":
+                hh = h % 12 or 12
+                out.append(str(hh) if run == 1 else "%02d" % hh)
+            elif ch == "H":
+                out.append(str(h) if run == 1 else "%02d" % h)
+            elif ch == "m":
+                out.append(str(mi) if run == 1 else "%02d" % mi)
+            elif ch == "s":
+                out.append(str(s) if run == 1 else "%02d" % s)
+            elif ch == "t":
+                out.append(("AM" if h < 12 else "PM")[:1 if run == 1 else 2])
+            else:
+                out.append(pic[i:j])
+            i = j
+        return "".join(out)
+
+    def _datefmt(c, st, fmt, buf, n, wide):
+        pic = k.s(fmt, wide) if fmt else "M/d/yyyy"
+        r = _fmt_picture(pic, _systime_tuple(c, st))
+        if n == 0:
+            return len(r) + 1
+        if len(r) + 1 > n:
+            return k.err(ERROR_INSUFFICIENT_BUFFER)
+        k.put(buf, n, r, wide)
+        return len(r) + 1
+
+    def _timefmt(c, st, fmt, buf, n, wide):
+        pic = k.s(fmt, wide) if fmt else "h:mm:ss tt"
+        r = _fmt_picture(pic, _systime_tuple(c, st))
+        if n == 0:
+            return len(r) + 1
+        if len(r) + 1 > n:
+            return k.err(ERROR_INSUFFICIENT_BUFFER)
+        k.put(buf, n, r, wide)
+        return len(r) + 1
+
+    # =====================================================================
+    # synchronization / threads
+    # =====================================================================
+    @R("CreateThread", "ppppup", "p")
+    def _cthread(c, sa, stack, start, param, flags, ptid):
+        tid, h = p.create_thread(start, param, stack or 0x100000)
+        t = p.handles.get(h, "thread")
+        if flags & 4 and t is not None:           # CREATE_SUSPENDED
+            t.state = "suspended"
+            t.suspend = 1
+        if ptid:
+            c.mem.write32(ptid, tid)
+        return h
+
+    @R("CreateRemoteThread", "pppppup", "p")
+    def _crthread(c, hp, sa, stack, start, param, flags, ptid):
+        return _cthread(c, sa, stack, start, param, flags, ptid)
+
+    @R("ExitThread", "u", "v")
+    def _exitthread(c, code):
+        raise NOOExitThread(code)
+
+    @R("TerminateThread", "pu")
+    def _termthread(c, h, code):
+        t = p.handles.get(h, "thread")
+        if t is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        if t is p.current_thread:
+            raise NOOExitThread(code)
+        t.state = "dead"
+        t.exit_code = code
+        return 1
+
+    @R("GetExitCodeThread", "pp")
+    def _gect(c, h, out):
+        t = p.handles.get(h, "thread")
+        if h in (0xFFFFFFFE, 0xFFFFFFFFFFFFFFFE):
+            t = p.current_thread
+        if t is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        c.mem.write32(out, t.exit_code if t.state == "dead" else 259)
+        return 1
+
+    @R("SuspendThread", "p")
+    def _suspend(c, h):
+        t = p.handles.get(h, "thread")
+        if t is None:
+            return 0xFFFFFFFF
+        prev = getattr(t, "suspend", 0)
+        t.suspend = prev + 1
+        if t.state == "running" and t is not p.current_thread:
+            t.state = "suspended"
+        return prev
+
+    @R("ResumeThread", "p")
+    def _resume(c, h):
+        t = p.handles.get(h, "thread")
+        if t is None:
+            return 0xFFFFFFFF
+        prev = getattr(t, "suspend", 0)
+        if prev:
+            t.suspend = prev - 1
+            if t.suspend == 0 and t.state == "suspended":
+                t.state = "running"
+        return prev
+
+    @R("SwitchToThread", "")
+    def _switch(c):
+        k.block(c, ("sleep",), time.monotonic(), rax=1)
+
+    @R("Sleep", "u", "v")
+    def _sleep(c, ms):
+        k.block(c, ("sleep",), time.monotonic() + (ms / 1000.0 if ms != INFINITE else 1e9))
+
+    @R("SleepEx", "ui")
+    def _sleepex(c, ms, alertable):
+        k.block(c, ("sleep",), time.monotonic() + (ms / 1000.0 if ms != INFINITE else 1e9), rax=0)
+
+    @R("GetThreadPriority", "p")
+    def _gtp(c, h):
+        return 0
+
+    @R("SetThreadPriority SetThreadPriorityBoost", "pi")
+    def _stp(c, h, v):
+        return 1
+
+    @R("SetThreadAffinityMask", "pp", "p")
+    def _stam(c, h, m):
+        return 1
+
+    @R("SetThreadIdealProcessor", "pu")
+    def _stip(c, h, n):
+        return 0
+
+    @R("SetThreadDescription", "pp")
+    def _std(c, h, d):
+        return 0
+
+    @R("SetThreadStackGuarantee", "p")
+    def _stsg(c, pz):
+        if pz:
+            c.mem.write32(pz, 0)
+        return 1
+
+    @R("WaitForSingleObject", "pu")
+    def _wfso(c, h, ms):
+        return k.wait(c, [h], False, ms)
+
+    @R("WaitForSingleObjectEx", "pui")
+    def _wfsox(c, h, ms, alert):
+        return k.wait(c, [h], False, ms)
+
+    def _wfmo(c, n, arr, all_, ms):
+        ps = k.ptr_size()
+        hs = [k.p.mem.read64(arr + i * 8) if ps == 8 else k.p.mem.read32(arr + i * 4) for i in range(n)]
+        return k.wait(c, hs, bool(all_), ms)
+
+    @R("WaitForMultipleObjects", "upiu")
+    def _wfmo_(c, n, arr, all_, ms):
+        return _wfmo(c, n, arr, all_, ms)
+
+    @R("WaitForMultipleObjectsEx", "upiui")
+    def _wfmox(c, n, arr, all_, ms, alert):
+        return _wfmo(c, n, arr, all_, ms)
+
+    @R("SignalObjectAndWait", "ppui")
+    def _soaw(c, sig, h, ms, alert):
+        _setevent(c, sig)
+        return k.wait(c, [h], False, ms)
+
+    def _named(name_ptr, wide):
+        return k.s(name_ptr, wide) if name_ptr else None
+
+    k.named = {}
+
+    def _create_named(kind, name, make):
+        if name and name in k.named:
+            h_old, obj = k.named[name]
+            p.last_error = ERROR_ALREADY_EXISTS
+            return p.handles.add(obj, kind)
+        obj = make()
+        h = p.handles.add(obj, kind)
+        if name:
+            k.named[name] = (h, obj)
+        p.last_error = 0
+        return h
+
+    def _cev(c, manual, init, name, wide):
+        return _create_named("kevent", _named(name, wide), lambda: _KEvent(manual, init))
+
+    @R("CreateEventA", "piip", "p")
+    def _ceva(c, sa, manual, init, name):
+        return _cev(c, manual, init, name, False)
+
+    @R("CreateEventW", "piip", "p")
+    def _cevw(c, sa, manual, init, name):
+        return _cev(c, manual, init, name, True)
+
+    @R("CreateEventExA", "ppuu", "p")
+    def _cevxa(c, sa, name, flags, acc):
+        return _cev(c, flags & 1, flags & 2, name, False)
+
+    @R("CreateEventExW", "ppuu", "p")
+    def _cevxw(c, sa, name, flags, acc):
+        return _cev(c, flags & 1, flags & 2, name, True)
+
+    def _open_named(kind, name):
+        ent = k.named.get(name)
+        if ent is None:
+            return k.err(ERROR_FILE_NOT_FOUND)
+        return p.handles.add(ent[1], kind)
+
+    @R("OpenEventA", "uip", "p")
+    def _oeva(c, acc, inh, name):
+        return _open_named("kevent", k.cs_(name))
+
+    @R("OpenEventW", "uip", "p")
+    def _oevw(c, acc, inh, name):
+        return _open_named("kevent", k.ws_(name))
+
+    def _setevent(c, h):
+        ev = p.handles.get(h, "kevent")
+        if ev is None:
+            old = p.handles.get(h, "event")
+            if old is not None:
+                old["signaled"] = True
+                return 1
+            return k.err(ERROR_INVALID_HANDLE)
+        ev.signaled = True
+        return 1
+
+    @R("SetEvent", "p")
+    def _setev(c, h):
+        return _setevent(c, h)
+
+    @R("ResetEvent", "p")
+    def _resetev(c, h):
+        ev = p.handles.get(h, "kevent")
+        if ev is None:
+            old = p.handles.get(h, "event")
+            if old is not None:
+                old["signaled"] = False
+                return 1
+            return k.err(ERROR_INVALID_HANDLE)
+        ev.signaled = False
+        return 1
+
+    @R("PulseEvent", "p")
+    def _pulseev(c, h):
+        ev = p.handles.get(h, "kevent")
+        if ev is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        # release waiters currently blocked, then reset
+        for t in p.threads:
+            w = t.waiting_on
+            if t.state == "blocked" and w and w[0] == "kwait" and h in w[1]:
+                ev.signaled = True
+                if k.wake_check(t):
+                    t.state = "running"
+                    t.waiting_on = None
+                    t.cpu.finish_yield()
+                    if not ev.manual:
+                        break
+        ev.signaled = False
+        return 1
+
+    def _cmutex(c, owned, name, wide):
+        def make():
+            m_ = _KMutex()
+            if owned:
+                m_.owner = p.current_thread.tid
+                m_.count = 1
+            return m_
+        return _create_named("kmutex", _named(name, wide), make)
+
+    @R("CreateMutexA", "pip", "p")
+    def _cmxa(c, sa, owned, name):
+        return _cmutex(c, owned, name, False)
+
+    @R("CreateMutexW", "pip", "p")
+    def _cmxw(c, sa, owned, name):
+        return _cmutex(c, owned, name, True)
+
+    @R("CreateMutexExA", "ppuu", "p")
+    def _cmxxa(c, sa, name, flags, acc):
+        return _cmutex(c, flags & 1, name, False)
+
+    @R("CreateMutexExW", "ppuu", "p")
+    def _cmxxw(c, sa, name, flags, acc):
+        return _cmutex(c, flags & 1, name, True)
+
+    @R("OpenMutexA", "uip", "p")
+    def _omxa(c, acc, inh, name):
+        return _open_named("kmutex", k.cs_(name))
+
+    @R("OpenMutexW", "uip", "p")
+    def _omxw(c, acc, inh, name):
+        return _open_named("kmutex", k.ws_(name))
+
+    @R("ReleaseMutex", "p")
+    def _relmx(c, h):
+        m_ = p.handles.get(h, "kmutex")
+        if m_ is None:
+            old = p.handles.get(h, "mutex")
+            if old is not None:
+                old["owned"] = False
+                return 1
+            return k.err(ERROR_INVALID_HANDLE)
+        if m_.owner != p.current_thread.tid:
+            return k.err(ERROR_NOT_OWNER)
+        m_.count -= 1
+        if m_.count <= 0:
+            m_.count = 0
+            m_.owner = 0
+        return 1
+
+    def _csem(c, init, mx, name, wide):
+        return _create_named("ksem", _named(name, wide), lambda: _KSemaphore(init, mx))
+
+    @R("CreateSemaphoreA", "piip", "p")
+    def _csema(c, sa, init, mx, name):
+        return _csem(c, init, mx, name, False)
+
+    @R("CreateSemaphoreW", "piip", "p")
+    def _csemw(c, sa, init, mx, name):
+        return _csem(c, init, mx, name, True)
+
+    @R("CreateSemaphoreExA", "piipuu", "p")
+    def _csemxa(c, sa, init, mx, name, f, a):
+        return _csem(c, init, mx, name, False)
+
+    @R("CreateSemaphoreExW", "piipuu", "p")
+    def _csemxw(c, sa, init, mx, name, f, a):
+        return _csem(c, init, mx, name, True)
+
+    @R("OpenSemaphoreA", "uip", "p")
+    def _osema(c, acc, inh, name):
+        return _open_named("ksem", k.cs_(name))
+
+    @R("OpenSemaphoreW", "uip", "p")
+    def _osemw(c, acc, inh, name):
+        return _open_named("ksem", k.ws_(name))
+
+    @R("ReleaseSemaphore", "pip")
+    def _relsem(c, h, n, prev):
+        s_ = p.handles.get(h, "ksem")
+        if s_ is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        if s_.count + n > s_.maximum:
+            return k.err(ERROR_TOO_MANY_POSTS)
+        if prev:
+            c.mem.write32(prev, s_.count)
+        s_.count += n
+        return 1
+
+    # critical sections -----------------------------------------------------------------
+    def _cs_init(c, a):
+        ps = k.ptr_size()
+        c.mem.write(a, bytes(24 if ps == 4 else 40))
+        k.cs[a] = [0, 0]
+        k._cs_fields(a, k.cs[a])
+        return 1
+
+    @R("InitializeCriticalSection", "p", "v")
+    def _ics(c, a):
+        _cs_init(c, a)
+
+    @R("InitializeCriticalSectionAndSpinCount", "pu")
+    def _icssc(c, a, spin):
+        return _cs_init(c, a)
+
+    @R("InitializeCriticalSectionEx", "puu")
+    def _icsx(c, a, spin, flags):
+        return _cs_init(c, a)
+
+    @R("RtlInitializeCriticalSection", "p", "i", NT)
+    def _rics(c, a):
+        _cs_init(c, a)
+        return 0
+
+    @R("SetCriticalSectionSpinCount", "pu")
+    def _scsc(c, a, n):
+        return 0
+
+    @R("EnterCriticalSection", "p", "v")
+    def _ecs(c, a):
+        st = k.cs.setdefault(a, [0, 0])
+        tid = p.current_thread.tid
+        if st[0] in (0, tid):
+            st[0] = tid
+            st[1] += 1
+            k._cs_fields(a, st)
+            return
+        k.block(c, ("cs", a))
+
+    @R("RtlEnterCriticalSection", "p", "i", NT)
+    def _recs(c, a):
+        _ecs(c, a)
+        return 0
+
+    @R("TryEnterCriticalSection", "p")
+    def _tecs(c, a):
+        st = k.cs.setdefault(a, [0, 0])
+        tid = p.current_thread.tid
+        if st[0] in (0, tid):
+            st[0] = tid
+            st[1] += 1
+            k._cs_fields(a, st)
+            return 1
+        return 0
+
+    @R("LeaveCriticalSection", "p", "v")
+    def _lcs(c, a):
+        st = k.cs.setdefault(a, [0, 0])
+        if st[1] > 0:
+            st[1] -= 1
+        if st[1] == 0:
+            st[0] = 0
+        k._cs_fields(a, st)
+
+    @R("RtlLeaveCriticalSection", "p", "i", NT)
+    def _rlcs(c, a):
+        _lcs(c, a)
+        return 0
+
+    @R("DeleteCriticalSection", "p", "v")
+    def _dcs(c, a):
+        k.cs.pop(a, None)
+
+    @R("RtlDeleteCriticalSection", "p", "i", NT)
+    def _rdcs(c, a):
+        k.cs.pop(a, None)
+        return 0
+
+    # SRW locks / condition variables / init-once ----------------------------------------
+    @R("InitializeSRWLock", "p", "v")
+    def _isrw(c, a):
+        k.srw[a] = [0, 0]
+        k.wptr(a, 0)
+
+    @R("AcquireSRWLockExclusive", "p", "v")
+    def _asrwx(c, a):
+        st = k.srw.setdefault(a, [0, 0])
+        if st[0] == 0 and st[1] == 0:
+            st[0] = p.current_thread.tid
+            return
+        k.block(c, ("srw", a, True))
+
+    @R("AcquireSRWLockShared", "p", "v")
+    def _asrws(c, a):
+        st = k.srw.setdefault(a, [0, 0])
+        if st[0] == 0:
+            st[1] += 1
+            return
+        k.block(c, ("srw", a, False))
+
+    @R("TryAcquireSRWLockExclusive", "p")
+    def _tasrwx(c, a):
+        st = k.srw.setdefault(a, [0, 0])
+        if st[0] == 0 and st[1] == 0:
+            st[0] = p.current_thread.tid
+            return 1
+        return 0
+
+    @R("TryAcquireSRWLockShared", "p")
+    def _tasrws(c, a):
+        st = k.srw.setdefault(a, [0, 0])
+        if st[0] == 0:
+            st[1] += 1
+            return 1
+        return 0
+
+    @R("ReleaseSRWLockExclusive", "p", "v")
+    def _rsrwx(c, a):
+        st = k.srw.setdefault(a, [0, 0])
+        st[0] = 0
+
+    @R("ReleaseSRWLockShared", "p", "v")
+    def _rsrws(c, a):
+        st = k.srw.setdefault(a, [0, 0])
+        st[1] = max(0, st[1] - 1)
+
+    @R("InitializeConditionVariable", "p", "v")
+    def _icv(c, a):
+        k.cv[a] = set()
+        k.wptr(a, 0)
+
+    def _cv_sleep(c, cv, lock, lkind, excl, ms):
+        t = p.current_thread
+        k.cv.setdefault(cv, set()).discard(t.tid)
+        if lkind == "cs":
+            st = k.cs.setdefault(lock, [0, 0])
+            t.cv_saved_count = st[1]
+            st[0], st[1] = 0, 0
+            k._cs_fields(lock, st)
+        else:
+            st = k.srw.setdefault(lock, [0, 0])
+            if excl:
+                st[0] = 0
+            else:
+                st[1] = max(0, st[1] - 1)
+        t.cv_waiting = cv
+        deadline = None if ms == INFINITE else time.monotonic() + ms / 1000.0
+        k.cv_waiters = getattr(k, "cv_waiters", {})
+        k.cv_waiters.setdefault(cv, []).append(t.tid)
+        k.block(c, ("cv", cv, lock, lkind, excl), deadline, rax=1)
+
+    @R("SleepConditionVariableCS", "ppu")
+    def _scvcs(c, cv, cs, ms):
+        _cv_sleep(c, cv, cs, "cs", True, ms)
+
+    @R("SleepConditionVariableSRW", "ppuu")
+    def _scvsrw(c, cv, lock, ms, flags):
+        _cv_sleep(c, cv, lock, "srw", not (flags & 1), ms)
+
+    @R("WakeConditionVariable", "p", "v")
+    def _wcv(c, cv):
+        waiters = getattr(k, "cv_waiters", {}).get(cv, [])
+        if waiters:
+            k.cv.setdefault(cv, set()).add(waiters.pop(0))
+
+    @R("WakeAllConditionVariable", "p", "v")
+    def _wacv(c, cv):
+        waiters = getattr(k, "cv_waiters", {}).get(cv, [])
+        k.cv.setdefault(cv, set()).update(waiters)
+        del waiters[:]
+
+    @R("InitOnceInitialize", "p", "v")
+    def _ioi(c, a):
+        k.wptr(a, 0)
+
+    @R("InitOnceExecuteOnce", "pppp")
+    def _ioeo(c, once, fn, param, ctx):
+        ps = k.ptr_size()
+        st = c.mem.read64(once) if ps == 8 else c.mem.read32(once)
+        if st & 2:
+            if ctx:
+                k.wptr(ctx, st & ~3)
+            return 1
+        r = p.call_guest(fn, [once, param, ctx]) & 0xFFFFFFFF
+        if r:
+            val = (c.mem.read64(ctx) if ps == 8 else c.mem.read32(ctx)) if ctx else 0
+            k.wptr(once, (val & ~3) | 2)
+        return 1 if r else 0
+
+    @R("InitOnceBeginInitialize", "pupp")
+    def _iobi(c, once, flags, pending, ctx):
+        ps = k.ptr_size()
+        st = c.mem.read64(once) if ps == 8 else c.mem.read32(once)
+        done = st & 2
+        c.mem.write32(pending, 0 if done else 1)
+        if done and ctx:
+            k.wptr(ctx, st & ~3)
+        return 1
+
+    @R("InitOnceComplete", "pup")
+    def _ioc(c, once, flags, ctx):
+        k.wptr(once, (ctx & ~3) | 2)
+        return 1
+
+    # interlocked (exported by 32-bit kernel32; x64 compilers inline them) ------------------
+    @R("InterlockedIncrement", "p")
+    def _ii(c, a):
+        v = (c.mem.read32(a) + 1) & 0xFFFFFFFF
+        c.mem.write32(a, v)
+        return v
+
+    @R("InterlockedDecrement", "p")
+    def _id(c, a):
+        v = (c.mem.read32(a) - 1) & 0xFFFFFFFF
+        c.mem.write32(a, v)
+        return v
+
+    @R("InterlockedExchange", "pu")
+    def _ix(c, a, v):
+        old = c.mem.read32(a)
+        c.mem.write32(a, v)
+        return old
+
+    @R("InterlockedExchangeAdd", "pu")
+    def _ixa(c, a, v):
+        old = c.mem.read32(a)
+        c.mem.write32(a, old + v)
+        return old
+
+    @R("InterlockedCompareExchange", "puu")
+    def _icx(c, a, new, cmp):
+        old = c.mem.read32(a)
+        if old == cmp:
+            c.mem.write32(a, new)
+        return old
+
+    @R("InterlockedCompareExchange64", "pQQ", "q")
+    def _icx64(c, a, new, cmp):
+        old = c.mem.read64(a)
+        if old == cmp:
+            c.mem.write64(a, new)
+        return old
+
+    @R("InterlockedPushEntrySList", "pp", "p")
+    def _ipesl(c, head, entry):
+        ps = k.ptr_size()
+        first = c.mem.read64(head) if ps == 8 else c.mem.read32(head)
+        k.wptr(entry, first)
+        k.wptr(head, entry)
+        return first
+
+    @R("InterlockedPopEntrySList", "p", "p")
+    def _ipopsl(c, head):
+        ps = k.ptr_size()
+        first = c.mem.read64(head) if ps == 8 else c.mem.read32(head)
+        if first:
+            nxt = c.mem.read64(first) if ps == 8 else c.mem.read32(first)
+            k.wptr(head, nxt)
+        return first
+
+    @R("InitializeSListHead", "p", "v")
+    def _islh(c, head):
+        c.mem.write(head, bytes(16))
+
+    @R("InterlockedFlushSList", "p", "p")
+    def _ifsl(c, head):
+        ps = k.ptr_size()
+        first = c.mem.read64(head) if ps == 8 else c.mem.read32(head)
+        k.wptr(head, 0)
+        return first
+
+    # TLS / FLS -------------------------------------------------------------------------
+    @R("TlsAlloc", "")
+    def _tlsalloc(c):
+        return p.tls_alloc()
+
+    @R("TlsFree", "u")
+    def _tlsfree(c, i):
+        return 1 if p.tls_free(i) else 0
+
+    @R("TlsGetValue", "u", "p")
+    def _tlsget(c, i):
+        p.last_error = 0
+        return p.tls_get(i)
+
+    @R("TlsSetValue", "up")
+    def _tlsset(c, i, v):
+        return 1 if p.tls_set(i, v) else k.err(ERROR_INVALID_PARAMETER)
+
+    @R("FlsAlloc", "p")
+    def _flsalloc(c, cb):
+        i = p.tls_alloc()
+        return i
+
+    @R("FlsFree", "u")
+    def _flsfree(c, i):
+        return 1 if p.tls_free(i) else 0
+
+    @R("FlsGetValue", "u", "p")
+    def _flsget(c, i):
+        return p.tls_get(i)
+
+    @R("FlsSetValue", "up")
+    def _flsset(c, i, v):
+        return 1 if p.tls_set(i, v) else 0
+
+    @R("EncodePointer DecodePointer EncodeSystemPointer DecodeSystemPointer RtlEncodePointer "
+       "RtlDecodePointer", "p", "p", _K32_DLLS + NT)
+    def _encptr(c, v):
+        return v
+
+    @R("QueueUserAPC", "ppp")
+    def _qapc(c, fn, h, data):
+        return 1
+
+    # =====================================================================
+    # handles
+    # =====================================================================
+    @R("CloseHandle", "p")
+    def _closehandle(c, h):
+        if h in (HandleTable.STDIN_HANDLE, HandleTable.STDOUT_HANDLE, HandleTable.STDERR_HANDLE):
+            return 1
+        kind = p.handles.kind(h)
+        if kind is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        obj = p.handles.get(h)
+        if kind == "file":
+            others = [hh for hh, (kk, oo) in p.handles._map.items() if oo is obj and hh != h]
+            if not others:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+        elif kind == "pipe_r":
+            obj.readers -= 1
+        elif kind == "pipe_w":
+            obj.writers -= 1
+        meta = k.file_meta.get(h)
+        p.handles.close(h)
+        k.file_meta.pop(h, None)
+        if meta and meta.get("doc") and not any(
+                m_.get("host") == meta["host"] for m_ in k.file_meta.values()):
+            try:
+                if os.path.isdir(meta["host"]):
+                    os.rmdir(meta["host"])
+                else:
+                    os.unlink(meta["host"])
+            except OSError:
+                pass
+        return 1
+
+    @R("DuplicateHandle", "ppppuiu")
+    def _duph(c, sp, h, tp, out, acc, inh, opt):
+        if h in (0xFFFFFFFE, 0xFFFFFFFFFFFFFFFE):
+            nh = p.handles.add(p.current_thread, "thread")
+        elif h in (0xFFFFFFFF, M64):
+            nh = p.handles.add({"exited": False}, "process")
+        else:
+            kind = p.handles.kind(h)
+            if kind is None:
+                if h in (HandleTable.STDIN_HANDLE, HandleTable.STDOUT_HANDLE, HandleTable.STDERR_HANDLE):
+                    nh = h
+                else:
+                    return k.err(ERROR_INVALID_HANDLE)
+            else:
+                nh = p.handles.add(p.handles.get(h), kind)
+                if h in k.file_meta:
+                    k.file_meta[nh] = dict(k.file_meta[h])
+        if out:
+            k.wptr(out, nh)
+        if opt & 1:                                # DUPLICATE_CLOSE_SOURCE
+            p.handles.close(h)
+        return 1
+
+    @R("GetHandleInformation", "pp")
+    def _ghi(c, h, out):
+        if out:
+            c.mem.write32(out, 0)
+        return 1
+
+    @R("SetHandleInformation", "puu")
+    def _shi(c, h, m_, f):
+        return 1
+
+    @R("CompareObjectHandles", "pp")
+    def _coh(c, a, b):
+        return 1 if p.handles.get(a) is p.handles.get(b) else 0
+
+    # =====================================================================
+    # files & directories
+    # =====================================================================
+    import errno as _errno
+    STD = (HandleTable.STDIN_HANDLE, HandleTable.STDOUT_HANDLE, HandleTable.STDERR_HANDLE)
+    INVALID = M64                               # masked to the guest word size on return
+    FA_RO, FA_DIR, FA_ARCH, FA_NORMAL = 0x1, 0x10, 0x20, 0x80
+    GR, GW, GE, GA = 0x80000000, 0x40000000, 0x20000000, 0x10000000
+    _OSERR = {_errno.ENOENT: 2, _errno.ENOTDIR: 3, _errno.EACCES: 5, _errno.EPERM: 5,
+              _errno.EEXIST: 80, _errno.ENOTEMPTY: 145, _errno.EISDIR: 5, _errno.ENOSPC: 112,
+              _errno.EBADF: 6, _errno.EINVAL: 87, _errno.EXDEV: 17, _errno.ENAMETOOLONG: 206,
+              _errno.EBUSY: 32, _errno.EMFILE: 4}
+
+    def oserr(e, host=None):
+        code = _OSERR.get(getattr(e, "errno", None), 5)
+        if code == 2 and host is not None and not os.path.isdir(os.path.dirname(host)):
+            code = 3
+        p.last_error = code
+        return 0
+
+    def resolve(path, write=False):
+        """guest path -> host path, or None (last error set)."""
+        if path.startswith("\\\\?\\") or path.startswith("\\??\\"):
+            path = path[4:]
+        if not path:
+            p.last_error = ERROR_PATH_NOT_FOUND
+            return None
+        try:
+            return k.host_path(path, write)
+        except NOOSandboxViolation as e:
+            p.log.warn("[sandbox] %s" % e)
+            p.last_error = ERROR_ACCESS_DENIED
+            return None
+        except Exception:
+            p.last_error = 123                      # ERROR_INVALID_NAME
+            return None
+
+    def full_path(path):
+        path = path.replace("/", "\\")
+        if path.startswith("\\\\?\\"):
+            path = path[4:]
+        trail = path.endswith("\\") and len(path) > 1
+        drive, parts = VirtualFileSystem.normalize(path, p.vfs.cwd)
+        out = drive + ":\\" + "\\".join(parts)
+        if trail and parts:
+            out += "\\"
+        return out
+
+    def missing(host):
+        p.last_error = ERROR_FILE_NOT_FOUND if os.path.isdir(os.path.dirname(host)) \
+            else ERROR_PATH_NOT_FOUND
+        return 0
+
+    def attrs_of(host, st=None):
+        try:
+            st = st or os.stat(host)
+        except OSError:
+            return None
+        import stat as _stat
+        if _stat.S_ISDIR(st.st_mode):
+            a = FA_DIR
+        else:
+            a = FA_ARCH
+        if not st.st_mode & 0o200:
+            a |= FA_RO
+        name = os.path.basename(host)
+        if name.startswith(".") and name not in (".", ".."):
+            a |= 0x2                                # hidden (dotfiles, like Wine)
+        return a
+
+    def times_of(st):
+        c_ = _ft_from_unix(min(st.st_ctime, st.st_mtime))
+        return c_, _ft_from_unix(st.st_atime), _ft_from_unix(st.st_mtime)
+
+    def w64(addr, v):
+        if addr:
+            p.mem.write64(addr, v & M64)
+
+    def w32(addr, v):
+        if addr:
+            p.mem.write32(addr, v & 0xFFFFFFFF)
+
+    class _NullDev:
+        pass
+
+    class _KDir:
+        def __init__(self, host, path):
+            self.host, self.path = host, path
+
+    class _KPipe:
+        def __init__(self, size):
+            self.buf = bytearray()
+            self.readers = 1
+            self.writers = 1
+            self.size = size or 4096
+
+    k.null_dev = _NullDev()
+    k.std = {0xFFFFFFF6: HandleTable.STDIN_HANDLE, 0xFFFFFFF5: HandleTable.STDOUT_HANDLE,
+             0xFFFFFFF4: HandleTable.STDERR_HANDLE}
+
+    def stdin_read(n):
+        crt = getattr(api, "crt", None)
+        if crt is not None:
+            return crt._stdin_read(n) or b""
+        return p._handle_read(HandleTable.STDIN_HANDLE, n) or b""
+
+    def console_write(h, data):
+        crt = getattr(api, "crt", None)
+        if crt is not None and hasattr(crt, "flush_std"):
+            crt.flush_std()
+        p.log.guest_write(data, "stderr" if h == HandleTable.STDERR_HANDLE else "stdout")
+
+    def is_console(h):
+        return h in STD or p.handles.kind(h) in ("conin", "conout")
+
+    def create_file(c, path, access, share, disp, flags):
+        up = path.upper().replace("/", "\\")
+        if up in ("CONIN$", "\\\\.\\CONIN$"):
+            return p.handles.add(k.null_dev, "conin")
+        if up in ("CONOUT$", "CON", "\\\\.\\CONOUT$"):
+            return p.handles.add(k.null_dev, "conout")
+        if up in ("NUL", "\\\\.\\NUL") or up.endswith("\\NUL") or up.startswith("NUL."):
+            p.last_error = 0
+            return p.handles.add(k.null_dev, "null")
+        if up.startswith("\\\\.\\"):
+            p.log.warn("CreateFile on device %s — not available" % path)
+            p.last_error = ERROR_FILE_NOT_FOUND
+            return INVALID
+        if not 1 <= disp <= 5:
+            p.last_error = ERROR_INVALID_PARAMETER
+            return INVALID
+        host = resolve(path, True)
+        if host is None:
+            return INVALID
+        exists = os.path.exists(host)
+        if exists and os.path.isdir(host):
+            if flags & 0x02000000:                  # FILE_FLAG_BACKUP_SEMANTICS
+                if disp == 1:
+                    p.last_error = ERROR_FILE_EXISTS
+                    return INVALID
+                h = p.handles.add(_KDir(host, full_path(path)), "dir")
+                k.file_meta[h] = {"path": full_path(path), "host": host, "access": access,
+                                  "doc": bool(flags & 0x04000000), "append": False}
+                p.last_error = 0
+                return h
+            p.last_error = ERROR_ACCESS_DENIED
+            return INVALID
+        if not os.path.isdir(os.path.dirname(host)):
+            p.last_error = ERROR_PATH_NOT_FOUND
+            return INVALID
+        if disp == 1 and exists:
+            p.last_error = ERROR_FILE_EXISTS
+            return INVALID
+        if disp in (3, 5) and not exists:
+            p.last_error = ERROR_FILE_NOT_FOUND
+            return INVALID
+        wr = bool(access & (GW | GA | 0x2 | 0x4 | 0x10 | 0x100 | 0x10000))
+        rd = bool(access & (GR | GA | GE | 0x1 | 0x20)) or not wr
+        if disp in (1, 2, 4, 5) and not wr and disp != 4:
+            wr = True if disp in (1, 2, 5) else wr
+        fl = os.O_RDWR if rd and wr else (os.O_WRONLY if wr else os.O_RDONLY)
+        if disp in (1, 2, 4):
+            fl |= os.O_CREAT
+        if disp == 1:
+            fl |= os.O_EXCL
+        if disp in (2, 5):
+            fl |= os.O_TRUNC
+        fl |= getattr(os, "O_BINARY", 0)
+        try:
+            if disp in (1, 2, 4) and not wr:
+                # OPEN_ALWAYS/CREATE_* with read-only access still creates
+                fd = os.open(host, (fl & ~(os.O_WRONLY | os.O_RDWR)) | os.O_RDWR)
+                os.close(fd)
+                fd = os.open(host, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+            else:
+                fd = os.open(host, fl, 0o666 if not (flags & FA_RO) or exists else 0o444)
+        except OSError as e:
+            if e.errno == _errno.EEXIST:
+                p.last_error = ERROR_FILE_EXISTS
+                return INVALID
+            oserr(e, host)
+            return INVALID
+        mode = "r+b" if rd and wr else ("wb" if wr else "rb")
+        f = os.fdopen(fd, mode, buffering=0)
+        h = p.handles.add(f, "file")
+        k.file_meta[h] = {"path": full_path(path), "host": host, "access": access,
+                          "doc": bool(flags & 0x04000000),
+                          "append": bool(access & 0x4) and not access & (GW | GA | 0x2)}
+        p.last_error = ERROR_ALREADY_EXISTS if exists and disp in (2, 4) else 0
+        return h
+
+    @R("CreateFileA", "puupuup", "p")
+    def _cfa(c, name, access, share, sa, disp, flags, tmpl):
+        return create_file(c, k.cs_(name), access, share, disp, flags)
+
+    @R("CreateFileW", "puupuup", "p")
+    def _cfw(c, name, access, share, sa, disp, flags, tmpl):
+        return create_file(c, k.ws_(name), access, share, disp, flags)
+
+    @R("CreateFile2", "puuup", "p")
+    def _cf2(c, name, access, share, disp, params):
+        flags = 0
+        if params:
+            flags = p.mem.read32(params + 4) | p.mem.read32(params + 8)
+        return create_file(c, k.ws_(name), access, share, disp, flags)
+
+    @R("OpenFile", "ppu", "p")
+    def _openfile(c, name, ofs, style):
+        path = k.cs_(name)
+        disp = 3
+        access = GR
+        if style & 0x1000:                          # OF_CREATE
+            disp, access = 2, GR | GW
+        elif style & 0x3:
+            access = GR | GW if style & 2 else GW
+        if style & 0x200:                           # OF_DELETE
+            host = resolve(path, True)
+            try:
+                os.unlink(host)
+                return 1
+            except OSError as e:
+                oserr(e, host)
+                return INVALID
+        if style & 0x4000:                          # OF_EXIST
+            host = resolve(path)
+            return 1 if host and os.path.isfile(host) else (k.err(2) or INVALID)
+        return create_file(c, path, access, 3, disp, 0)
+
+    def _ov_off(ov):
+        if p.cpu_mode == 64:
+            return p.mem.read32(ov + 16) | (p.mem.read32(ov + 20) << 32)
+        return p.mem.read32(ov + 8) | (p.mem.read32(ov + 12) << 32)
+
+    def _ov_done(ov, status, n):
+        ps = k.ptr_size()
+        k.wptr(ov, status)
+        k.wptr(ov + ps, n)
+        ev = p.mem.read64(ov + 24) if ps == 8 else p.mem.read32(ov + 16)
+        e = p.handles.get(ev, "kevent")
+        if e is not None:
+            e.signaled = True
+
+    def pipe_read(pipe, buf, n):
+        data = bytes(pipe.buf[:n])
+        del pipe.buf[:len(data)]
+        if data:
+            p.mem.write(buf, data)
+        return data
+
+    @R("ReadFile", "ppupp")
+    def _readfile(c, h, buf, n, pread, ov):
+        w32(pread, 0)
+        kind = p.handles.kind(h)
+        if h == HandleTable.STDIN_HANDLE or kind == "conin":
+            data = stdin_read(n) if n else b""
+        elif kind == "file":
+            f = p.handles.get(h)
+            try:
+                if ov:
+                    f.seek(_ov_off(ov))
+                data = f.read(n) if n else b""
+            except (OSError, ValueError) as e:
+                return oserr(e) if isinstance(e, OSError) and e.errno else k.err(ERROR_ACCESS_DENIED)
+            data = data or b""
+        elif kind == "null":
+            data = b""
+        elif kind == "pipe_r":
+            pipe = p.handles.get(h)
+            if not pipe.buf:
+                if pipe.writers <= 0:
+                    return k.err(109)               # ERROR_BROKEN_PIPE
+                t = p.current_thread
+                t.state = "blocked"
+                t.waiting_on = ("pipe", pipe, buf, n, pread, None)
+                c.regs[RAX] = 0
+                raise NOOYield()
+            data = pipe_read(pipe, buf, n)
+            w32(pread, len(data))
+            return 1
+        elif kind in ("dir", "pipe_w", "conout") or h in STD:
+            return k.err(ERROR_ACCESS_DENIED if kind != "dir" else 1)
+        else:
+            return k.err(ERROR_INVALID_HANDLE)
+        if data:
+            c.mem.write(buf, data)
+        w32(pread, len(data))
+        if ov:
+            if not data and n and kind == "file":
+                _ov_done(ov, 0xC0000011, 0)         # STATUS_END_OF_FILE
+                return k.err(ERROR_HANDLE_EOF)
+            _ov_done(ov, 0, len(data))
+        return 1
+
+    def write_handle(c, h, data, ov=0):
+        kind = p.handles.kind(h)
+        if h in (HandleTable.STDOUT_HANDLE, HandleTable.STDERR_HANDLE) or kind == "conout":
+            console_write(h, data)
+            return len(data)
+        if kind == "file":
+            f = p.handles.get(h)
+            meta = k.file_meta.get(h, {})
+            try:
+                if ov:
+                    off = _ov_off(ov)
+                    if off & 0xFFFFFFFFFFFFFFFF == 0xFFFFFFFFFFFFFFFF:
+                        f.seek(0, 2)
+                    else:
+                        f.seek(off)
+                elif meta.get("append"):
+                    f.seek(0, 2)
+                f.write(data)
+            except (OSError, ValueError) as e:
+                if isinstance(e, OSError) and e.errno:
+                    oserr(e)
+                else:
+                    p.last_error = ERROR_ACCESS_DENIED
+                return None
+            return len(data)
+        if kind == "null":
+            return len(data)
+        if kind == "pipe_w":
+            pipe = p.handles.get(h)
+            if pipe.readers <= 0:
+                p.last_error = 232                  # ERROR_NO_DATA
+                return None
+            pipe.buf += data
+            return len(data)
+        if h == HandleTable.STDIN_HANDLE or kind in ("conin", "dir", "pipe_r"):
+            p.last_error = ERROR_ACCESS_DENIED
+            return None
+        p.last_error = ERROR_INVALID_HANDLE
+        return None
+
+    @R("WriteFile", "ppupp")
+    def _writefile(c, h, buf, n, pwritten, ov):
+        w32(pwritten, 0)
+        data = c.mem.read(buf, n) if n else b""
+        r = write_handle(c, h, data, ov)
+        if r is None:
+            return 0
+        w32(pwritten, r)
+        if ov:
+            _ov_done(ov, 0, r)
+        return 1
+
+    @R("ReadFileEx", "ppupp")
+    def _readfileex(c, h, buf, n, ov, cb):
+        return _readfile(c, h, buf, n, 0, ov)
+
+    @R("WriteFileEx", "ppupp")
+    def _writefileex(c, h, buf, n, ov, cb):
+        return _writefile(c, h, buf, n, 0, ov)
+
+    @R("GetOverlappedResult", "pppi")
+    def _gor(c, h, ov, pn, wait):
+        n = p.mem.read64(ov + 8) if p.cpu_mode == 64 else p.mem.read32(ov + 4)
+        st = p.mem.read64(ov) if p.cpu_mode == 64 else p.mem.read32(ov)
+        w32(pn, n)
+        if st == 0xC0000011:
+            return k.err(ERROR_HANDLE_EOF)
+        return 1
+
+    @R("GetOverlappedResultEx", "pppui")
+    def _gorx(c, h, ov, pn, ms, alert):
+        return _gor(c, h, ov, pn, 1)
+
+    @R("CancelIo", "p")
+    def _cancelio(c, h):
+        return 1
+
+    @R("CancelIoEx", "pp")
+    def _cancelioex(c, h, ov):
+        return k.err(1168)                          # ERROR_NOT_FOUND: nothing pending
+
+    @R("FlushFileBuffers", "p")
+    def _flushfb(c, h):
+        kind = p.handles.kind(h)
+        if kind == "file":
+            try:
+                p.handles.get(h).flush()
+            except Exception:
+                pass
+            return 1
+        if h in STD or kind is not None:
+            return 1
+        return k.err(ERROR_INVALID_HANDLE)
+
+    def _file(h):
+        f = p.handles.get(h, "file")
+        if f is None:
+            p.last_error = ERROR_INVALID_HANDLE
+        return f
+
+    @R("GetFileSize", "pp")
+    def _gfs(c, h, phigh):
+        f = _file(h)
+        if f is None:
+            return 0xFFFFFFFF
+        size = os.fstat(f.fileno()).st_size
+        w32(phigh, size >> 32)
+        if size & 0xFFFFFFFF == 0xFFFFFFFF:
+            p.last_error = 0
+        return size & 0xFFFFFFFF
+
+    @R("GetFileSizeEx", "pp")
+    def _gfsx(c, h, out):
+        f = _file(h)
+        if f is None:
+            return 0
+        w64(out, os.fstat(f.fileno()).st_size)
+        return 1
+
+    def _seek(h, dist, method):
+        f = _file(h)
+        if f is None:
+            return None
+        if method > 2:
+            p.last_error = ERROR_INVALID_PARAMETER
+            return None
+        base = (0, f.tell(), os.fstat(f.fileno()).st_size)[method]
+        new = base + dist
+        if new < 0:
+            p.last_error = 131                      # ERROR_NEGATIVE_SEEK
+            return None
+        f.seek(new)
+        return new
+
+    @R("SetFilePointer", "pipu")
+    def _sfp(c, h, lo, phigh, method):
+        if phigh:
+            dist = _s64(((p.mem.read32(phigh)) << 32) | (lo & 0xFFFFFFFF))
+        else:
+            dist = lo
+        new = _seek(h, dist, method)
+        if new is None:
+            return 0xFFFFFFFF
+        w32(phigh, new >> 32)
+        if new & 0xFFFFFFFF == 0xFFFFFFFF:
+            p.last_error = 0
+        return new & 0xFFFFFFFF
+
+    @R("SetFilePointerEx", "pqpu")
+    def _sfpx(c, h, dist, out, method):
+        new = _seek(h, dist, method)
+        if new is None:
+            return 0
+        w64(out, new)
+        return 1
+
+    @R("SetEndOfFile", "p")
+    def _seof(c, h):
+        f = _file(h)
+        if f is None:
+            return 0
+        try:
+            f.truncate(f.tell())
+        except OSError as e:
+            return oserr(e)
+        return 1
+
+    @R("SetFileValidData", "pq")
+    def _sfvd(c, h, n):
+        return 1
+
+    @R("LockFile UnlockFile", "puuuu")
+    def _lockfile(c, h, a, b_, d, e):
+        return 1
+
+    @R("LockFileEx", "puuuup")
+    def _lockfileex(c, h, fl, r, lo, hi, ov):
+        return 1
+
+    @R("UnlockFileEx", "puuup")
+    def _unlockfileex(c, h, r, lo, hi, ov):
+        return 1
+
+    @R("GetFileType", "p")
+    def _gft(c, h):
+        kind = p.handles.kind(h)
+        if h in STD or kind in ("conin", "conout", "null"):
+            return 2                                # FILE_TYPE_CHAR
+        if kind in ("file", "dir"):
+            return 1                                # FILE_TYPE_DISK
+        if kind in ("pipe_r", "pipe_w"):
+            return 3                                # FILE_TYPE_PIPE
+        p.last_error = ERROR_INVALID_HANDLE if kind is None else 0
+        return 0
+
+    def _hstat(h):
+        kind = p.handles.kind(h)
+        if kind == "file":
+            return os.fstat(p.handles.get(h).fileno()), k.file_meta.get(h, {}).get("host")
+        if kind == "dir":
+            d = p.handles.get(h)
+            return os.stat(d.host), d.host
+        p.last_error = ERROR_INVALID_HANDLE
+        return None, None
+
+    @R("GetFileTime", "pppp")
+    def _gftime(c, h, pc, pa, pw):
+        st, host = _hstat(h)
+        if st is None:
+            return 0
+        ct, at, mt = times_of(st)
+        w64(pc, ct)
+        w64(pa, at)
+        w64(pw, mt)
+        return 1
+
+    @R("SetFileTime", "pppp")
+    def _sftime(c, h, pc, pa, pw):
+        st, host = _hstat(h)
+        if st is None:
+            return 0
+        at = _unix_from_ft(p.mem.read64(pa)) if pa and p.mem.read64(pa) else st.st_atime
+        mt = _unix_from_ft(p.mem.read64(pw)) if pw and p.mem.read64(pw) else st.st_mtime
+        try:
+            os.utime(host, (at, mt))
+        except OSError as e:
+            return oserr(e)
+        return 1
+
+    @R("GetFileInformationByHandle", "pp")
+    def _gfibh(c, h, out):
+        st, host = _hstat(h)
+        if st is None:
+            return 0
+        ct, at, mt = times_of(st)
+        size = 0 if os.path.isdir(host) else st.st_size
+        ino = st.st_ino & M64
+        p.mem.write(out, struct.pack("<IQQQIIIIII", attrs_of(host, st), ct, at, mt, 0x4E4F4F21,
+                                     size >> 32, size & 0xFFFFFFFF, st.st_nlink,
+                                     ino >> 32, ino & 0xFFFFFFFF))
+        return 1
+
+    @R("GetFileInformationByHandleEx", "pupu")
+    def _gfibhx(c, h, cls, buf, size):
+        st, host = _hstat(h)
+        if st is None:
+            return 0
+        ct, at, mt = times_of(st)
+        isdir = os.path.isdir(host)
+        if cls == 0:                                # FileBasicInfo
+            data = struct.pack("<QQQQI4x", ct, at, mt, mt, attrs_of(host, st))
+        elif cls == 1:                              # FileStandardInfo
+            sz = 0 if isdir else st.st_size
+            data = struct.pack("<qqIBB2x", (sz + 4095) & ~4095, sz, st.st_nlink,
+                               1 if k.file_meta.get(h, {}).get("doc") else 0, 1 if isdir else 0)
+        elif cls == 2:                              # FileNameInfo
+            name = k.file_meta.get(h, {}).get("path", "")[2:].encode("utf-16-le")
+            data = struct.pack("<I", len(name)) + name
+            if size < len(data):
+                if size >= 4:
+                    p.mem.write(buf, data[:size])
+                return k.err(234)                   # ERROR_MORE_DATA
+        elif cls == 9:                              # FileAttributeTagInfo
+            data = struct.pack("<II", attrs_of(host, st), 0)
+        elif cls == 0x12:                           # FileIdInfo
+            data = struct.pack("<Q", 0x4E4F4F21) + (st.st_ino & M64).to_bytes(16, "little")
+        else:
+            return k.err(ERROR_INVALID_PARAMETER)
+        if size < len(data):
+            return k.err(ERROR_INSUFFICIENT_BUFFER)
+        p.mem.write(buf, data)
+        return 1
+
+    @R("SetFileInformationByHandle", "pupu")
+    def _sfibh(c, h, cls, buf, size):
+        st, host = _hstat(h)
+        if st is None:
+            return 0
+        meta = k.file_meta.setdefault(h, {})
+        if cls == 4:                                # FileDispositionInfo
+            meta["doc"] = bool(p.mem.read8(buf))
+        elif cls == 6:                              # FileEndOfFileInfo
+            f = _file(h)
+            if f is not None:
+                f.truncate(p.mem.read64(buf))
+        elif cls == 5:                              # FileAllocationInfo
+            pass
+        elif cls == 0:                              # FileBasicInfo
+            at, mt = p.mem.read64(buf + 8), p.mem.read64(buf + 16)
+            try:
+                os.utime(host, (_unix_from_ft(at) if at else st.st_atime,
+                                _unix_from_ft(mt) if mt else st.st_mtime))
+            except OSError:
+                pass
+        elif cls == 3:                              # FileRenameInfo
+            ps = k.ptr_size()
+            replace = p.mem.read8(buf)
+            off = 8 + ps if ps == 8 else 8
+            ln = p.mem.read32(buf + off)
+            new = p.mem.read(buf + off + 4, ln).decode("utf-16-le", "replace")
+            dst = resolve(new, True)
+            if dst is None:
+                return 0
+            if os.path.exists(dst) and not replace:
+                return k.err(ERROR_ALREADY_EXISTS)
+            try:
+                os.replace(host, dst)
+            except OSError as e:
+                return oserr(e)
+            meta["host"] = dst
+            meta["path"] = full_path(new)
+        else:
+            return k.err(ERROR_INVALID_PARAMETER)
+        return 1
+
+    def _final_name(h):
+        meta = k.file_meta.get(h)
+        if meta is None:
+            return None
+        return meta["path"]
+
+    def _gfpnbh(c, h, buf, n, flags, wide):
+        name = _final_name(h)
+        if name is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        vol = flags & 0x3
+        if vol == 0:
+            name = "\\\\?\\" + name
+        elif vol == 1:
+            name = "\\\\?\\Volume{4e4f4f21-0000-0000-0000-000000000000}" + name[2:]
+        else:
+            name = name[2:]
+        return k.put(buf, n, name, wide)
+
+    @R("GetFinalPathNameByHandleA", "ppuu")
+    def _gfpnbha(c, h, buf, n, flags):
+        return _gfpnbh(c, h, buf, n, flags, False)
+
+    @R("GetFinalPathNameByHandleW", "ppuu")
+    def _gfpnbhw(c, h, buf, n, flags):
+        return _gfpnbh(c, h, buf, n, flags, True)
+
+    # -- attributes --------------------------------------------------------------------
+    def _gfa(path):
+        host = resolve(path)
+        if host is None:
+            return 0xFFFFFFFF
+        a = attrs_of(host)
+        if a is None:
+            missing(host)
+            return 0xFFFFFFFF
+        return a
+
+    @R("GetFileAttributesA", "p")
+    def _gfaa(c, name):
+        return _gfa(k.cs_(name))
+
+    @R("GetFileAttributesW", "p")
+    def _gfaw(c, name):
+        return _gfa(k.ws_(name))
+
+    def _gfax(path, out):
+        host = resolve(path)
+        if host is None:
+            return 0
+        try:
+            st = os.stat(host)
+        except OSError:
+            return missing(host)
+        ct, at, mt = times_of(st)
+        size = 0 if os.path.isdir(host) else st.st_size
+        p.mem.write(out, struct.pack("<IQQQII", attrs_of(host, st), ct, at, mt, size >> 32,
+                                     size & 0xFFFFFFFF))
+        return 1
+
+    @R("GetFileAttributesExA", "pup")
+    def _gfaxa(c, name, lvl, out):
+        return _gfax(k.cs_(name), out)
+
+    @R("GetFileAttributesExW", "pup")
+    def _gfaxw(c, name, lvl, out):
+        return _gfax(k.ws_(name), out)
+
+    def _sfa(path, a):
+        host = resolve(path, True)
+        if host is None:
+            return 0
+        try:
+            mode = os.stat(host).st_mode
+            os.chmod(host, (mode & ~0o222) if a & FA_RO else (mode | 0o200))
+        except OSError as e:
+            return oserr(e, host)
+        return 1
+
+    @R("SetFileAttributesA", "pu")
+    def _sfaa(c, name, a):
+        return _sfa(k.cs_(name), a)
+
+    @R("SetFileAttributesW", "pu")
+    def _sfaw(c, name, a):
+        return _sfa(k.ws_(name), a)
+
+    # -- enumeration -----------------------------------------------------------------------
+    def _wild_re(pat):
+        """DOS wildcard -> (regex, match only extension-less names)."""
+        tail = ""
+        noext = False
+        if pat.endswith(".*"):
+            pat, tail = pat[:-2], r"(\..*)?"
+        elif pat.endswith(".") and pat.strip(".*?"):
+            pat, noext = pat[:-1], True
+        rx = "".join(".*" if ch == "*" else "." if ch == "?" else re.escape(ch) for ch in pat)
+        return re.compile("(?s)%s%s$" % (rx, tail), re.I), noext
+
+    def _find_entries(pattern):
+        pat = pattern.replace("/", "\\")
+        if pat.startswith("\\\\?\\"):
+            pat = pat[4:]
+        d, sep, fp = pat.rpartition("\\")
+        if not sep and len(pat) >= 2 and pat[1] == ":":
+            d, fp = pat[:2], pat[2:]
+        if not fp:
+            p.last_error = ERROR_FILE_NOT_FOUND
+            return None
+        if sep and not d:
+            d = "\\"
+        guest_dir = full_path(d if d else ".")
+        host = resolve(guest_dir)
+        if host is None:
+            return None
+        if not os.path.isdir(host):
+            p.last_error = ERROR_PATH_NOT_FOUND
+            return None
+        try:
+            names = os.listdir(host)
+        except OSError as e:
+            oserr(e)
+            return None
+        names.sort(key=lambda s: s.upper())
+        if len(guest_dir.rstrip("\\")) > 2:         # not a drive root
+            names = [".", ".."] + names
+        if "*" in fp or "?" in fp:
+            rx, noext = _wild_re(fp)
+            out = [n for n in names if rx.match(n) and (not noext or "." not in n or n in (".", ".."))]
+        else:
+            out = [n for n in names if n.upper() == fp.upper()]
+        if not out:
+            p.last_error = ERROR_FILE_NOT_FOUND
+            return None
+        return host, out
+
+    def _fill_find(buf, host_dir, name, wide, basic=False):
+        host = os.path.join(host_dir, name) if name not in (".", "..") else \
+            (host_dir if name == "." else os.path.dirname(host_dir))
+        try:
+            st = os.stat(host)
+        except OSError:
+            st = os.stat(host_dir)
+        ct, at, mt = times_of(st)
+        a = attrs_of(host, st) or FA_NORMAL
+        size = 0 if a & FA_DIR else st.st_size
+        head = struct.pack("<IQQQIIII", a, ct, at, mt, size >> 32, size & 0xFFFFFFFF, 0, 0)
+        if wide:
+            nm = name.encode("utf-16-le")[:518]
+            body = nm.ljust(520, b"\x00") + b"\x00" * 28
+            p.mem.write(buf, head + body)
+        else:
+            nm = name.encode("utf-8", "replace")[:259]
+            body = nm.ljust(260, b"\x00") + b"\x00" * 14
+            p.mem.write(buf, head + body)
+
+    def _find_first(pattern, buf, wide, dirs_only=False):
+        r = _find_entries(pattern)
+        if r is None:
+            return INVALID
+        host, names = r
+        st = {"host": host, "names": names, "i": 1}
+        h = p.handles.add(st, "kfind")
+        _fill_find(buf, host, names[0], wide)
+        p.last_error = 0
+        return h
+
+    def _find_next(h, buf, wide):
+        st = p.handles.get(h, "kfind")
+        if st is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        if st["i"] >= len(st["names"]):
+            return k.err(ERROR_NO_MORE_FILES)
+        _fill_find(buf, st["host"], st["names"][st["i"]], wide)
+        st["i"] += 1
+        return 1
+
+    @R("FindFirstFileA", "pp", "p")
+    def _ffa(c, pat, buf):
+        return _find_first(k.cs_(pat), buf, False)
+
+    @R("FindFirstFileW", "pp", "p")
+    def _ffw(c, pat, buf):
+        return _find_first(k.ws_(pat), buf, True)
+
+    @R("FindFirstFileExA", "pupupu", "p")
+    def _ffxa(c, pat, lvl, buf, op, flt, fl):
+        return _find_first(k.cs_(pat), buf, False)
+
+    @R("FindFirstFileExW", "pupupu", "p")
+    def _ffxw(c, pat, lvl, buf, op, flt, fl):
+        return _find_first(k.ws_(pat), buf, True)
+
+    @R("FindNextFileA", "pp")
+    def _fna(c, h, buf):
+        return _find_next(h, buf, False)
+
+    @R("FindNextFileW", "pp")
+    def _fnw(c, h, buf):
+        return _find_next(h, buf, True)
+
+    @R("FindClose", "p")
+    def _fclose(c, h):
+        if p.handles.kind(h) != "kfind":
+            return k.err(ERROR_INVALID_HANDLE)
+        p.handles.close(h)
+        return 1
+
+    # -- directories -----------------------------------------------------------------------
+    def _mkdir(path):
+        host = resolve(path, True)
+        if host is None:
+            return 0
+        if os.path.exists(host):
+            return k.err(ERROR_ALREADY_EXISTS)
+        if not os.path.isdir(os.path.dirname(host)):
+            return k.err(ERROR_PATH_NOT_FOUND)
+        try:
+            os.mkdir(host)
+        except OSError as e:
+            return oserr(e, host)
+        return 1
+
+    @R("CreateDirectoryA", "pp")
+    def _cda(c, name, sa):
+        return _mkdir(k.cs_(name))
+
+    @R("CreateDirectoryW", "pp")
+    def _cdw(c, name, sa):
+        return _mkdir(k.ws_(name))
+
+    @R("CreateDirectoryExA", "ppp")
+    def _cdxa(c, tmpl, name, sa):
+        return _mkdir(k.cs_(name))
+
+    @R("CreateDirectoryExW", "ppp")
+    def _cdxw(c, tmpl, name, sa):
+        return _mkdir(k.ws_(name))
+
+    def _rmdir(path):
+        host = resolve(path, True)
+        if host is None:
+            return 0
+        if not os.path.exists(host):
+            return missing(host)
+        if not os.path.isdir(host):
+            return k.err(267)                       # ERROR_DIRECTORY
+        try:
+            cwd_host = resolve(p.vfs.cwd)
+        except Exception:
+            cwd_host = None
+        if cwd_host and os.path.abspath(cwd_host) == os.path.abspath(host):
+            return k.err(ERROR_SHARING_VIOLATION)
+        try:
+            os.rmdir(host)
+        except OSError as e:
+            if e.errno in (_errno.ENOTEMPTY, _errno.EEXIST):
+                return k.err(ERROR_DIR_NOT_EMPTY)
+            return oserr(e, host)
+        return 1
+
+    @R("RemoveDirectoryA", "p")
+    def _rda(c, name):
+        return _rmdir(k.cs_(name))
+
+    @R("RemoveDirectoryW", "p")
+    def _rdw(c, name):
+        return _rmdir(k.ws_(name))
+
+    def _delete(path):
+        host = resolve(path, True)
+        if host is None:
+            return 0
+        if not os.path.lexists(host):
+            return missing(host)
+        if os.path.isdir(host):
+            return k.err(ERROR_ACCESS_DENIED)
+        try:
+            if not os.stat(host).st_mode & 0o200:
+                return k.err(ERROR_ACCESS_DENIED)   # FILE_ATTRIBUTE_READONLY
+            os.unlink(host)
+        except OSError as e:
+            return oserr(e, host)
+        return 1
+
+    @R("DeleteFileA", "p")
+    def _dfa(c, name):
+        return _delete(k.cs_(name))
+
+    @R("DeleteFileW", "p")
+    def _dfw(c, name):
+        return _delete(k.ws_(name))
+
+    def _copy(src, dst, fail_if_exists):
+        hs = resolve(src)
+        hd = resolve(dst, True)
+        if hs is None or hd is None:
+            return 0
+        if not os.path.isfile(hs):
+            if os.path.isdir(hs):
+                return k.err(ERROR_ACCESS_DENIED)
+            return missing(hs)
+        if os.path.exists(hd):
+            if fail_if_exists:
+                return k.err(ERROR_FILE_EXISTS)
+            if os.path.isdir(hd) or not os.stat(hd).st_mode & 0o200:
+                return k.err(ERROR_ACCESS_DENIED)
+        if not os.path.isdir(os.path.dirname(hd)):
+            return k.err(ERROR_PATH_NOT_FOUND)
+        try:
+            with open(hs, "rb") as fi, open(hd, "wb") as fo:
+                while True:
+                    chunk = fi.read(1 << 20)
+                    if not chunk:
+                        break
+                    fo.write(chunk)
+            st = os.stat(hs)
+            os.utime(hd, (st.st_atime, st.st_mtime))
+        except OSError as e:
+            return oserr(e, hd)
+        return 1
+
+    @R("CopyFileA", "ppi")
+    def _cpa(c, s_, d, f):
+        return _copy(k.cs_(s_), k.cs_(d), f)
+
+    @R("CopyFileW", "ppi")
+    def _cpw(c, s_, d, f):
+        return _copy(k.ws_(s_), k.ws_(d), f)
+
+    @R("CopyFileExA", "pppppu")
+    def _cpxa(c, s_, d, prog, data, cancel, fl):
+        return _copy(k.cs_(s_), k.cs_(d), fl & 1)
+
+    @R("CopyFileExW", "pppppu")
+    def _cpxw(c, s_, d, prog, data, cancel, fl):
+        return _copy(k.ws_(s_), k.ws_(d), fl & 1)
+
+    @R("CopyFile2", "ppp", "i")
+    def _cp2(c, s_, d, params):
+        fl = p.mem.read32(params + 4) if params else 0
+        if _copy(k.ws_(s_), k.ws_(d), fl & 1):
+            return 0
+        return 0x80070000 | p.last_error
+
+    def _move(src, dst, flags):
+        hs = resolve(src, True)
+        if hs is None:
+            return 0
+        if not dst:
+            if flags & 4:                           # MOVEFILE_DELAY_UNTIL_REBOOT
+                return 1
+            return k.err(ERROR_INVALID_PARAMETER)
+        hd = resolve(dst, True)
+        if hd is None:
+            return 0
+        if not os.path.lexists(hs):
+            return missing(hs)
+        if os.path.exists(hd) and os.path.normcase(os.path.abspath(hs)) != \
+                os.path.normcase(os.path.abspath(hd)):
+            if not flags & 1 or os.path.isdir(hd) or os.path.isdir(hs):
+                return k.err(ERROR_ALREADY_EXISTS)
+        if not os.path.isdir(os.path.dirname(hd)):
+            return k.err(ERROR_PATH_NOT_FOUND)
+        try:
+            os.replace(hs, hd)
+        except OSError as e:
+            if e.errno == _errno.EXDEV and flags & 2 and _copy(src, dst, False):
+                os.unlink(hs)
+                return 1
+            return oserr(e, hd)
+        return 1
+
+    @R("MoveFileA", "pp")
+    def _mva(c, s_, d):
+        return _move(k.cs_(s_), k.cs_(d), 2)
+
+    @R("MoveFileW", "pp")
+    def _mvw(c, s_, d):
+        return _move(k.ws_(s_), k.ws_(d), 2)
+
+    @R("MoveFileExA", "ppu")
+    def _mvxa(c, s_, d, fl):
+        return _move(k.cs_(s_), k.cs_(d) if d else "", fl)
+
+    @R("MoveFileExW", "ppu")
+    def _mvxw(c, s_, d, fl):
+        return _move(k.ws_(s_), k.ws_(d) if d else "", fl)
+
+    @R("MoveFileWithProgressA", "ppppu")
+    def _mvpa(c, s_, d, prog, data, fl):
+        return _move(k.cs_(s_), k.cs_(d) if d else "", fl)
+
+    @R("MoveFileWithProgressW", "ppppu")
+    def _mvpw(c, s_, d, prog, data, fl):
+        return _move(k.ws_(s_), k.ws_(d) if d else "", fl)
+
+    @R("ReplaceFileA", "pppupp")
+    def _rfa(c, replaced, replacement, backup, fl, e1, e2):
+        if backup:
+            _copy(k.cs_(replaced), k.cs_(backup), False)
+        return _move(k.cs_(replacement), k.cs_(replaced), 1)
+
+    @R("ReplaceFileW", "pppupp")
+    def _rfw(c, replaced, replacement, backup, fl, e1, e2):
+        if backup:
+            _copy(k.ws_(replaced), k.ws_(backup), False)
+        return _move(k.ws_(replacement), k.ws_(replaced), 1)
+
+    @R("CreateHardLinkA", "ppp")
+    def _chla(c, new, old, sa):
+        return _copy(k.cs_(old), k.cs_(new), True)
+
+    @R("CreateHardLinkW", "ppp")
+    def _chlw(c, new, old, sa):
+        return _copy(k.ws_(old), k.ws_(new), True)
+
+    @R("CreateSymbolicLinkA CreateSymbolicLinkW", "ppu")
+    def _csl(c, a, b_, fl):
+        return k.err(1314)                          # ERROR_PRIVILEGE_NOT_HELD (like Windows w/o dev mode)
+
+    def _gcd(buf, n, wide):
+        return k.put(buf, n, p.vfs.cwd, wide)
+
+    @R("GetCurrentDirectoryA", "up")
+    def _gcda(c, n, buf):
+        return _gcd(buf, n, False)
+
+    @R("GetCurrentDirectoryW", "up")
+    def _gcdw(c, n, buf):
+        return _gcd(buf, n, True)
+
+    def _scd(path):
+        host = resolve(path)
+        if host is None:
+            return 0
+        if not os.path.exists(host):
+            return missing(host)
+        if not os.path.isdir(host):
+            return k.err(267)
+        p.vfs.setcwd(full_path(path).rstrip("\\") if len(full_path(path)) > 3 else full_path(path))
+        return 1
+
+    @R("SetCurrentDirectoryA", "p")
+    def _scda(c, name):
+        return _scd(k.cs_(name))
+
+    @R("SetCurrentDirectoryW", "p")
+    def _scdw(c, name):
+        return _scd(k.ws_(name))
+
+    def _temp_dir():
+        t = p.env.get("TEMP") or p.env.get("TMP") or "C:\\Temp"
+        return t.rstrip("\\") + "\\"
+
+    @R("GetTempPathA GetTempPath2A", "up")
+    def _gtpa(c, n, buf):
+        return k.put(buf, n, _temp_dir(), False)
+
+    @R("GetTempPathW GetTempPath2W", "up")
+    def _gtpw(c, n, buf):
+        return k.put(buf, n, _temp_dir(), True)
+
+    def _gtfn(path, prefix, unique, buf, wide):
+        d = path.rstrip("\\")
+        hd = resolve(d or ".")
+        if hd is None:
+            return 0
+        if not os.path.isdir(hd):
+            return k.err(267)
+        n = unique & 0xFFFF
+        create = n == 0
+        if create:
+            n = (int(time.time() * 1000) ^ os.getpid()) & 0xFFFF or 1
+        for _ in range(0x10000):
+            name = "%s\\%s%X.tmp" % (d, prefix[:3], n)
+            h = resolve(name, True)
+            if not create:
+                break
+            if not os.path.exists(h):
+                try:
+                    open(h, "xb").close()
+                except OSError:
+                    pass
+                else:
+                    break
+            n = (n + 1) & 0xFFFF or 1
+        else:
+            return k.err(80)
+        data = name.encode("utf-16-le") + b"\0\0" if wide else name.encode() + b"\0"
+        p.mem.write(buf, data)
+        return n
+
+    @R("GetTempFileNameA", "ppup")
+    def _gtfna(c, path, pre, u, buf):
+        return _gtfn(k.cs_(path), k.cs_(pre), u, buf, False)
+
+    @R("GetTempFileNameW", "ppup")
+    def _gtfnw(c, path, pre, u, buf):
+        return _gtfn(k.ws_(path), k.ws_(pre), u, buf, True)
+
+    def _gfpn(name, n, buf, pfp, wide):
+        if not name:
+            return k.err(ERROR_INVALID_PARAMETER)
+        try:
+            full = full_path(name)
+        except NOOSandboxViolation:
+            full = name
+        r = k.put(buf, n, full, wide)
+        if pfp:
+            if r <= len(full) and not full.endswith("\\"):
+                idx = full.rfind("\\") + 1
+                off = len(full[:idx].encode("utf-16-le")) if wide else len(full[:idx].encode())
+                k.wptr(pfp, buf + off)
+            elif r <= len(full):
+                k.wptr(pfp, 0)
+        return r
+
+    @R("GetFullPathNameA", "pupp")
+    def _gfpna(c, name, n, buf, pfp):
+        return _gfpn(k.cs_(name), n, buf, pfp, False)
+
+    @R("GetFullPathNameW", "pupp")
+    def _gfpnw(c, name, n, buf, pfp):
+        return _gfpn(k.ws_(name), n, buf, pfp, True)
+
+    def _glpn(src, buf, n, wide):
+        host = resolve(src)
+        if host is None:
+            return 0
+        if not os.path.exists(host):
+            return missing(host)
+        return k.put(buf, n, src, wide)
+
+    @R("GetLongPathNameA GetShortPathNameA", "ppu")
+    def _glpna(c, s_, buf, n):
+        return _glpn(k.cs_(s_), buf, n, False)
+
+    @R("GetLongPathNameW GetShortPathNameW", "ppu")
+    def _glpnw(c, s_, buf, n):
+        return _glpn(k.ws_(s_), buf, n, True)
+
+    def _search_path(path, fname, ext):
+        if path:
+            dirs = [d for d in path.split(";") if d]
+        else:
+            exe_dir = getattr(p, "exe_win_path", "") or ""
+            dirs = []
+            if exe_dir:
+                dirs.append(exe_dir.rsplit("\\", 1)[0])
+            dirs += [p.vfs.cwd, "C:\\Windows\\System32", "C:\\Windows"]
+            dirs += [d for d in p.env.get("PATH", "").split(";") if d]
+        cands = [fname]
+        if ext and "." not in fname.rsplit("\\", 1)[-1]:
+            cands.insert(0, fname + ext)
+        for cand in cands:
+            if (len(cand) > 1 and cand[1] == ":") or cand.startswith("\\"):
+                h = resolve(cand)
+                if h and os.path.isfile(h):
+                    return full_path(cand)
+                continue
+            for d in dirs:
+                g = d.rstrip("\\") + "\\" + cand
+                h = resolve(g)
+                if h and os.path.isfile(h):
+                    return full_path(g)
+        return None
+
+    def _sp(path, fname, ext, n, buf, pfp, wide):
+        found = _search_path(path, fname, ext)
+        if found is None:
+            return k.err(ERROR_FILE_NOT_FOUND)
+        return _gfpn(found, n, buf, pfp, wide)
+
+    @R("SearchPathA", "pppupp")
+    def _spa(c, path, fname, ext, n, buf, pfp):
+        return _sp(k.cs_(path) if path else "", k.cs_(fname), k.cs_(ext) if ext else "",
+                   n, buf, pfp, False)
+
+    @R("SearchPathW", "pppupp")
+    def _spw(c, path, fname, ext, n, buf, pfp):
+        return _sp(k.ws_(path) if path else "", k.ws_(fname), k.ws_(ext) if ext else "",
+                   n, buf, pfp, True)
+
+    @R("NeedCurrentDirectoryForExePathA NeedCurrentDirectoryForExePathW", "p")
+    def _ncdfep(c, name):
+        return 1
+
+    # -- drives & volumes -----------------------------------------------------------------------
+    def _drives():
+        out = []
+        for d in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            if os.path.isdir(os.path.join(p.vfs.root, d)):
+                out.append(d)
+        for w in getattr(p.vfs, "overlay", {}):
+            if w[:1].isalpha() and w[0].upper() not in out:
+                out.append(w[0].upper())
+        return sorted(out) or ["C"]
+
+    def _gdt(root):
+        if not root:
+            root = p.vfs.cwd[:3]
+        d = root[:1].upper()
+        if d in _drives():
+            return 3                                # DRIVE_FIXED
+        return 1                                    # DRIVE_NO_ROOT_DIR
+
+    @R("GetDriveTypeA", "p")
+    def _gdta(c, r):
+        return _gdt(k.cs_(r) if r else "")
+
+    @R("GetDriveTypeW", "p")
+    def _gdtw(c, r):
+        return _gdt(k.ws_(r) if r else "")
+
+    @R("GetLogicalDrives", "")
+    def _gld(c):
+        m_ = 0
+        for d in _drives():
+            m_ |= 1 << (ord(d) - 65)
+        return m_
+
+    def _glds(n, buf, wide):
+        s_ = "".join("%s:\\\0" % d for d in _drives())
+        data = s_.encode("utf-16-le") if wide else s_.encode()
+        units = len(s_)
+        if n < units + 1 or not buf:
+            return units + 1
+        p.mem.write(buf, data + (b"\0\0" if wide else b"\0"))
+        return units
+
+    @R("GetLogicalDriveStringsA", "up")
+    def _gldsa(c, n, buf):
+        return _glds(n, buf, False)
+
+    @R("GetLogicalDriveStringsW", "up")
+    def _gldsw(c, n, buf):
+        return _glds(n, buf, True)
+
+    def _gvi(root, vn, vns, serial, maxc, fsf, fsn, fsns, wide):
+        if root and _gdt(root) == 1:
+            return k.err(ERROR_PATH_NOT_FOUND)
+        if vn and vns:
+            k.put(vn, vns, "NOO", wide)
+        w32(serial, 0x4E4F4F21)
+        w32(maxc, 255)
+        w32(fsf, 0x03E700FF)
+        if fsn and fsns:
+            k.put(fsn, fsns, "NTFS", wide)
+        return 1
+
+    @R("GetVolumeInformationA", "ppuppppu")
+    def _gvia(c, r, vn, vns, serial, maxc, fsf, fsn, fsns):
+        return _gvi(k.cs_(r) if r else "", vn, vns, serial, maxc, fsf, fsn, fsns, False)
+
+    @R("GetVolumeInformationW", "ppuppppu")
+    def _gviw(c, r, vn, vns, serial, maxc, fsf, fsn, fsns):
+        return _gvi(k.ws_(r) if r else "", vn, vns, serial, maxc, fsf, fsn, fsns, True)
+
+    @R("GetVolumeInformationByHandleW", "ppuppppu")
+    def _gvibh(c, h, vn, vns, serial, maxc, fsf, fsn, fsns):
+        return _gvi("", vn, vns, serial, maxc, fsf, fsn, fsns, True)
+
+    def _disk():
+        try:
+            sv = os.statvfs(p.vfs.root)
+            return sv.f_frsize * sv.f_blocks, sv.f_frsize * sv.f_bavail
+        except Exception:
+            return 100 << 30, 50 << 30
+
+    @R("GetDiskFreeSpaceA GetDiskFreeSpaceW", "ppppp")
+    def _gdfs(c, r, spc, bps, free, total):
+        tot, fr = _disk()
+        cl = 4096
+        w32(spc, 8)
+        w32(bps, 512)
+        w32(free, min(fr // cl, 0xFFFFFFFF))
+        w32(total, min(tot // cl, 0xFFFFFFFF))
+        return 1
+
+    @R("GetDiskFreeSpaceExA GetDiskFreeSpaceExW", "pppp")
+    def _gdfsx(c, r, avail, total, free):
+        tot, fr = _disk()
+        w64(avail, fr)
+        w64(total, tot)
+        w64(free, fr)
+        return 1
+
+    def _gvpn(name, buf, n, wide):
+        try:
+            full = full_path(name)
+        except Exception:
+            full = "C:\\"
+        return 1 if k.put(buf, n, full[:3], wide) <= 3 else k.err(206)
+
+    @R("GetVolumePathNameA", "ppu")
+    def _gvpna(c, name, buf, n):
+        return _gvpn(k.cs_(name), buf, n, False)
+
+    @R("GetVolumePathNameW", "ppu")
+    def _gvpnw(c, name, buf, n):
+        return _gvpn(k.ws_(name), buf, n, True)
+
+    @R("SetFileApisToOEM SetFileApisToANSI", "", "v")
+    def _sfapis(c):
+        return None
+
+    @R("AreFileApisANSI", "")
+    def _afaa(c):
+        return 1
+
+    @R("Wow64DisableWow64FsRedirection Wow64RevertWow64FsRedirection", "p")
+    def _wow64fs(c, old):
+        return 1
+
+    @R("IsWow64Process", "pp")
+    def _iswow64(c, h, out):
+        w32(out, 0)
+        return 1
+
+    @R("IsWow64Process2", "ppp")
+    def _iswow64_2(c, h, pm, nm):
+        if pm:
+            p.mem.write16(pm, 0)
+        if nm:
+            p.mem.write16(nm, 0x8664)
+        return 1
+
+    # -- pipes -------------------------------------------------------------------------------
+    @R("CreatePipe", "pppu")
+    def _cpipe(c, pr, pw, sa, size):
+        pipe = _KPipe(size)
+        k.wptr(pr, p.handles.add(pipe, "pipe_r"))
+        k.wptr(pw, p.handles.add(pipe, "pipe_w"))
+        return 1
+
+    @R("PeekNamedPipe", "ppuppp")
+    def _pnp(c, h, buf, n, pread, avail, left):
+        pipe = p.handles.get(h)
+        if p.handles.kind(h) not in ("pipe_r", "pipe_w"):
+            if h == HandleTable.STDIN_HANDLE:
+                w32(pread, 0)
+                w32(avail, 0)
+                return 1
+            return k.err(ERROR_INVALID_HANDLE)
+        if buf and n:
+            data = bytes(pipe.buf[:n])
+            p.mem.write(buf, data)
+            w32(pread, len(data))
+        else:
+            w32(pread, 0)
+        w32(avail, len(pipe.buf))
+        w32(left, 0)
+        if not pipe.buf and pipe.writers <= 0:
+            return k.err(109)
+        return 1
+
+    @R("SetNamedPipeHandleState", "pppp")
+    def _snphs(c, h, mode, maxc, to):
+        return 1
+
+    @R("CreateNamedPipeA CreateNamedPipeW", "puuuuuup", "p")
+    def _cnp(c, name, om, pm, maxi, outs, ins, to, sa):
+        p.log.warn("CreateNamedPipe: named pipes are not supported")
+        p.last_error = ERROR_NOT_SUPPORTED
+        return INVALID
+
+    k.wait_pipe = pipe_read
+
+    # -- file mappings ---------------------------------------------------------------------------
+    k.views = {}                                    # view addr -> (mapping, offset, length)
+
+    def _cfm(hfile, prot, size, name):
+        if name and name in k.named:
+            h_old, obj = k.named[name]
+            p.last_error = ERROR_ALREADY_EXISTS
+            return p.handles.add(obj, "kmapping")
+        f = None
+        if hfile not in (0xFFFFFFFF, M64, 0):
+            f = p.handles.get(hfile, "file")
+            if f is None:
+                p.last_error = ERROR_INVALID_HANDLE
+                return 0
+            fsize = os.fstat(f.fileno()).st_size
+            if size == 0:
+                if fsize == 0:
+                    p.last_error = 1006                # ERROR_FILE_INVALID
+                    return 0
+                size = fsize
+            elif size > fsize:
+                if prot & 0xFF in (0x04, 0x40):
+                    f.truncate(size)
+                else:
+                    p.last_error = 8                   # ERROR_NOT_ENOUGH_MEMORY (read-only ext.)
+                    return 0
+        elif size == 0:
+            p.last_error = ERROR_INVALID_PARAMETER
+            return 0
+        m_ = _KFileMapping(f, size, prot, name)
+        m_.base = 0
+        m_.views = 0
+        m_.path = k.file_meta.get(hfile, {}).get("host") if f is not None else None
+        h = p.handles.add(m_, "kmapping")
+        if name:
+            k.named[name] = (h, m_)
+        p.last_error = 0
+        return h
+
+    @R("CreateFileMappingA", "ppuuup", "p")
+    def _cfma(c, hf, sa, prot, hi, lo, name):
+        return _cfm(hf, prot, (hi << 32) | lo, k.cs_(name) if name else None)
+
+    @R("CreateFileMappingW", "ppuuup", "p")
+    def _cfmw(c, hf, sa, prot, hi, lo, name):
+        return _cfm(hf, prot, (hi << 32) | lo, k.ws_(name) if name else None)
+
+    @R("CreateFileMappingFromApp", "ppuQp", "p")
+    def _cfmfa(c, hf, sa, prot, size, name):
+        return _cfm(hf, prot, size, k.ws_(name) if name else None)
+
+    def _ofm(name):
+        ent = k.named.get(name)
+        if ent is None or not isinstance(ent[1], _KFileMapping):
+            return k.err(ERROR_FILE_NOT_FOUND)
+        return p.handles.add(ent[1], "kmapping")
+
+    @R("OpenFileMappingA", "uip", "p")
+    def _ofma(c, acc, inh, name):
+        return _ofm(k.cs_(name))
+
+    @R("OpenFileMappingW", "uip", "p")
+    def _ofmw(c, acc, inh, name):
+        return _ofm(k.ws_(name))
+
+    def _writeback(m_, off=0, length=None):
+        if m_.f is None or not m_.base or m_.prot & 0xFF not in (0x04, 0x40):
+            return
+        length = m_.size - off if length is None else length
+        try:
+            data = p.mem.read(m_.base + off, length)
+            pos = m_.f.tell()
+            m_.f.seek(off)
+            m_.f.write(data)
+            m_.f.seek(pos)
+        except Exception as e:
+            p.log.warn("file mapping write-back failed: %s" % e)
+
+    def _map_view(hm, access, off, n, want_base=0):
+        m_ = p.handles.get(hm, "kmapping")
+        if m_ is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        if off > m_.size or (n and off + n > m_.size):
+            return k.err(8)
+        if not m_.base:
+            perm = MEM_READ | MEM_WRITE
+            if m_.prot & 0xF0:
+                perm |= MEM_EXEC
+            try:
+                m_.base = p.mem.alloc((m_.size + 0xFFFF) & ~0xFFFF, perm,
+                                      addr=want_base or None, tag="mapping")
+            except Exception:
+                m_.base = p.mem.alloc((m_.size + 0xFFFF) & ~0xFFFF, perm, tag="mapping")
+            if m_.f is not None:
+                pos = m_.f.tell()
+                m_.f.seek(0)
+                data = m_.f.read(m_.size) or b""
+                m_.f.seek(pos)
+                if data:
+                    p.mem.write(m_.base, data)
+        m_.views += 1
+        addr = m_.base + off
+        k.views[addr] = (m_, off, n or (m_.size - off))
+        return addr
+
+    @R("MapViewOfFile", "puuuz", "p")
+    def _mvof(c, hm, acc, hi, lo, n):
+        return _map_view(hm, acc, (hi << 32) | lo, n)
+
+    @R("MapViewOfFileEx", "puuuzp", "p")
+    def _mvofx(c, hm, acc, hi, lo, n, base):
+        return _map_view(hm, acc, (hi << 32) | lo, n, base)
+
+    @R("MapViewOfFileFromApp", "puQz", "p")
+    def _mvofa(c, hm, acc, off, n):
+        return _map_view(hm, acc, off, n)
+
+    @R("UnmapViewOfFile", "p")
+    def _uvof(c, addr):
+        ent = k.views.pop(addr, None)
+        if ent is None:
+            return k.err(487)                      # ERROR_INVALID_ADDRESS
+        m_, off, n = ent
+        _writeback(m_, off, n)
+        m_.views -= 1
+        return 1
+
+    @R("UnmapViewOfFileEx", "pu")
+    def _uvofx(c, addr, fl):
+        return _uvof(c, addr)
+
+    @R("FlushViewOfFile", "pz")
+    def _fvof(c, addr, n):
+        for va, (m_, off, ln) in k.views.items():
+            if va <= addr < va + ln:
+                _writeback(m_, off + (addr - va), n or (ln - (addr - va)))
+                return 1
+        return k.err(487)
+
+    # =====================================================================
+    # console
+    # =====================================================================
+    @R("GetStdHandle", "u", "p")
+    def _gsh(c, n):
+        h = k.std.get(n & 0xFFFFFFFF)
+        if h is None:
+            p.last_error = ERROR_INVALID_HANDLE
+            return INVALID
+        return h
+
+    @R("SetStdHandle", "up")
+    def _ssh(c, n, h):
+        if n & 0xFFFFFFFF not in (0xFFFFFFF6, 0xFFFFFFF5, 0xFFFFFFF4):
+            return k.err(ERROR_INVALID_HANDLE)
+        k.std[n & 0xFFFFFFFF] = h
+        return 1
+
+    @R("SetStdHandleEx", "upp")
+    def _sshx(c, n, h, prev):
+        if prev:
+            k.wptr(prev, k.std.get(n & 0xFFFFFFFF, 0))
+        return _ssh(c, n, h)
+
+    @R("WriteConsoleA", "ppupp")
+    def _wca(c, h, buf, n, pw, r):
+        if not is_console(h):
+            return k.err(ERROR_INVALID_HANDLE)
+        data = c.mem.read(buf, n) if n else b""
+        console_write(h, data)
+        w32(pw, n)
+        return 1
+
+    @R("WriteConsoleW", "ppupp")
+    def _wcw(c, h, buf, n, pw, r):
+        if not is_console(h):
+            return k.err(ERROR_INVALID_HANDLE)
+        data = c.mem.read(buf, 2 * n) if n else b""
+        console_write(h, data.decode("utf-16-le", "replace").encode("utf-8", "replace"))
+        w32(pw, n)
+        return 1
+
+    def _console_line(n):
+        out = bytearray()
+        while len(out) < n:
+            b = stdin_read(1)
+            if not b:
+                break
+            if b == b"\n" and (not out or out[-1:] != b"\r"):
+                out += b"\r"
+                if len(out) >= n:
+                    k.pending_lf = True
+                    break
+            out += b
+            if b == b"\n":
+                break
+        return bytes(out)
+
+    k.pending_lf = False
+
+    def _rc(h, buf, n, pread, wide):
+        if not is_console(h):
+            return k.err(ERROR_INVALID_HANDLE)
+        if k.pending_lf:
+            k.pending_lf = False
+            line = b"\n"
+        else:
+            line = _console_line(n)
+        if wide:
+            text = line.decode("utf-8", "replace").encode("utf-16-le")[:2 * n]
+            p.mem.write(buf, text)
+            w32(pread, len(text) // 2)
+        else:
+            p.mem.write(buf, line)
+            w32(pread, len(line))
+        return 1
+
+    @R("ReadConsoleA", "ppupp")
+    def _rca(c, h, buf, n, pread, ctl):
+        return _rc(h, buf, n, pread, False)
+
+    @R("ReadConsoleW", "ppupp")
+    def _rcw(c, h, buf, n, pread, ctl):
+        return _rc(h, buf, n, pread, True)
+
+    _VK = {0x0D: 0x0D, 0x0A: 0x0D, 0x1B: 0x1B, 0x08: 0x08, 0x09: 0x09, 0x20: 0x20}
+
+    def _rci(h, buf, n, pread, wide, peek):
+        if not is_console(h):
+            return k.err(ERROR_INVALID_HANDLE)
+        if not n:
+            w32(pread, 0)
+            return 1
+        if peek:
+            w32(pread, 0)
+            return 1
+        b = stdin_read(1)
+        if not b:
+            w32(pread, 0)
+            return 1
+        ch = b[0]
+        vk = _VK.get(ch, ord(chr(ch).upper()) if chr(ch).isalnum() else 0)
+        rec = struct.pack("<HHiHHHHI", 1, 0, 1, 1, vk, 0, 0x0D if ch == 0x0A else ch, 0)
+        p.mem.write(buf, rec)
+        w32(pread, 1)
+        return 1
+
+    @R("ReadConsoleInputA ReadConsoleInputExA", "pppp")
+    def _rcia(c, h, buf, n, pread):
+        return _rci(h, buf, n, pread, False, False)
+
+    @R("ReadConsoleInputW ReadConsoleInputExW", "pppp")
+    def _rciw(c, h, buf, n, pread):
+        return _rci(h, buf, n, pread, True, False)
+
+    @R("PeekConsoleInputA PeekConsoleInputW", "pppp")
+    def _pci(c, h, buf, n, pread):
+        return _rci(h, buf, n, pread, True, True)
+
+    @R("GetNumberOfConsoleInputEvents", "pp")
+    def _gncie(c, h, pn):
+        if not is_console(h):
+            return k.err(ERROR_INVALID_HANDLE)
+        w32(pn, 0)
+        return 1
+
+    @R("FlushConsoleInputBuffer", "p")
+    def _fcib(c, h):
+        return 1
+
+    @R("GetConsoleMode", "pp")
+    def _gcm(c, h, pm):
+        if not is_console(h):
+            return k.err(ERROR_INVALID_HANDLE)
+        is_in = h == HandleTable.STDIN_HANDLE or p.handles.kind(h) == "conin"
+        w32(pm, k.console_mode.get(h, 0x1F7 if is_in else 0x3))
+        return 1
+
+    @R("SetConsoleMode", "pu")
+    def _scm(c, h, m_):
+        if not is_console(h):
+            return k.err(ERROR_INVALID_HANDLE)
+        k.console_mode[h] = m_
+        return 1
+
+    def _csbi(buf):
+        x, y = k.cursor
+        p.mem.write(buf, struct.pack("<hhhhHhhhhhh", 120, 9001, x, y, k.console_attr,
+                                     0, max(0, y - 29), 119, max(29, y), 120, 30))
+
+    @R("GetConsoleScreenBufferInfo", "pp")
+    def _gcsbi(c, h, buf):
+        if not is_console(h) or h == HandleTable.STDIN_HANDLE:
+            return k.err(ERROR_INVALID_HANDLE)
+        _csbi(buf)
+        return 1
+
+    @R("GetConsoleScreenBufferInfoEx", "pp")
+    def _gcsbix(c, h, buf):
+        if not is_console(h):
+            return k.err(ERROR_INVALID_HANDLE)
+        _csbi(buf + 4)
+        p.mem.write(buf + 26, struct.pack("<HI", 0x60, 0))
+        pal = [0x000000, 0x800000, 0x008000, 0x808000, 0x000080, 0x800080, 0x008080, 0xC0C0C0,
+               0x808080, 0xFF0000, 0x00FF00, 0xFFFF00, 0x0000FF, 0xFF00FF, 0x00FFFF, 0xFFFFFF]
+        p.mem.write(buf + 32, struct.pack("<16I", *pal))
+        return 1
+
+    @R("SetConsoleScreenBufferInfoEx", "pp")
+    def _scsbix(c, h, buf):
+        return 1
+
+    @R("SetConsoleTextAttribute", "pu")
+    def _scta(c, h, a):
+        if not is_console(h):
+            return k.err(ERROR_INVALID_HANDLE)
+        k.console_attr = a & 0xFFFF
+        return 1
+
+    @R("SetConsoleCursorPosition", "pu")
+    def _sccp(c, h, coord):
+        if not is_console(h):
+            return k.err(ERROR_INVALID_HANDLE)
+        k.cursor = [_s32(coord << 16) >> 16, _s32(coord) >> 16]
+        return 1
+
+    @R("GetConsoleCursorInfo", "pp")
+    def _gcci(c, h, buf):
+        p.mem.write(buf, struct.pack("<II", 25, 1))
+        return 1
+
+    @R("SetConsoleCursorInfo", "pp")
+    def _scci(c, h, buf):
+        return 1
+
+    @R("FillConsoleOutputCharacterA FillConsoleOutputCharacterW FillConsoleOutputAttribute",
+       "puuup")
+    def _fco(c, h, ch, n, coord, pw):
+        w32(pw, n)
+        return 1
+
+    @R("ScrollConsoleScreenBufferA ScrollConsoleScreenBufferW", "pppup")
+    def _scsb(c, h, r1, clip, dest, fill):
+        return 1
+
+    @R("WriteConsoleOutputA WriteConsoleOutputW", "ppuup")
+    def _wco(c, h, buf, size, coord, region):
+        return 1
+
+    @R("WriteConsoleOutputCharacterA WriteConsoleOutputCharacterW WriteConsoleOutputAttribute",
+       "ppuup")
+    def _wcoc(c, h, buf, n, coord, pw):
+        w32(pw, n)
+        return 1
+
+    @R("ReadConsoleOutputA ReadConsoleOutputW", "ppuup")
+    def _rco(c, h, buf, size, coord, region):
+        return 1
+
+    @R("ReadConsoleOutputCharacterA ReadConsoleOutputCharacterW ReadConsoleOutputAttribute",
+       "ppuup")
+    def _rcoc(c, h, buf, n, coord, pr):
+        w32(pr, 0)
+        return 1
+
+    @R("SetConsoleScreenBufferSize SetConsoleActiveScreenBuffer", "pu")
+    def _scsbs(c, h, v):
+        return 1
+
+    @R("SetConsoleWindowInfo", "pip")
+    def _scwi(c, h, absolute, rect):
+        return 1
+
+    @R("GetLargestConsoleWindowSize", "p")
+    def _glcws(c, h):
+        return (300 << 16) | 240
+
+    @R("CreateConsoleScreenBuffer", "puppp", "p")
+    def _ccsb(c, acc, share, sa, fl, data):
+        return p.handles.add(k.null_dev, "conout")
+
+    def _gct(buf, n, wide):
+        return k.put(buf, n, k.console_title, wide) if buf else 0
+
+    @R("GetConsoleTitleA GetConsoleOriginalTitleA", "pu")
+    def _gcta(c, buf, n):
+        r = k.put(buf, n, k.console_title, False)
+        return r if r <= len(k.console_title) else 0
+
+    @R("GetConsoleTitleW GetConsoleOriginalTitleW", "pu")
+    def _gctw(c, buf, n):
+        r = k.put(buf, n, k.console_title, True)
+        return r if r <= len(k.console_title) else 0
+
+    @R("SetConsoleTitleA", "p")
+    def _scta2(c, s_):
+        k.console_title = k.cs_(s_)
+        return 1
+
+    @R("SetConsoleTitleW", "p")
+    def _sctw(c, s_):
+        k.console_title = k.ws_(s_)
+        return 1
+
+    @R("AllocConsole FreeConsole", "")
+    def _allocc(c):
+        return 1
+
+    @R("AttachConsole", "u")
+    def _attachc(c, pid):
+        return 1
+
+    @R("GetConsoleWindow", "", "p")
+    def _gcw(c):
+        return 0
+
+    @R("GenerateConsoleCtrlEvent", "uu")
+    def _gcce(c, ev, grp):
+        return 1
+
+    @R("GetConsoleProcessList", "pu")
+    def _gcpl(c, buf, n):
+        if n:
+            w32(buf, p.pid)
+        return 1
+
+    @R("GetCurrentConsoleFont", "pip")
+    def _gccf(c, h, mx, buf):
+        p.mem.write(buf, struct.pack("<Ihh", 0, 8, 16))
+        return 1
+
+    @R("GetCurrentConsoleFontEx", "pip")
+    def _gccfx(c, h, mx, buf):
+        p.mem.write(buf + 4, struct.pack("<Ihh", 0, 8, 16))
+        return 1
+
+    @R("SetCurrentConsoleFontEx", "pip")
+    def _sccfx(c, h, mx, buf):
+        return 1
+
+    @R("GetConsoleDisplayMode", "p")
+    def _gcdm(c, out):
+        w32(out, 0)
+        return 1
+
+    @R("GetConsoleFontSize", "pu")
+    def _gcfs(c, h, i):
+        return (16 << 16) | 8
+
+    # =====================================================================
+    # time
+    # =====================================================================
+    def _st_pack(tm, ms):
+        return struct.pack("<8H", tm.tm_year, tm.tm_mon, (tm.tm_wday + 1) % 7, tm.tm_mday,
+                           tm.tm_hour, tm.tm_min, tm.tm_sec, ms)
+
+    @R("GetSystemTime", "p", "v")
+    def _gst2(c, out):
+        t = time.time()
+        p.mem.write(out, _st_pack(time.gmtime(t), int(t * 1000) % 1000))
+
+    @R("GetLocalTime", "p", "v")
+    def _glt(c, out):
+        t = time.time()
+        p.mem.write(out, _st_pack(time.localtime(t), int(t * 1000) % 1000))
+
+    @R("SetSystemTime SetLocalTime", "p")
+    def _sst(c, st):
+        return k.err(1314)                          # ERROR_PRIVILEGE_NOT_HELD
+
+    @R("GetSystemTimeAsFileTime GetSystemTimePreciseAsFileTime", "p", "v")
+    def _gstaft(c, out):
+        p.mem.write64(out, _ft_from_unix(time.time()))
+
+    @R("NtQuerySystemTime", "p", dlls=NT)
+    def _nqst(c, out):
+        p.mem.write64(out, _ft_from_unix(time.time()))
+        return 0
+
+    @R("RtlTimeToSecondsSince1970", "pp", dlls=NT)
+    def _rtts1970(c, pt, out):
+        v = p.mem.read64(pt) // 10_000_000 - _EPOCH_DIFF
+        if not 0 <= v <= 0xFFFFFFFF:
+            return 0
+        p.mem.write32(out, v)
+        return 1
+
+    @R("RtlSecondsSince1970ToTime", "up", "v", dlls=NT)
+    def _rs1970tt(c, secs, out):
+        p.mem.write64(out, (secs + _EPOCH_DIFF) * 10_000_000)
+
+    import datetime as _dt
+    _FT_EPOCH = _dt.datetime(1601, 1, 1)
+
+    def ft_to_st(ft):
+        if ft >= 0x8000000000000000:
+            return None
+        d = _FT_EPOCH + _dt.timedelta(microseconds=ft // 10)
+        return struct.pack("<8H", d.year, d.month, (d.weekday() + 1) % 7, d.day, d.hour,
+                           d.minute, d.second, d.microsecond // 1000)
+
+    def st_to_ft(st):
+        y, mo, _wd, d, h, mi, s_, ms = struct.unpack("<8H", st)
+        try:
+            dd = _dt.datetime(y, mo, d, h, mi, s_, ms * 1000)
+        except (ValueError, OverflowError):
+            return None
+        if y < 1601 or h > 23 or mi > 59 or s_ > 59 or ms > 999:
+            return None
+        delta = dd - _FT_EPOCH
+        return (delta.days * 86400 + delta.seconds) * 10_000_000 + delta.microseconds * 10
+
+    @R("FileTimeToSystemTime", "pp")
+    def _fttst(c, pft, pst):
+        st = ft_to_st(p.mem.read64(pft))
+        if st is None:
+            return k.err(ERROR_INVALID_PARAMETER)
+        p.mem.write(pst, st)
+        return 1
+
+    @R("SystemTimeToFileTime", "pp")
+    def _sttft(c, pst, pft):
+        ft = st_to_ft(p.mem.read(pst, 16))
+        if ft is None:
+            return k.err(ERROR_INVALID_PARAMETER)
+        p.mem.write64(pft, ft)
+        return 1
+
+    def _gmtoff(unix):
+        try:
+            return time.localtime(max(0, min(unix, 32503680000))).tm_gmtoff
+        except (OverflowError, ValueError, OSError, AttributeError):
+            return -time.timezone
+
+    @R("FileTimeToLocalFileTime", "pp")
+    def _fttlft(c, pin, pout):
+        ft = p.mem.read64(pin)
+        p.mem.write64(pout, (ft + _gmtoff(_unix_from_ft(ft)) * 10_000_000) & M64)
+        return 1
+
+    @R("LocalFileTimeToFileTime", "pp")
+    def _lfttft(c, pin, pout):
+        ft = p.mem.read64(pin)
+        off = _gmtoff(_unix_from_ft(ft))
+        off = _gmtoff(_unix_from_ft(ft) - off)
+        p.mem.write64(pout, (ft - off * 10_000_000) & M64)
+        return 1
+
+    @R("CompareFileTime", "pp")
+    def _cft(c, a, b_):
+        x, y = p.mem.read64(a), p.mem.read64(b_)
+        return 0xFFFFFFFF if x < y else (1 if x > y else 0)
+
+    @R("FileTimeToDosDateTime", "ppp")
+    def _fttddt(c, pft, pd, pt):
+        st = ft_to_st(p.mem.read64(pft))
+        if st is None:
+            return k.err(ERROR_INVALID_PARAMETER)
+        y, mo, _wd, d, h, mi, s_, ms = struct.unpack("<8H", st)
+        if not 1980 <= y <= 2107:
+            return k.err(ERROR_INVALID_PARAMETER)
+        if pd:
+            p.mem.write16(pd, ((y - 1980) << 9) | (mo << 5) | d)
+        if pt:
+            p.mem.write16(pt, (h << 11) | (mi << 5) | (s_ // 2))
+        return 1
+
+    @R("DosDateTimeToFileTime", "uup")
+    def _ddtt(c, d, t, pft):
+        st = struct.pack("<8H", 1980 + ((d >> 9) & 0x7F), (d >> 5) & 0xF, 0, d & 0x1F,
+                         (t >> 11) & 0x1F, (t >> 5) & 0x3F, (t & 0x1F) * 2, 0)
+        ft = st_to_ft(st)
+        if ft is None:
+            return k.err(ERROR_INVALID_PARAMETER)
+        p.mem.write64(pft, ft)
+        return 1
+
+    def _tzi_bytes():
+        bias = time.timezone // 60
+        dbias = (time.altzone - time.timezone) // 60 if time.daylight else 0
+        sname = (time.tzname[0] or "UTC")[:31].encode("utf-16-le").ljust(64, b"\0")
+        dname = (time.tzname[1] if time.daylight else time.tzname[0] or "UTC")[:31] \
+            .encode("utf-16-le").ljust(64, b"\0")
+        return struct.pack("<i", bias) + sname + b"\0" * 16 + struct.pack("<i", 0) + \
+            dname + b"\0" * 16 + struct.pack("<i", dbias)
+
+    def _tz_id():
+        if not time.daylight:
+            return 0                                # TIME_ZONE_ID_UNKNOWN
+        return 2 if time.localtime().tm_isdst > 0 else 1
+
+    @R("GetTimeZoneInformation", "p")
+    def _gtzi(c, out):
+        p.mem.write(out, _tzi_bytes())
+        return _tz_id()
+
+    @R("GetDynamicTimeZoneInformation", "p")
+    def _gdtzi(c, out):
+        key = (time.tzname[0] or "UTC").encode("utf-16-le")[:254].ljust(256, b"\0")
+        p.mem.write(out, _tzi_bytes() + key + b"\0\0\0\0")
+        return _tz_id()
+
+    @R("GetTimeZoneInformationForYear", "upp")
+    def _gtzify(c, y, dtzi, out):
+        p.mem.write(out, _tzi_bytes())
+        return 1
+
+    @R("SetTimeZoneInformation SetDynamicTimeZoneInformation", "p")
+    def _stzi(c, tzi):
+        return k.err(1314)
+
+    def _tz_shift(ptzi, st, to_local):
+        ft = st_to_ft(p.mem.read(st, 16))
+        if ft is None:
+            return None
+        if ptzi:
+            bias = _s32(p.mem.read32(ptzi))
+            off = -bias * 60
+        else:
+            u = _unix_from_ft(ft)
+            off = _gmtoff(u if to_local else u - _gmtoff(u))
+        ft += off * 10_000_000 if to_local else -off * 10_000_000
+        return ft_to_st(ft)
+
+    @R("SystemTimeToTzSpecificLocalTime SystemTimeToTzSpecificLocalTimeEx", "ppp")
+    def _sttzslt(c, tzi, pin, pout):
+        r = _tz_shift(tzi, pin, True)
+        if r is None:
+            return k.err(ERROR_INVALID_PARAMETER)
+        p.mem.write(pout, r)
+        return 1
+
+    @R("TzSpecificLocalTimeToSystemTime TzSpecificLocalTimeToSystemTimeEx", "ppp")
+    def _tzslttst(c, tzi, pin, pout):
+        r = _tz_shift(tzi, pin, False)
+        if r is None:
+            return k.err(ERROR_INVALID_PARAMETER)
+        p.mem.write(pout, r)
+        return 1
+
+    k.boot = time.monotonic() - 3600.0 * 5            # pretend the machine booted 5h ago
+
+    @R("GetTickCount", "")
+    def _gtc(c):
+        return int((time.monotonic() - k.boot) * 1000) & 0xFFFFFFFF
+
+    @R("GetTickCount64", "", "q")
+    def _gtc64(c):
+        return int((time.monotonic() - k.boot) * 1000)
+
+    @R("QueryPerformanceCounter", "p")
+    def _qpc(c, out):
+        p.mem.write64(out, int((time.perf_counter()) * 10_000_000) & M64)
+        return 1
+
+    @R("QueryPerformanceFrequency", "p")
+    def _qpf(c, out):
+        p.mem.write64(out, 10_000_000)
+        return 1
+
+    @R("RtlQueryPerformanceCounter", "p", dlls=NT)
+    def _rqpc(c, out):
+        return _qpc(c, out)
+
+    @R("RtlQueryPerformanceFrequency", "p", dlls=NT)
+    def _rqpf(c, out):
+        return _qpf(c, out)
+
+    @R("NtQueryPerformanceCounter", "pp", dlls=NT)
+    def _nqpc(c, out, freq):
+        _qpc(c, out)
+        if freq:
+            _qpf(c, freq)
+        return 0
+
+    @R("QueryUnbiasedInterruptTime QueryInterruptTime QueryInterruptTimePrecise "
+       "QueryUnbiasedInterruptTimePrecise", "p")
+    def _quit(c, out):
+        p.mem.write64(out, int((time.monotonic() - k.boot) * 10_000_000))
+        return 1
+
+    @R("GetSystemTimeAdjustment", "ppp")
+    def _gsta(c, adj, inc, dis):
+        w32(adj, 156250)
+        w32(inc, 156250)
+        w32(dis, 1)
+        return 1
+
+    @R("GetSystemTimeAdjustmentPrecise", "ppp")
+    def _gstap(c, adj, inc, dis):
+        w64(adj, 156250)
+        w64(inc, 156250)
+        w32(dis, 1)
+        return 1
+
+    # =====================================================================
+    # exceptions
+    # =====================================================================
+    @R("RaiseException", "uuup", "v")
+    def _raise(c, code, flags, n, args):
+        n = min(n, 15)
+        ps = k.ptr_size()
+        params = [(p.mem.read64(args + 8 * i) if ps == 8 else p.mem.read32(args + 4 * i))
+                  for i in range(n)] if args else []
+        p.seh.raise_exception(c, code, flags, params)
+
+    @R("RtlRaiseException", "p", "v", dlls=NT + _K32_DLLS)
+    def _rtlraise(c, rec):
+        ps = k.ptr_size()
+        if ps == 8:
+            code, flags, _nest, addr, n = struct.unpack("<IIQQI", p.mem.read(rec, 28))
+            params = [p.mem.read64(rec + 0x20 + 8 * i) for i in range(min(n, 15))]
+        else:
+            code, flags, _nest, addr, n = struct.unpack("<IIIII", p.mem.read(rec, 20))
+            params = [p.mem.read32(rec + 0x14 + 4 * i) for i in range(min(n, 15))]
+        t = p.current_thread
+        regs = list(c.regs)
+        sp = regs[RSP]
+        if ps == 8:
+            ret = p.mem.read64(sp)
+            regs[RSP] = sp + 8
+        else:
+            ret = p.mem.read32(sp)
+            regs[RSP] = sp + 8
+        p.seh.begin(t, code, flags & EXCEPTION_NONCONTINUABLE, addr or ret, params, ret, regs,
+                    c.pack_flags())
+        raise NOOContextSet()
+
+    @R("SetUnhandledExceptionFilter", "p", "p")
+    def _suef(c, fn):
+        old = p.seh.filter
+        p.seh.filter = fn
+        return old
+
+    @R("UnhandledExceptionFilter", "p")
+    def _uef(c, ep):
+        try:
+            rec = p.mem.read64(ep) if k.ptr_size() == 8 else p.mem.read32(ep)
+            code = p.mem.read32(rec)
+        except Exception:
+            code = 0
+        p.log.error("UnhandledExceptionFilter: exception 0x%08X — process will terminate" % code)
+        return 1                                    # EXCEPTION_EXECUTE_HANDLER
+
+    def _veh_add(first, fn, lst):
+        if first:
+            lst.insert(0, fn)
+        else:
+            lst.append(fn)
+        k.veh_ids = getattr(k, "veh_ids", {})
+        hid = p.heap_alloc(p.process_heap_handle, 16)
+        k.veh_ids[hid] = (lst, fn)
+        return hid
+
+    def _veh_remove(hid):
+        ent = getattr(k, "veh_ids", {}).pop(hid, None)
+        if ent is None:
+            return 0
+        lst, fn = ent
+        if fn in lst:
+            lst.remove(fn)
+        return 1
+
+    @R("AddVectoredExceptionHandler RtlAddVectoredExceptionHandler", "up", "p",
+       dlls=_K32_DLLS + NT)
+    def _aveh(c, first, fn):
+        return _veh_add(first, fn, p.seh.vectored)
+
+    @R("RemoveVectoredExceptionHandler RtlRemoveVectoredExceptionHandler", "p",
+       dlls=_K32_DLLS + NT)
+    def _rveh(c, hid):
+        return _veh_remove(hid)
+
+    @R("AddVectoredContinueHandler RtlAddVectoredContinueHandler", "up", "p",
+       dlls=_K32_DLLS + NT)
+    def _avch(c, first, fn):
+        return _veh_add(first, fn, p.seh.continue_handlers)
+
+    @R("RemoveVectoredContinueHandler RtlRemoveVectoredContinueHandler", "p",
+       dlls=_K32_DLLS + NT)
+    def _rvch(c, hid):
+        return _veh_remove(hid)
+
+    @R("RtlUnwind", "pppp", "v", dlls=_K32_DLLS + NT)
+    def _rtlunwind(c, frame, ip, rec, retval):
+        if p.cpu_mode == 64:
+            p.seh.rtl_unwind64(c, frame, ip, rec, retval, 0)
+        else:
+            p.seh.rtl_unwind32(c, frame, ip, rec, retval)
+
+    @R("RtlUnwindEx", "pppppp", "v", dlls=_K32_DLLS + NT)
+    def _rtlunwindex(c, frame, ip, rec, retval, ctx, hist):
+        p.seh.rtl_unwind64(c, frame, ip, rec, retval, ctx)
+
+    @R("RtlLookupFunctionEntry", "ppp", "p", dlls=_K32_DLLS + NT)
+    def _rlfe(c, pc, pbase, hist):
+        fe = p.unwinder.lookup(pc)
+        if fe is None:
+            if pbase:
+                k.wptr(pbase, 0)
+            return 0
+        if pbase:
+            k.wptr(pbase, fe[0])
+        return fe[1]
+
+    @R("RtlVirtualUnwind", "uppppppp", "p", dlls=_K32_DLLS + NT)
+    def _rvu(c, typ, base, pc, fe, ctx, phd, pest, ctxptrs):
+        regs, eip, fl, xmm, mx = p.seh.read_context(ctx)
+        w = {"regs": regs, "rip": pc}
+        handler, hdata, est = p.unwinder.virtual_unwind(typ, base, pc, fe, w)
+        p.mem.write64(ctx + 0xF8, w["rip"] & M64)
+        for r, off in _X64_GPR_CTX:
+            p.mem.write64(ctx + off, w["regs"][r] & M64)
+        if phd:
+            p.mem.write64(phd, hdata)
+        if pest:
+            p.mem.write64(pest, est)
+        return handler
+
+    @R("RtlCaptureContext RtlCaptureContext2", "p", "v", dlls=_K32_DLLS + NT)
+    def _rcc(c, ctx):
+        regs = list(c.regs)
+        sp = regs[RSP]
+        if p.cpu_mode == 64:
+            ret = p.mem.read64(sp)
+            regs[RSP] = sp + 8
+        else:
+            ret = p.mem.read32(sp)
+            regs[RSP] = sp + 8                      # return address + the argument
+        p.seh.write_context(c, ctx, regs, ret)
+
+    @R("RtlRestoreContext", "pp", "v", dlls=_K32_DLLS + NT)
+    def _rrc(c, ctx, rec):
+        if rec:
+            code = p.mem.read32(rec)
+            if code == 0xC0000029 and p.cpu_mode == 64:      # STATUS_UNWIND_CONSOLIDATE
+                n = p.mem.read32(rec + 0x18)
+                cb = p.mem.read64(rec + 0x20)
+                p.seh.load_context(c, ctx)
+                target = p.call_guest(cb, [rec])
+                c.eip = target
+                raise NOOContextSet()
+        p.seh.load_context(c, ctx)
+        raise NOOContextSet()
+
+    @R("NtContinue ZwContinue", "pi", dlls=NT)
+    def _ntcontinue(c, ctx, alert):
+        p.seh.load_context(c, ctx)
+        raise NOOContextSet()
+
+    @R("RtlPcToFileHeader", "pp", "p", dlls=_K32_DLLS + NT)
+    def _rpcfh(c, pc, pbase):
+        for base, pe in p.unwinder._images():
+            if base <= pc < base + pe.size_of_image:
+                k.wptr(pbase, base)
+                return base
+        k.wptr(pbase, 0)
+        return 0
+
+    @R("RtlAddFunctionTable", "pup", dlls=_K32_DLLS + NT)
+    def _raft(c, tbl, n, base):
+        p.unwinder.dynamic.append((base, tbl, n))
+        return 1
+
+    @R("RtlDeleteFunctionTable", "p", dlls=_K32_DLLS + NT)
+    def _rdft(c, tbl):
+        before = len(p.unwinder.dynamic)
+        p.unwinder.dynamic = [d for d in p.unwinder.dynamic if d[1] != tbl]
+        return 1 if len(p.unwinder.dynamic) != before else 0
+
+    @R("RtlInstallFunctionTableCallback", "QQuppp", dlls=_K32_DLLS + NT)
+    def _rifc(c, tid, base, length, cb, ctx, dll):
+        return 1
+
+    @R("RtlCaptureStackBackTrace CaptureStackBackTrace", "uupp", dlls=_K32_DLLS + NT)
+    def _rcsbt(c, skip, n, buf, hashp):
+        frames = []
+        t = p.current_thread
+        lo, hi = t.stack_base, t.stack_base + t.stack_size
+        try:
+            if p.cpu_mode == 64:
+                w = {"regs": list(c.regs), "rip": p.mem.read64(c.regs[RSP])}
+                w["regs"][RSP] += 8
+                while len(frames) < skip + n and w["rip"]:
+                    frames.append(w["rip"])
+                    fe = p.unwinder.lookup(w["rip"])
+                    if fe is None:
+                        break
+                    p.unwinder.virtual_unwind(0, fe[0], w["rip"], fe[1], w)
+                    if not lo <= w["regs"][RSP] < hi:
+                        break
+            else:
+                frames.append(p.mem.read32(c.regs[RSP]))
+                bp = c.regs[RBP]
+                while len(frames) < skip + n and lo <= bp < hi:
+                    frames.append(p.mem.read32(bp + 4))
+                    nbp = p.mem.read32(bp)
+                    if nbp <= bp:
+                        break
+                    bp = nbp
+        except NOOCPUFault:
+            pass
+        frames = frames[skip:skip + n]
+        for i, f in enumerate(frames):
+            k.wptr(buf + i * k.ptr_size(), f)
+        if hashp:
+            p.mem.write32(hashp, sum(frames) & 0xFFFFFFFF)
+        return len(frames)
+
+    @R("RtlGetCurrentThread", "", "p", dlls=NT)
+    def _rgct(c):
+        return 0xFFFFFFFE
+
+    # __C_specific_handler: MSVC C __try/__except/__finally on x64 ---------------------------------
+    k.ep_scratch = {}
+
+    def _c_specific(c, rec, est, ctx, dc):
+        m = p.mem
+        flags = m.read32(rec + 4)
+        pc = m.read64(dc)
+        base = m.read64(dc + 8)
+        target_ip = m.read64(dc + 32)
+        hdata = m.read64(dc + 56)
+        hist = m.read64(dc + 64)
+        count = m.read32(hdata)
+        rel = pc - base
+        i = m.read32(dc + 72)
+        if flags & (EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND):
+            while i < count:
+                b, e, h, j = struct.unpack("<IIII", m.read(hdata + 4 + 16 * i, 16))
+                i += 1
+                if not b <= rel < e:
+                    continue
+                if flags & EXCEPTION_TARGET_UNWIND and base + j == target_ip and j:
+                    return 1
+                if j == 0:                          # __finally block
+                    m.write32(dc + 72, i)
+                    p.call_guest(base + h, [1, est])
+            return 1                                # ExceptionContinueSearch
+        while i < count:
+            b, e, h, j = struct.unpack("<IIII", m.read(hdata + 4 + 16 * i, 16))
+            i += 1
+            if not (b <= rel < e) or not j:
+                continue
+            if h == 1:
+                r = 1
+            else:
+                t = p.current_thread
+                ep = k.ep_scratch.get(t.tid)
+                if ep is None:
+                    ep = k.ep_scratch[t.tid] = p.heap_alloc(p.process_heap_handle, 16)
+                m.write64(ep, rec)
+                m.write64(ep + 8, ctx)
+                r = _s32(p.call_guest(base + h, [ep, est]) & 0xFFFFFFFF)
+            if r < 0:
+                return 0                            # ExceptionContinueExecution
+            if r > 0:
+                code = m.read32(rec)
+                p.seh.rtl_unwind64(c, est, base + j, rec, code, ctx)
+        return 1
+
+    @R("__C_specific_handler", "pppp", dlls=NT + ("msvcrt.dll", "vcruntime140.dll",
+                                                  "ucrtbase.dll", "vcruntime140_1.dll"),
+       cc="cdecl")
+    def _csh(c, rec, est, ctx, dc):
+        return _c_specific(c, rec, est, ctx, dc)
+
+    # =====================================================================
+    # FormatMessage
+    # =====================================================================
+    _FMT_RE = re.compile(r"%([-+ #0]*)(\*|\d+)?(?:\.(\*|\d+))?(hh|h|ll|l|I64|I32|I|w|z|j|t)?([diouxXcCsSeEfgGp])")
+
+    def _msg_table(hmod, msgid):
+        pe = None
+        mods = getattr(p, "modules", None)
+        if hmod and mods is not None:
+            mod = getattr(mods, "by_handle", {}).get(hmod)
+            pe = getattr(mod, "pe", None) if mod is not None else None
+            base = hmod
+        if pe is None:
+            pe = getattr(p, "pe", None)
+            base = p.image_base
+        if pe is None:
+            return None
+        for ent in getattr(pe, "resources", []):
+            path = ent["path"]
+            if path and path[0] in (11, "MESSAGETABLE"):
+                data = p.mem.read(base + ent["rva"], ent["size"])
+                nblocks = struct.unpack_from("<I", data, 0)[0]
+                for b in range(nblocks):
+                    lo, hi, off = struct.unpack_from("<III", data, 4 + 12 * b)
+                    if lo <= msgid <= hi:
+                        for _ in range(msgid - lo):
+                            off += struct.unpack_from("<H", data, off)[0]
+                        ln, fl = struct.unpack_from("<HH", data, off)
+                        raw = data[off + 4:off + ln]
+                        if fl & 1:
+                            return raw.decode("utf-16-le", "replace").rstrip("\0")
+                        return raw.decode("latin-1").rstrip("\0")
+        return None
+
+    def _fmt_one(spec, val, wide_default, get_s):
+        m_ = _FMT_RE.fullmatch("%" + spec)
+        if not m_:
+            return get_s(val, wide_default)
+        flags, width, prec, length, conv = m_.groups()
+        width = int(width) if width and width != "*" else 0
+        prec = int(prec) if prec and prec != "*" else None
+        if conv in "sS":
+            if length in ("l", "w"):
+                wide = True
+            elif length == "h":
+                wide = False
+            else:
+                wide = wide_default if conv == "s" else not wide_default
+            txt = get_s(val, wide) if val else "(null)"
+            if prec is not None:
+                txt = txt[:prec]
+        elif conv in "cC":
+            txt = chr(val & 0xFFFF)
+        elif conv in "di":
+            bits = 64 if length in ("ll", "I64") or (length in ("I", "z", "j", "t")
+                                                    and p.cpu_mode == 64) else 32
+            v = val & ((1 << bits) - 1)
+            if v >> (bits - 1):
+                v -= 1 << bits
+            txt = str(v)
+        elif conv in "ouxX":
+            bits = 64 if length in ("ll", "I64") or (length in ("I", "z", "j", "t")
+                                                    and p.cpu_mode == 64) else 32
+            v = val & ((1 << bits) - 1)
+            txt = {"o": "%o", "u": "%d", "x": "%x", "X": "%X"}[conv] % v
+            if "#" in flags and v and conv in "xX":
+                txt = ("0x" if conv == "x" else "0X") + txt
+        elif conv == "p":
+            txt = ("%016X" if p.cpu_mode == 64 else "%08X") % val
+        else:
+            txt = str(val)
+        if width and len(txt) < width:
+            if "-" in flags:
+                txt = txt.ljust(width)
+            elif "0" in flags and conv not in "sScC":
+                txt = txt.rjust(width, "0")
+            else:
+                txt = txt.rjust(width)
+        return txt
+
+    def format_message(flags, src, msgid, buf, n, args, wide):
+        ps = k.ptr_size()
+        if flags & 0x400:                           # FORMAT_MESSAGE_FROM_STRING
+            fmt = k.s(src, wide)
+        else:
+            fmt = None
+            if flags & 0x800:
+                fmt = _msg_table(src, msgid)
+            if fmt is None and flags & 0x1000:
+                code = msgid
+                if (msgid & 0xFFFF0000) == 0x80070000:
+                    code = msgid & 0xFFFF
+                txt = _SYS_ERRORS.get(code)
+                if txt is None and code == msgid and msgid >> 31:
+                    txt = None
+                if txt is not None:
+                    fmt = txt + "\r\n"
+            if fmt is None:
+                return k.err(317)                   # ERROR_MR_MID_NOT_FOUND
+        width = flags & 0xFF
+        if flags & 0x200:                           # IGNORE_INSERTS
+            out = fmt
+            if width:
+                out = out.replace("\r\n", " ")
+        else:
+            if flags & 0x2000:                      # ARGUMENT_ARRAY
+                arr = args
+            else:
+                arr = (p.mem.read64(args) if ps == 8 else p.mem.read32(args)) if args else 0
+
+            def arg(i):
+                if not arr:
+                    return 0
+                return p.mem.read64(arr + 8 * i) if ps == 8 else p.mem.read32(arr + 4 * i)
+
+            def get_s(a, w):
+                return k.ws_(a) if w else k.cs_(a)
+
+            res = []
+            i = 0
+            L = len(fmt)
+            while i < L:
+                ch = fmt[i]
+                if ch == "%" and i + 1 < L:
+                    nx = fmt[i + 1]
+                    if nx.isdigit():
+                        j = i + 1
+                        while j < L and fmt[j].isdigit() and j < i + 3:
+                            j += 1
+                        num = int(fmt[i + 1:j])
+                        spec = "s"
+                        if j < L and fmt[j] == "!":
+                            e = fmt.find("!", j + 1)
+                            if e > 0:
+                                spec = fmt[j + 1:e]
+                                j = e + 1
+                        if num == 0:
+                            break
+                        res.append(_fmt_one(spec, arg(num - 1), wide, get_s))
+                        i = j
+                        continue
+                    if nx == "0":
+                        break
+                    res.append({"n": "\r\n", "r": "\r", "t": "\t", "b": " ", " ": " ",
+                                "%": "%", ".": ".", "!": "!"}.get(nx, nx))
+                    i += 2
+                    continue
+                if width and ch in "\r\n":
+                    if ch == "\r" and fmt[i + 1:i + 2] == "\n":
+                        i += 1
+                    res.append(" ")
+                    i += 1
+                    continue
+                res.append(ch)
+                i += 1
+            out = "".join(res)
+        data = out.encode("utf-16-le") if wide else out.encode("utf-8", "replace")
+        units = len(out) if wide else len(data)
+        if wide:
+            units = len(data) // 2
+        term = b"\0\0" if wide else b"\0"
+        if flags & 0x100:                           # ALLOCATE_BUFFER
+            a = p.heap_alloc(p.process_heap_handle, max(len(data) + len(term),
+                                                        n * (2 if wide else 1)))
+            if not a:
+                return k.err(ERROR_NOT_ENOUGH_MEMORY)
+            p.mem.write(a, data + term)
+            k.wptr(buf, a)
+            return units
+        if units + 1 > n:
+            return k.err(ERROR_INSUFFICIENT_BUFFER)
+        p.mem.write(buf, data + term)
+        return units
+
+    @R("FormatMessageA", "ppuupup")
+    def _fma(c, flags, src, mid, lang, buf, n, args):
+        return format_message(flags, src, mid, buf, n, args, False)
+
+    @R("FormatMessageW", "ppuupup")
+    def _fmw(c, flags, src, mid, lang, buf, n, args):
+        return format_message(flags, src, mid, buf, n, args, True)
+
+    # =====================================================================
+    # INI files (profile APIs)
+    # =====================================================================
+    def _ini_path(name):
+        if not name:
+            name = "win.ini"
+        if "\\" not in name and "/" not in name:
+            name = "C:\\Windows\\" + name
+        return resolve(name, True)
+
+    def _ini_load(host):
+        secs = []                                   # [(name, [(key, value)])]
+        try:
+            with open(host, "rb") as f:
+                raw = f.read()
+        except OSError:
+            return secs
+        if raw.startswith(b"\xff\xfe"):
+            text = raw[2:].decode("utf-16-le", "replace")
+        else:
+            text = raw.decode("utf-8-sig", "replace")
+        cur = None
+        for line in text.splitlines():
+            s_ = line.strip()
+            if not s_ or s_.startswith(";"):
+                continue
+            if s_.startswith("[") and "]" in s_:
+                cur = (s_[1:s_.index("]")].strip(), [])
+                secs.append(cur)
+                continue
+            if cur is None:
+                continue
+            if "=" in s_:
+                key, val = s_.split("=", 1)
+                cur[1].append((key.strip(), val.strip()))
+            else:
+                cur[1].append((s_, None))
+        return secs
+
+    def _ini_save(host, secs):
+        lines = []
+        for name, items in secs:
+            lines.append("[%s]" % name)
+            for key, val in items:
+                lines.append(key if val is None else "%s=%s" % (key, val))
+            lines.append("")
+        try:
+            os.makedirs(os.path.dirname(host), exist_ok=True)
+            with open(host, "wb") as f:
+                f.write("\r\n".join(lines).encode("utf-8"))
+        except OSError as e:
+            return oserr(e)
+        return 1
+
+    def _ini_sec(secs, name):
+        for s_ in secs:
+            if s_[0].lower() == name.lower():
+                return s_
+        return None
+
+    def _put_list(buf, n, items, wide):
+        """Double-NUL-terminated list, truncated like Windows (returns n - 2)."""
+        if n < 2 or not buf:
+            if buf and n:
+                p.mem.write(buf, b"\0\0" if wide else b"\0")
+            return 0
+        text = "".join(x + "\0" for x in items)
+        if len(text) + 1 > n:
+            text = text[:n - 2] + "\0"
+            ret = n - 2
+        else:
+            ret = len(text)
+        data = (text + "\0").encode("utf-16-le") if wide else (text + "\0").encode("utf-8", "replace")
+        p.mem.write(buf, data)
+        return ret
+
+    def get_profile_string(sec, key, default, buf, n, fname, wide):
+        host = _ini_path(fname)
+        secs = _ini_load(host) if host else []
+        if sec is None:
+            return _put_list(buf, n, [s_[0] for s_ in secs], wide)
+        s_ = _ini_sec(secs, sec)
+        if key is None:
+            return _put_list(buf, n, [k_ for k_, v in s_[1]] if s_ else [], wide)
+        val = None
+        if s_:
+            for k_, v in s_[1]:
+                if k_.lower() == key.lower():
+                    val = v if v is not None else ""
+                    break
+        if val is None:
+            val = (default or "").rstrip(" ")
+        elif len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        if not buf or n == 0:
+            return 0
+        if len(val) >= n:
+            val = val[:n - 1]
+        p.mem.write(buf, (val + "\0").encode("utf-16-le") if wide else (val + "\0").encode("utf-8", "replace"))
+        if not s_ or val == (default or "").rstrip(" "):
+            p.last_error = ERROR_FILE_NOT_FOUND if s_ is None else p.last_error
+        return len(val)
+
+    def _opt(a, wide):
+        return k.s(a, wide) if a else None
+
+    @R("GetPrivateProfileStringA", "ppppup")
+    def _gppsa(c, sec, key, dflt, buf, n, fname):
+        return get_profile_string(_opt(sec, False), _opt(key, False), _opt(dflt, False), buf, n,
+                                  _opt(fname, False), False)
+
+    @R("GetPrivateProfileStringW", "ppppup")
+    def _gppsw(c, sec, key, dflt, buf, n, fname):
+        return get_profile_string(_opt(sec, True), _opt(key, True), _opt(dflt, True), buf, n,
+                                  _opt(fname, True), True)
+
+    @R("GetProfileStringA", "ppppu")
+    def _gpsa(c, sec, key, dflt, buf, n):
+        return get_profile_string(_opt(sec, False), _opt(key, False), _opt(dflt, False), buf, n,
+                                  None, False)
+
+    @R("GetProfileStringW", "ppppu")
+    def _gpsw(c, sec, key, dflt, buf, n):
+        return get_profile_string(_opt(sec, True), _opt(key, True), _opt(dflt, True), buf, n,
+                                  None, True)
+
+    def get_profile_int(sec, key, default, fname):
+        host = _ini_path(fname)
+        s_ = _ini_sec(_ini_load(host) if host else [], sec or "")
+        if s_:
+            for k_, v in s_[1]:
+                if k_.lower() == (key or "").lower() and v is not None:
+                    m_ = re.match(r"\s*(-?)(0[xX][0-9a-fA-F]+|\d+)", v)
+                    if not m_:
+                        return 0
+                    num = int(m_.group(2), 0) if m_.group(2).lower().startswith("0x") \
+                        else int(m_.group(2))
+                    return (-num if m_.group(1) else num) & 0xFFFFFFFF
+        return default & 0xFFFFFFFF
+
+    @R("GetPrivateProfileIntA", "ppip")
+    def _gppia(c, sec, key, d, fname):
+        return get_profile_int(_opt(sec, False), _opt(key, False), d, _opt(fname, False))
+
+    @R("GetPrivateProfileIntW", "ppip")
+    def _gppiw(c, sec, key, d, fname):
+        return get_profile_int(_opt(sec, True), _opt(key, True), d, _opt(fname, True))
+
+    @R("GetProfileIntA", "ppi")
+    def _gpia(c, sec, key, d):
+        return get_profile_int(_opt(sec, False), _opt(key, False), d, None)
+
+    @R("GetProfileIntW", "ppi")
+    def _gpiw(c, sec, key, d):
+        return get_profile_int(_opt(sec, True), _opt(key, True), d, None)
+
+    def write_profile_string(sec, key, val, fname):
+        host = _ini_path(fname)
+        if host is None:
+            return 0
+        if sec is None:
+            return 1
+        secs = _ini_load(host)
+        s_ = _ini_sec(secs, sec)
+        if key is None:
+            if s_:
+                secs.remove(s_)
+            return _ini_save(host, secs)
+        if s_ is None:
+            if val is None:
+                return 1
+            s_ = (sec, [])
+            secs.append(s_)
+        items = s_[1]
+        for i, (k_, v) in enumerate(items):
+            if k_.lower() == key.lower():
+                if val is None:
+                    del items[i]
+                else:
+                    items[i] = (k_, val)
+                break
+        else:
+            if val is not None:
+                items.append((key, val))
+        return _ini_save(host, secs)
+
+    @R("WritePrivateProfileStringA", "pppp")
+    def _wppsa(c, sec, key, val, fname):
+        return write_profile_string(_opt(sec, False), _opt(key, False), _opt(val, False),
+                                    _opt(fname, False))
+
+    @R("WritePrivateProfileStringW", "pppp")
+    def _wppsw(c, sec, key, val, fname):
+        return write_profile_string(_opt(sec, True), _opt(key, True), _opt(val, True),
+                                    _opt(fname, True))
+
+    @R("WriteProfileStringA", "ppp")
+    def _wpsa(c, sec, key, val):
+        return write_profile_string(_opt(sec, False), _opt(key, False), _opt(val, False), None)
+
+    @R("WriteProfileStringW", "ppp")
+    def _wpsw(c, sec, key, val):
+        return write_profile_string(_opt(sec, True), _opt(key, True), _opt(val, True), None)
+
+    def get_profile_section(sec, buf, n, fname, wide):
+        host = _ini_path(fname)
+        s_ = _ini_sec(_ini_load(host) if host else [], sec or "")
+        items = [kk if v is None else "%s=%s" % (kk, v) for kk, v in s_[1]] if s_ else []
+        return _put_list(buf, n, items, wide)
+
+    @R("GetPrivateProfileSectionA", "ppup")
+    def _gppseca(c, sec, buf, n, fname):
+        return get_profile_section(_opt(sec, False), buf, n, _opt(fname, False), False)
+
+    @R("GetPrivateProfileSectionW", "ppup")
+    def _gppsecw(c, sec, buf, n, fname):
+        return get_profile_section(_opt(sec, True), buf, n, _opt(fname, True), True)
+
+    @R("GetProfileSectionA", "ppu")
+    def _gpseca(c, sec, buf, n):
+        return get_profile_section(_opt(sec, False), buf, n, None, False)
+
+    @R("GetProfileSectionW", "ppu")
+    def _gpsecw(c, sec, buf, n):
+        return get_profile_section(_opt(sec, True), buf, n, None, True)
+
+    def _gppsn(buf, n, fname, wide):
+        host = _ini_path(fname)
+        return _put_list(buf, n, [s_[0] for s_ in (_ini_load(host) if host else [])], wide)
+
+    @R("GetPrivateProfileSectionNamesA", "pup")
+    def _gppsna(c, buf, n, fname):
+        return _gppsn(buf, n, _opt(fname, False), False)
+
+    @R("GetPrivateProfileSectionNamesW", "pup")
+    def _gppsnw(c, buf, n, fname):
+        return _gppsn(buf, n, _opt(fname, True), True)
+
+    def write_profile_section(sec, data_ptr, fname, wide):
+        host = _ini_path(fname)
+        if host is None:
+            return 0
+        secs = _ini_load(host)
+        s_ = _ini_sec(secs, sec)
+        items = []
+        a = data_ptr
+        while a:
+            s2 = k.s(a, wide)
+            if not s2:
+                break
+            key, _, val = s2.partition("=")
+            items.append((key.strip(), val.strip() if _ else None))
+            a += (len(s2) + 1) * (2 if wide else 1) if wide else len(s2.encode()) + 1
+        if s_ is None:
+            secs.append((sec, items))
+        else:
+            s_[1][:] = items
+        return _ini_save(host, secs)
+
+    @R("WritePrivateProfileSectionA", "ppp")
+    def _wppseca(c, sec, data, fname):
+        return write_profile_section(k.cs_(sec), data, _opt(fname, False), False)
+
+    @R("WritePrivateProfileSectionW", "ppp")
+    def _wppsecw(c, sec, data, fname):
+        return write_profile_section(k.ws_(sec), data, _opt(fname, True), True)
+
+    def _gpps_struct(sec, key, buf, n, fname, wide):
+        host = _ini_path(fname)
+        s_ = _ini_sec(_ini_load(host) if host else [], sec)
+        if s_:
+            for kk, v in s_[1]:
+                if kk.lower() == key.lower() and v:
+                    try:
+                        raw = bytes.fromhex(v)
+                    except ValueError:
+                        return 0
+                    if len(raw) != n + 1 or (sum(raw[:-1]) & 0xFF) != raw[-1]:
+                        return 0
+                    p.mem.write(buf, raw[:-1])
+                    return 1
+        return 0
+
+    @R("GetPrivateProfileStructA", "pppup")
+    def _gppstra(c, sec, key, buf, n, fname):
+        return _gpps_struct(k.cs_(sec), k.cs_(key), buf, n, _opt(fname, False), False)
+
+    @R("GetPrivateProfileStructW", "pppup")
+    def _gppstrw(c, sec, key, buf, n, fname):
+        return _gpps_struct(k.ws_(sec), k.ws_(key), buf, n, _opt(fname, True), True)
+
+    def _wpps_struct(sec, key, buf, n, fname):
+        if not buf:
+            return write_profile_string(sec, key, None, fname)
+        raw = p.mem.read(buf, n)
+        return write_profile_string(sec, key, (raw + bytes([sum(raw) & 0xFF])).hex().upper(), fname)
+
+    @R("WritePrivateProfileStructA", "pppup")
+    def _wppstra(c, sec, key, buf, n, fname):
+        return _wpps_struct(k.cs_(sec), k.cs_(key), buf, n, _opt(fname, False))
+
+    @R("WritePrivateProfileStructW", "pppup")
+    def _wppstrw(c, sec, key, buf, n, fname):
+        return _wpps_struct(k.ws_(sec), k.ws_(key), buf, n, _opt(fname, True))
+
+    # =====================================================================
+    # atoms
+    # =====================================================================
+    k.atom_by_name = {}
+    k.atom_names = {}
+    k.atom_next = 0xC000
+
+    def _atom_key(a, wide):
+        if a < 0x10000:
+            return a
+        s_ = k.s(a, wide)
+        if s_.startswith("#") and s_[1:].isdigit():
+            return int(s_[1:]) & 0xFFFF
+        return s_
+
+    def add_atom(a, wide):
+        key = _atom_key(a, wide)
+        if isinstance(key, int):
+            if not 0 < key < 0xC000:
+                return k.err(ERROR_INVALID_PARAMETER)
+            return key
+        if not key or len(key) > 255:
+            return k.err(ERROR_INVALID_PARAMETER)
+        ent = k.atom_by_name.get(key.upper())
+        if ent is not None:
+            ent[1] += 1
+            return ent[0]
+        atom = k.atom_next
+        k.atom_next += 1
+        k.atom_by_name[key.upper()] = [atom, 1]
+        k.atom_names[atom] = key
+        return atom
+
+    def find_atom(a, wide):
+        key = _atom_key(a, wide)
+        if isinstance(key, int):
+            return key if 0 < key < 0xC000 else k.err(ERROR_INVALID_PARAMETER)
+        ent = k.atom_by_name.get(key.upper())
+        if ent is None:
+            return k.err(ERROR_FILE_NOT_FOUND)
+        return ent[0]
+
+    def delete_atom(atom):
+        atom &= 0xFFFF
+        if atom < 0xC000:
+            return 0
+        name = k.atom_names.get(atom)
+        if name is None:
+            p.last_error = ERROR_INVALID_HANDLE
+            return atom
+        ent = k.atom_by_name[name.upper()]
+        ent[1] -= 1
+        if ent[1] <= 0:
+            del k.atom_by_name[name.upper()]
+            del k.atom_names[atom]
+        return 0
+
+    def get_atom_name(atom, buf, n, wide):
+        atom &= 0xFFFF
+        if atom < 0xC000:
+            name = "#%d" % atom
+        else:
+            name = k.atom_names.get(atom)
+            if name is None:
+                return k.err(ERROR_INVALID_HANDLE)
+        if n <= 0:
+            return k.err(ERROR_INSUFFICIENT_BUFFER)
+        name = name[:n - 1]
+        p.mem.write(buf, (name + "\0").encode("utf-16-le") if wide else (name + "\0").encode())
+        return len(name)
+
+    @R("AddAtomA GlobalAddAtomA", "p")
+    def _aaa(c, a):
+        return add_atom(a, False)
+
+    @R("AddAtomW GlobalAddAtomW", "p")
+    def _aaw(c, a):
+        return add_atom(a, True)
+
+    @R("GlobalAddAtomExA", "pu")
+    def _gaaxa(c, a, f):
+        return add_atom(a, False)
+
+    @R("GlobalAddAtomExW", "pu")
+    def _gaaxw(c, a, f):
+        return add_atom(a, True)
+
+    @R("FindAtomA GlobalFindAtomA", "p")
+    def _faa(c, a):
+        return find_atom(a, False)
+
+    @R("FindAtomW GlobalFindAtomW", "p")
+    def _faw(c, a):
+        return find_atom(a, True)
+
+    @R("DeleteAtom GlobalDeleteAtom", "u")
+    def _da(c, a):
+        return delete_atom(a)
+
+    @R("GetAtomNameA GlobalGetAtomNameA", "upi")
+    def _gana(c, a, buf, n):
+        return get_atom_name(a, buf, n, False)
+
+    @R("GetAtomNameW GlobalGetAtomNameW", "upi")
+    def _ganw(c, a, buf, n):
+        return get_atom_name(a, buf, n, True)
+
+    @R("InitAtomTable", "u")
+    def _iat(c, n):
+        return 1
+
+    # =====================================================================
+    # thread pool (work items run on real guest threads)
+    # =====================================================================
+    k.tp_jobs = {}
+    k.tp_next = [1]
+
+    def _tp_entry(c):
+        a = _CallArgs(c)
+        job = k.tp_jobs.pop(a.int(), None)
+        if job is None:
+            raise NOOExitThread(0)
+        t = p.current_thread
+        t.tp_job = job
+        p.seh._call(c, job["fn"], job["args"], k.tp_done_thunk, c.regs[RSP] - 0x20)
+        raise NOOContextSet()
+
+    def _tp_done(c):
+        job = getattr(p.current_thread, "tp_job", None)
+        if job is not None and job.get("work") is not None:
+            job["work"]["pending"] -= 1
+        raise NOOExitThread(0)
+
+    _tp_entry._noo_cc = "cdecl"
+    _tp_done._noo_cc = "cdecl"
+    api.table[("!noo!", "tp_entry")] = _tp_entry
+    api.table[("!noo!", "tp_done")] = _tp_done
+    k.tp_done_thunk = 0
+
+    def tp_submit(fn, args, work=None):
+        if not k.tp_done_thunk:
+            k.tp_done_thunk = p.api_thunk("!noo!", "tp_done")
+            k.tp_entry_thunk = p.api_thunk("!noo!", "tp_entry")
+        jid = k.tp_next[0]
+        k.tp_next[0] += 1
+        k.tp_jobs[jid] = {"fn": fn, "args": args, "work": work}
+        tid, h = p.create_thread(k.tp_entry_thunk, jid, 0x100000)
+        if work is not None:
+            work["pending"] += 1
+            work["threads"].append(h)
+        return h
+
+    @R("CreateThreadpoolWork", "ppp", "p")
+    def _ctpw(c, fn, pv, env):
+        w = {"fn": fn, "pv": pv, "pending": 0, "threads": []}
+        h = p.heap_alloc(p.process_heap_handle, 16)
+        k.tp_work = getattr(k, "tp_work", {})
+        k.tp_work[h] = w
+        return h
+
+    @R("SubmitThreadpoolWork", "p", "v")
+    def _stpw(c, work):
+        w = getattr(k, "tp_work", {}).get(work)
+        if w is not None:
+            tp_submit(w["fn"], [0, w["pv"], work], w)
+
+    @R("WaitForThreadpoolWorkCallbacks", "pi", "v")
+    def _wftpwc(c, work, cancel):
+        w = getattr(k, "tp_work", {}).get(work)
+        if w is None:
+            return None
+        live = [h for h in w["threads"] if p.handles.kind(h) == "thread"
+                and p.handles.get(h).state != "dead"]
+        w["threads"] = live
+        if live:
+            k.wait(c, live, True, INFINITE)
+        return None
+
+    @R("CloseThreadpoolWork", "p", "v")
+    def _cltpw(c, work):
+        getattr(k, "tp_work", {}).pop(work, None)
+
+    @R("TrySubmitThreadpoolCallback", "ppp")
+    def _tstpc(c, fn, pv, env):
+        tp_submit(fn, [0, pv])
+        return 1
+
+    @R("QueueUserWorkItem", "ppu")
+    def _quwi(c, fn, ctx, flags):
+        tp_submit(fn, [ctx])
+        return 1
+
+    @R("CreateThreadpool", "p", "p")
+    def _ctp(c, r):
+        return p.heap_alloc(p.process_heap_handle, 16)
+
+    @R("CloseThreadpool", "p", "v")
+    def _cltp(c, pool):
+        return None
+
+    @R("SetThreadpoolThreadMaximum", "pu", "v")
+    def _stptm(c, pool, n):
+        return None
+
+    @R("SetThreadpoolThreadMinimum", "pu")
+    def _stptmin(c, pool, n):
+        return 1
+
+    @R("CreateThreadpoolCleanupGroup", "", "p")
+    def _ctpcg(c):
+        return p.heap_alloc(p.process_heap_handle, 16)
+
+    @R("CloseThreadpoolCleanupGroup", "p", "v")
+    def _cltpcg(c, g):
+        return None
+
+    @R("CloseThreadpoolCleanupGroupMembers", "pip", "v")
+    def _cltpcgm(c, g, cancel, ctx):
+        return None
+
+    @R("CallbackMayRunLong", "p")
+    def _cmrl(c, inst):
+        return 1
+
+    @R("SetEventWhenCallbackReturns", "pp", "v")
+    def _sewcr(c, inst, ev):
+        e = p.handles.get(ev, "kevent")
+        if e is not None:
+            e.signaled = True
+
+    @R("DisassociateCurrentThreadFromCallback", "p", "v")
+    def _dctfc(c, inst):
+        return None
+
+    # =====================================================================
+    # user32 text helpers (Char*, IsChar*, wsprintf)
+    # =====================================================================
+    U32 = ("user32.dll",)
+
+    def _case_str(a, wide, fn):
+        if a < 0x10000:                             # a single character
+            return ord(fn(chr(a & 0xFFFF))[:1] or chr(a & 0xFFFF))
+        if wide:
+            s_ = k.ws_(a)
+            p.mem.write(a, fn(s_).encode("utf-16-le")[:2 * len(s_)])
+        else:
+            raw = p.mem.read_cstring(a, 1 << 20)
+            p.mem.write(a, fn(raw.decode("latin-1")).encode("latin-1", "replace")[:len(raw)])
+        return a
+
+    def _case_buf(a, n, wide, fn):
+        if not a or not n:
+            return 0
+        if wide:
+            s_ = p.mem.read(a, 2 * n).decode("utf-16-le", "replace")
+            p.mem.write(a, fn(s_).encode("utf-16-le")[:2 * n])
+        else:
+            s_ = p.mem.read(a, n).decode("latin-1")
+            p.mem.write(a, fn(s_).encode("latin-1", "replace")[:n])
+        return n
+
+    def _up(s_):
+        return "".join(ch.upper() if len(ch.upper()) == 1 else ch for ch in s_)
+
+    def _lo(s_):
+        return "".join(ch.lower() if len(ch.lower()) == 1 else ch for ch in s_)
+
+    @R("CharUpperA", "p", "p", dlls=U32)
+    def _cua(c, a):
+        return _case_str(a, False, _up)
+
+    @R("CharUpperW", "p", "p", dlls=U32)
+    def _cuw(c, a):
+        return _case_str(a, True, _up)
+
+    @R("CharLowerA", "p", "p", dlls=U32)
+    def _cla(c, a):
+        return _case_str(a, False, _lo)
+
+    @R("CharLowerW", "p", "p", dlls=U32)
+    def _clw(c, a):
+        return _case_str(a, True, _lo)
+
+    @R("CharUpperBuffA", "pu", dlls=U32)
+    def _cuba(c, a, n):
+        return _case_buf(a, n, False, _up)
+
+    @R("CharUpperBuffW", "pu", dlls=U32)
+    def _cubw(c, a, n):
+        return _case_buf(a, n, True, _up)
+
+    @R("CharLowerBuffA", "pu", dlls=U32)
+    def _clba(c, a, n):
+        return _case_buf(a, n, False, _lo)
+
+    @R("CharLowerBuffW", "pu", dlls=U32)
+    def _clbw(c, a, n):
+        return _case_buf(a, n, True, _lo)
+
+    @R("CharNextA", "p", "p", dlls=U32)
+    def _cna(c, a):
+        return a + 1 if p.mem.read8(a) else a
+
+    @R("CharNextW", "p", "p", dlls=U32)
+    def _cnw(c, a):
+        return a + 2 if p.mem.read16(a) else a
+
+    @R("CharNextExA", "ppu", "p", dlls=U32)
+    def _cnxa(c, cp, a, fl):
+        return a + 1 if p.mem.read8(a) else a
+
+    @R("CharPrevA", "pp", "p", dlls=U32)
+    def _cpa(c, start, a):
+        return a - 1 if a > start else start
+
+    @R("CharPrevW", "pp", "p", dlls=U32)
+    def _cpw2(c, start, a):
+        return a - 2 if a > start else start
+
+    @R("CharPrevExA", "pppu", "p", dlls=U32)
+    def _cpxa(c, cp, start, a, fl):
+        return a - 1 if a > start else start
+
+    def _ischar(ch, wide, test):
+        ch &= 0xFFFF if wide else 0xFF
+        s_ = chr(ch) if wide else bytes([ch]).decode("cp1252", "replace")
+        return 1 if test(s_) else 0
+
+    for nm, test in (("IsCharAlpha", str.isalpha), ("IsCharUpper", str.isupper),
+                     ("IsCharLower", str.islower), ("IsCharAlphaNumeric", str.isalnum)):
+        R(nm + "A", "u", dlls=U32)(lambda c, ch, _t=test: _ischar(ch, False, _t))
+        R(nm + "W", "u", dlls=U32)(lambda c, ch, _t=test: _ischar(ch, True, _t))
+
+    def _oem(src, dst, n, wide_src, wide_dst):
+        if n is None:
+            s_ = k.ws_(src) if wide_src else p.mem.read_cstring(src, 1 << 20).decode("latin-1")
+            term = True
+        else:
+            s_ = p.mem.read(src, 2 * n).decode("utf-16-le", "replace") if wide_src else \
+                p.mem.read(src, n).decode("latin-1")
+            term = False
+        data = s_.encode("utf-16-le") if wide_dst else s_.encode("latin-1", "replace")
+        if term:
+            data += b"\0\0" if wide_dst else b"\0"
+        p.mem.write(dst, data)
+        return 1
+
+    @R("CharToOemA OemToCharA AnsiToOem OemToAnsi", "pp", dlls=U32)
+    def _ctoa(c, s_, d):
+        return _oem(s_, d, None, False, False)
+
+    @R("CharToOemW", "pp", dlls=U32)
+    def _ctow(c, s_, d):
+        return _oem(s_, d, None, True, False)
+
+    @R("OemToCharW", "pp", dlls=U32)
+    def _otcw(c, s_, d):
+        return _oem(s_, d, None, False, True)
+
+    @R("CharToOemBuffA OemToCharBuffA", "ppu", dlls=U32)
+    def _ctoba(c, s_, d, n):
+        return _oem(s_, d, n, False, False)
+
+    @R("CharToOemBuffW", "ppu", dlls=U32)
+    def _ctobw(c, s_, d, n):
+        return _oem(s_, d, n, True, False)
+
+    @R("OemToCharBuffW", "ppu", dlls=U32)
+    def _otcbw(c, s_, d, n):
+        return _oem(s_, d, n, False, True)
+
+    def _wsprintf(buf, fmt_ptr, args, wide):
+        m_ = p.mem
+        if wide:
+            fmt = k.ws_(fmt_ptr)
+            text = _crt_printf(fmt, args, "msvcrt", True,
+                               get_str=lambda a, n=None: m_.read_cstring(a, 1 << 20 if n is None or n < 0 else n).decode("latin-1"),
+                               get_wstr=lambda a, n=None: m_.read_wstring(a, 1 << 20 if n is None or n < 0 else n).decode("utf-16-le", "replace"),
+                               ptr_size=k.ptr_size())
+            text = text[:1024]
+            m_.write(buf, text.encode("utf-16-le") + b"\0\0")
+        else:
+            fmt = m_.read_cstring(fmt_ptr, 1 << 20).decode("latin-1")
+            text = _crt_printf(fmt, args, "msvcrt", False,
+                               get_str=lambda a, n=None: m_.read_cstring(a, 1 << 20 if n is None or n < 0 else n).decode("latin-1"),
+                               get_wstr=lambda a, n=None: m_.read_wstring(a, 1 << 20 if n is None or n < 0 else n).decode("utf-16-le", "replace"),
+                               ptr_size=k.ptr_size())
+            text = text[:1024]
+            m_.write(buf, text.encode("latin-1", "replace") + b"\0")
+        return len(text)
+
+    @R("wsprintfA", "pp.", dlls=U32)
+    def _wspa(c, buf, fmt, va):
+        return _wsprintf(buf, fmt, va, False)
+
+    @R("wsprintfW", "pp.", dlls=U32)
+    def _wspw(c, buf, fmt, va):
+        return _wsprintf(buf, fmt, va, True)
+
+    @R("wvsprintfA", "ppp", dlls=U32)
+    def _wvspa(c, buf, fmt, va):
+        return _wsprintf(buf, fmt, _VaList(c, va), False)
+
+    @R("wvsprintfW", "ppp", dlls=U32)
+    def _wvspw(c, buf, fmt, va):
+        return _wsprintf(buf, fmt, _VaList(c, va), True)
+
+
 # ==============================================================================
 # 11. Module / DLL loader
 # ==============================================================================
@@ -12530,12 +19043,37 @@ _INTERNAL_DLLS = ("kernel32.dll", "kernelbase.dll", "user32.dll", "advapi32.dll"
 
 
 class NOOModule:
-    __slots__ = ("name", "base", "size", "kind", "pe", "exports", "export_ordinals")
+    __slots__ = ("name", "base", "size", "kind", "pe", "exports", "export_ordinals",
+                 "forwarders")
 
     def __init__(self, name, base, size, kind, pe=None):
         self.name, self.base, self.size, self.kind, self.pe = name, base, size, kind, pe
         self.exports = {}          # name -> absolute address
         self.export_ordinals = {}  # ordinal -> absolute address
+        self.forwarders = {}       # name / ordinal -> "DLL.Name" or "DLL.#ord"
+
+
+# well-known exports that programs import by ordinal from system DLLs
+_ORDINAL_EXPORTS = {
+    "ws2_32.dll": {1: "accept", 2: "bind", 3: "closesocket", 4: "connect", 5: "getpeername",
+                   6: "getsockname", 7: "getsockopt", 8: "htonl", 9: "htons", 10: "ioctlsocket",
+                   11: "inet_addr", 12: "inet_ntoa", 13: "listen", 14: "ntohl", 15: "ntohs",
+                   16: "recv", 17: "recvfrom", 18: "select", 19: "send", 20: "sendto",
+                   21: "setsockopt", 22: "shutdown", 23: "socket", 51: "gethostbyaddr",
+                   52: "gethostbyname", 53: "getprotobyname", 54: "getprotobynumber",
+                   55: "getservbyname", 56: "getservbyport", 57: "gethostname",
+                   111: "WSAGetLastError", 112: "WSASetLastError", 115: "WSAStartup",
+                   116: "WSACleanup", 151: "__WSAFDIsSet"},
+    "oleaut32.dll": {2: "SysAllocString", 3: "SysReAllocString", 4: "SysAllocStringLen",
+                     5: "SysReAllocStringLen", 6: "SysFreeString", 7: "SysStringLen",
+                     8: "VariantInit", 9: "VariantClear", 10: "VariantCopy",
+                     12: "VariantChangeType", 147: "VariantChangeTypeEx",
+                     149: "SysStringByteLen", 150: "SysAllocStringByteLen"},
+    "comctl32.dll": {17: "InitCommonControls", 236: "Str_SetPtrW", 413: "SetWindowSubclass",
+                     410: "DefSubclassProc", 412: "RemoveWindowSubclass"},
+    "shell32.dll": {680: "IsUserAnAdmin"},
+}
+_ORDINAL_EXPORTS["wsock32.dll"] = _ORDINAL_EXPORTS["ws2_32.dll"]
 
 
 class ModuleManager:
@@ -12555,9 +19093,19 @@ class ModuleManager:
         m = self.by_name.get(name.lower())
         if m:
             return m.base
-        # tolerate missing ".dll"
-        m = self.by_name.get((name + ".dll").lower())
-        return m.base if m else 0
+        # tolerate missing ".dll" and a path prefix
+        key = name.replace("/", "\\").rsplit("\\", 1)[-1].lower()
+        if not key.endswith(".dll") and "." not in key:
+            key += ".dll"
+        m = self.by_name.get(key)
+        if m:
+            return m.base
+        # system DLLs NOO implements are always "loaded" (like kernel32/ntdll
+        # in every Windows process)
+        if key in _INTERNAL_DLLS or self.p.api.has_module(key) or \
+                key.startswith(("api-ms-win-", "ext-ms-win-")):
+            return self._make_internal(key).base
+        return 0
 
     def load(self, name):
         """LoadLibrary semantics: internal compatibility module, or a real PE
@@ -12571,14 +19119,38 @@ class ModuleManager:
         if key in _INTERNAL_DLLS or self.p.api.has_module(key) or key.startswith("api-ms-"):
             return self._make_internal(key).base
         # search the virtual filesystem for a real PE DLL
-        for cand in ("C:\\app\\" + name, self.p.vfs.getcwd() + "\\" + name,
-                     "C:\\Windows\\System32\\" + name, "C:\\Windows\\" + name):
+        cands = [name] if ("\\" in name or "/" in name) else []
+        base_name = name.replace("/", "\\").rsplit("\\", 1)[-1]
+        if not base_name.lower().endswith(".dll") and "." not in base_name:
+            base_name += ".dll"
+        exe_dir = (self.p.exe_win_path or "C:\\app\\x").rsplit("\\", 1)[0]
+        cands += [exe_dir + "\\" + base_name, "C:\\app\\" + base_name,
+                  self.p.vfs.getcwd() + "\\" + base_name,
+                  "C:\\Windows\\System32\\" + base_name, "C:\\Windows\\" + base_name]
+        for d in self.p.env.get("PATH", "").split(";"):
+            if d:
+                cands.append(d.rstrip("\\") + "\\" + base_name)
+        for cand in cands:
             try:
                 host = self.p.vfs.resolve(cand)
-                if os.path.isfile(host):
-                    return self._load_pe_dll(host, name).base
+                if not os.path.isfile(host):
+                    continue
             except (NOOSandboxViolation, OSError):
                 continue
+            m = self.by_name.get(os.path.basename(host).lower())
+            if m:
+                return m.base
+            m = self._load_pe_dll(host, base_name)
+            if not getattr(self.p, "_startup_pending", True) and \
+                    getattr(self.p, "current_thread", None) is not None:
+                pend = self.p.__dict__.get("pending_dll_inits", [])
+                self.p.pending_dll_inits = []
+                for b in pend:
+                    if not self.p._notify_module(b, 1):
+                        self.p.log.error("DllMain(%s) failed" % base_name)
+                        self.p.last_error = 1114          # ERROR_DLL_INIT_FAILED
+                        return 0
+            return m.base
         self.p.log.warn("LoadLibrary(%s): DLL not found in virtual filesystem and "
                         "not an internal module" % name)
         self.p.last_error = 126      # ERROR_MOD_NOT_FOUND
@@ -12601,17 +19173,23 @@ class ModuleManager:
         m = NOOModule(name.lower(), base, pe.size_of_image, "pe", pe)
         for exp in pe.exports.values():
             if exp.forwarder:
-                self.p.log.warn("forwarded export %s!%s -> %s (unresolved)"
-                                % (name, exp.name, exp.forwarder))
+                m.forwarders[exp.name] = exp.forwarder
+                m.forwarders[exp.ordinal] = exp.forwarder
                 continue
             addr = base + exp.rva
             m.exports[exp.name] = addr
             m.export_ordinals[exp.ordinal] = addr
         self.by_handle[base] = m
         self.by_name[name.lower()] = m
+        self.by_name[os.path.basename(host_path).lower()] = m
         self.p.resolve_imports(pe, base)
         self.p.protect_image(pe, base)
+        try:
+            self.p._tls_register(pe, base)
+        except NOOCPUFault as e:
+            self.p.log.warn("TLS directory of %s could not be set up: %s" % (name, e))
         self.p.log.ok("loaded PE DLL %s at %#x (%d exports)" % (name, base, len(m.exports)))
+        self.p.__dict__.setdefault("pending_dll_inits", []).append(base)
         return m
 
     def resolve(self, hmod, name, ordinal):
@@ -12621,15 +19199,39 @@ class ModuleManager:
             return 0
         if m.kind == "internal":
             if name is None:
-                self.p.log.warn("GetProcAddress by ordinal on internal module %s "
-                                "is not supported" % m.name)
-                return 0
+                name = _ORDINAL_EXPORTS.get(m.name, {}).get(ordinal)
+                if name is None:
+                    self.p.log.warn("GetProcAddress by ordinal %d on internal module %s "
+                                    "is not supported" % (ordinal, m.name))
+                    self.p.last_error = 127
+                    return 0
+                dll = "ws2_32.dll" if m.name == "wsock32.dll" else m.name
+                return self.p.api_thunk(dll, name)
             addr = self.p.api_thunk(m.name, name)
             return addr
         if name is not None:
             addr = m.exports.get(name)
         else:
             addr = m.export_ordinals.get(ordinal)
+        if not addr:
+            fwd = m.forwarders.get(name if name is not None else ordinal)
+            if fwd and "." in fwd and getattr(self, "_fwd_depth", 0) < 8:
+                dll, _, target = fwd.rpartition(".")
+                self._fwd_depth = getattr(self, "_fwd_depth", 0) + 1
+                try:
+                    h = self.load(dll if dll.lower().endswith(".dll") else dll + ".dll")
+                    if h:
+                        if target.startswith("#") and target[1:].isdigit():
+                            addr = self.resolve(h, None, int(target[1:]))
+                        else:
+                            mod = self.by_handle.get(h)
+                            if mod is not None and mod.kind == "internal":
+                                fn = self.p.api.lookup_any(mod.name, target)
+                                addr = self.p.api_thunk(mod.name, target) if fn else 0
+                            else:
+                                addr = self.resolve(h, target, None)
+                finally:
+                    self._fwd_depth -= 1
         if not addr:
             self.p.last_error = 127    # ERROR_PROC_NOT_FOUND
             return 0
@@ -12657,6 +19259,7 @@ class NOOThread:
         self.tid = NOOThread._next_tid[0]
         NOOThread._next_tid[0] += 1
         self.waiting_on = None
+        self.last_error = 0
 
 
 class NOOCallbackReturn(NOOError):
@@ -12748,51 +19351,105 @@ class NOOProcess:
         self._com_seeded = False
 
     # -- guest heap -------------------------------------------------------------
-    def heap_create(self):
-        base = self.mem.alloc(0x100000, MEM_READ | MEM_WRITE, tag="heap")
+    # Segregated exact-size bins + best-fit over larger free blocks + a bump
+    # pointer; the top block is returned to the bump region when freed. O(log n)
+    # per operation (the old first-fit list was O(n)).
+    @staticmethod
+    def _heap_new(base, size):
+        return {"base": base, "size": size, "ptr": base, "end": base + size,
+                "allocs": {}, "req": {}, "bins": {}, "sizes": []}
+
+    def heap_create(self, initial=0x100000):
+        base = self.mem.alloc(initial, MEM_READ | MEM_WRITE, tag="heap")
         h = self.handles.add(base, "heap")
-        self._heaps[h] = {"base": base, "size": 0x100000, "ptr": base,
-                          "allocs": {}, "free": []}
+        self._heaps[h] = self._heap_new(base, initial)
         return h
 
     def _heap(self, h):
         if h == self.process_heap_handle:
-            if h not in self._heaps:
+            heap = self._heaps.get(h)
+            if heap is None:
                 base = self.mem.alloc(0x400000, MEM_READ | MEM_WRITE, tag="process_heap")
-                self._heaps[h] = {"base": base, "size": 0x400000, "ptr": base,
-                                  "allocs": {}, "free": []}
-            return self._heaps[h]
-        base = self.handles.get(h, "heap")
+                heap = self._heaps[h] = self._heap_new(base, 0x400000)
+            return heap
         return self._heaps.get(h)
+
+    @staticmethod
+    def _heap_put(heap, a, s):
+        bins = heap["bins"]
+        lst = bins.get(s)
+        if lst is None:
+            bins[s] = [a]
+            bisect.insort(heap["sizes"], s)
+        else:
+            lst.append(a)
+
+    @staticmethod
+    def _heap_take(heap, s, i=None):
+        bins = heap["bins"]
+        lst = bins[s]
+        a = lst.pop()
+        if not lst:
+            del bins[s]
+            sizes = heap["sizes"]
+            if i is None:
+                i = bisect.bisect_left(sizes, s)
+            sizes.pop(i)
+        return a
+
+    def _heap_grow(self, heap, need):
+        grow = max((need + 0xFFFF) & ~0xFFFF, 0x400000, heap["size"] // 2)
+        end = heap["end"]
+        if all(((end + off) >> 12) not in self.mem.pages for off in range(0, grow, PAGE_SIZE)):
+            self.mem.alloc(grow, MEM_READ | MEM_WRITE, addr=end, tag="heap_grow")
+            heap["end"] = end + grow
+        else:
+            tail = heap["end"] - heap["ptr"]
+            if tail >= 32:
+                self._heap_put(heap, heap["ptr"], tail & ~15)
+            base = self.mem.alloc(grow, MEM_READ | MEM_WRITE, tag="heap_grow")
+            heap["ptr"], heap["end"] = base, base + grow
+        heap["size"] += grow
 
     def heap_alloc(self, h, size):
         heap = self._heap(h)
-        if heap is None or size <= 0:
+        if heap is None or size < 0 or size > 0x7FFF0000:
             return 0
-        size = (size + 15) & ~15
-        for i, (a, s) in enumerate(heap["free"]):
-            if s >= size:
-                heap["free"].pop(i)
-                if s > size + 16:
-                    heap["free"].append((a + size, s - size))
-                heap["allocs"][a] = size
-                return a
-        a = heap["ptr"]
-        if a + size > heap["base"] + heap["size"]:
-            grow = max(size * 2, 0x100000)
-            heap["size"] += grow
-            self.mem.alloc(grow, MEM_READ | MEM_WRITE,
-                           addr=heap["base"] + heap["size"] - grow, tag="heap_grow")
-        heap["ptr"] = a + size
-        heap["allocs"][a] = size
+        rs = (max(size, 1) + 15) & ~15
+        bins = heap["bins"]
+        if rs in bins:
+            a = self._heap_take(heap, rs)
+        else:
+            sizes = heap["sizes"]
+            i = bisect.bisect_left(sizes, rs)
+            if i < len(sizes):
+                bs = sizes[i]
+                a = self._heap_take(heap, bs, i)
+                if bs - rs >= 32:
+                    self._heap_put(heap, a + rs, bs - rs)
+                else:
+                    rs = bs
+            else:
+                if heap["ptr"] + rs > heap["end"]:
+                    self._heap_grow(heap, rs)
+                a = heap["ptr"]
+                heap["ptr"] = a + rs
+        heap["allocs"][a] = rs
+        heap["req"][a] = size
         return a
 
     def heap_free(self, h, addr):
         heap = self._heap(h)
-        if heap is None or addr not in heap["allocs"]:
+        if heap is None:
             return False
-        size = heap["allocs"].pop(addr)
-        heap["free"].append((addr, size))
+        rs = heap["allocs"].pop(addr, None)
+        if rs is None:
+            return False
+        heap["req"].pop(addr, None)
+        if addr + rs == heap["ptr"]:
+            heap["ptr"] = addr                     # top block: back to the bump region
+        else:
+            self._heap_put(heap, addr, rs)
         return True
 
     def heap_realloc(self, h, addr, new_size):
@@ -12804,10 +19461,25 @@ class NOOProcess:
         old = heap["allocs"].get(addr)
         if old is None:
             return 0
+        rs = (max(new_size, 1) + 15) & ~15
+        if rs <= old:
+            if old - rs >= 64:                     # shrink in place, release the tail
+                heap["allocs"][addr] = rs
+                if addr + old == heap["ptr"]:
+                    heap["ptr"] = addr + rs
+                else:
+                    self._heap_put(heap, addr + rs, old - rs)
+            heap["req"][addr] = new_size
+            return addr
+        if addr + old == heap["ptr"] and addr + rs <= heap["end"]:
+            heap["ptr"] = addr + rs                # top block: grow in place
+            heap["allocs"][addr] = rs
+            heap["req"][addr] = new_size
+            return addr
         new = self.heap_alloc(h, new_size)
         if not new:
             return 0
-        self.mem.write(new, self.mem.read(addr, min(old, new_size)))
+        self.mem.write(new, self.mem.read(addr, min(heap["req"].get(addr, old), new_size)))
         self.heap_free(h, addr)
         return new
 
@@ -12815,7 +19487,7 @@ class NOOProcess:
         heap = self._heap(h)
         if heap is None:
             return 0
-        return heap["allocs"].get(addr, 0)
+        return heap["req"].get(addr, 0)
 
     # -- CRT fd plumbing ----------------------------------------------------------
     def _fd_add_file(self, f):
@@ -12961,6 +19633,41 @@ class NOOProcess:
             return "cdecl"
         return "stdcall"
 
+    def _api_cleanup(self, api_id):
+        cache = self.__dict__.setdefault("_clean_cache", {})
+        n = cache.get(api_id)
+        if n is None:
+            n = cache[api_id] = self._api_cleanup_uncached(api_id)
+        return n
+
+    def _api_cleanup_uncached(self, api_id):
+        dll, name = self._thunk_ids.get(api_id, ("", ""))
+        if dll in ("!missing!", "!com!", "!noo!"):
+            return -1
+        if self._api_convention(api_id) != "stdcall":
+            return 0
+        fn = self.api.lookup_any(dll, name)
+        slots = getattr(fn, "_noo_slots", None)
+        if slots is None:
+            slots = _LEGACY_ARGC.get(name.lower())
+        return -1 if slots is None else 4 * slots
+
+    # per-thread GetLastError value
+    @property
+    def last_error(self):
+        t = self.__dict__.get("current_thread")
+        if t is not None:
+            return t.last_error
+        return self.__dict__.get("_last_error", 0)
+
+    @last_error.setter
+    def last_error(self, v):
+        t = self.__dict__.get("current_thread")
+        if t is not None:
+            t.last_error = v & 0xFFFFFFFF
+        else:
+            self.__dict__["_last_error"] = v & 0xFFFFFFFF
+
     def dispatch_api(self, api_id, cpu):
         if api_id == CALLBACK_RETURN_API_ID:
             raise NOOCallbackReturn()
@@ -12978,7 +19685,7 @@ class NOOProcess:
             return 0
         try:
             ret = fn(cpu)
-        except (NOOExitProcess, NOOExitThread, NOOCallbackReturn, NOOYield):
+        except (NOOExitProcess, NOOExitThread, NOOCallbackReturn, NOOYield, NOOContextSet):
             raise
         except NOOCPUFault:
             raise
@@ -12987,7 +19694,6 @@ class NOOProcess:
                            % (dll, name, e))
             self.log.debug(traceback.format_exc())
             return 0
-        self.last_error = 0
         return int(ret) & SIZE_MASK[64 if cpu.mode == 64 else 32] if ret is not None else 0
 
     # -- guest callbacks ---------------------------------------------------------------
@@ -13144,6 +19850,11 @@ class NOOProcess:
         # the C runtime's data exports must exist before imports are bound,
         # but after the image claimed its preferred base address
         self.api.crt = _crt_install(_CRT(self.api))
+        self.seh = _SEH(self)
+        self.unwinder = _Unwinder(self)
+        self.k32 = _K32(self.api)
+        _k32_install(self.k32)
+        self.seh.install_thunks()
         main = NOOModule(os.path.basename(self.exe_host_path).lower(), base,
                          pe.size_of_image, "pe", pe)
         self.modules.main = main
@@ -13172,6 +19883,7 @@ class NOOProcess:
         cpu = CPU(self.mem, self.cpu_mode, self.log)
         cpu.api_handler = self.dispatch_api
         cpu.api_convention = self._api_convention
+        cpu.api_cleanup = self._api_cleanup
         main_thread = NOOThread(self, cpu, stack_base, stack_size, teb)
         main_thread.tid = tid
         self.threads.append(main_thread)
@@ -13258,8 +19970,37 @@ class NOOProcess:
         cpu.regs[RSP] = stack_top - (0x100 if self.cpu_mode == 32 else 0x200)
         cpu.regs[RBP] = cpu.regs[RSP]
         entry = base + pe.entry_rva
+        # implicit TLS of the exe (slot 0 — DLL slots were assigned while
+        # their images were loaded), then DLL / TLS process-attach
+        # notifications in load order, exactly like the Windows loader
+        try:
+            self._tls_register(pe, base)
+            tl = self.__dict__.get("tls_modules", [])
+            tl.sort(key=lambda e: 0 if e["base"] == base else 1)
+            for i, ent in enumerate(tl):
+                if ent["slot"] != i:
+                    ent["slot"] = i
+            self.threads = [main_thread] + [t for t in self.threads if t is not main_thread]
+            for ent in tl:
+                rva_t = (self.modules.by_handle[ent["base"]].pe.directories[DIR_TLS][0]
+                         if ent["base"] in self.modules.by_handle else 0)
+                if rva_t:
+                    ps = 8 if self.cpu_mode == 64 else 4
+                    idx_addr = (self.mem.read64 if ps == 8 else self.mem.read32)(
+                        ent["base"] + rva_t + 2 * ps)
+                    if idx_addr:
+                        self.mem.write32(idx_addr, ent["slot"])
+            arr_off = 0x58 if self.cpu_mode == 64 else 0x2C
+            if self.cpu_mode == 64:
+                self.mem.write64(teb + arr_off, 0)
+            else:
+                self.mem.write32(teb + arr_off, 0)
+            self._tls_thread_init(main_thread)
+        except NOOCPUFault as e:
+            self.log.warn("TLS directory could not be set up: %s" % e)
         cpu.eip = entry
-        cpu.push(self._exit_thunk())       # entry "returns" -> ExitProcess
+        cpu.push(self._exit_thunk())       # entry "returns" -> process exit code
+        self._startup_pending = True
         self._entry = entry
         self.log.ok("PE loader: %s mapped at %#x, entry %#x (%d-bit)"
                     % (os.path.basename(self.exe_host_path), base, entry, self.cpu_mode))
@@ -13275,11 +20016,152 @@ class NOOProcess:
         return addr
 
     def _exit_thunk(self):
+        """Return address of the entry point: like BaseThreadInitThunk, the
+        value the entry point returns becomes the process exit code."""
         addr = getattr(self, "_exit_thunk_addr", None)
         if addr is None:
-            addr = self.api_thunk("kernel32.dll", "ExitProcess")
+            if ("!noo!", "process_exit") not in self.api.table:
+                def process_exit(cpu):
+                    raise NOOExitProcess(cpu.regs[RAX] & 0xFFFFFFFF)
+                process_exit._noo_cc = "cdecl"
+                self.api.table[("!noo!", "process_exit")] = process_exit
+            addr = self.api_thunk("!noo!", "process_exit")
             self._exit_thunk_addr = addr
         return addr
+
+    def _thread_exit_thunk(self):
+        addr = getattr(self, "_thread_exit_addr", None)
+        if addr is None:
+            if ("!noo!", "thread_exit") not in self.api.table:
+                def thread_exit(cpu):
+                    raise NOOExitThread(cpu.regs[RAX] & 0xFFFFFFFF)
+                thread_exit._noo_cc = "cdecl"
+                self.api.table[("!noo!", "thread_exit")] = thread_exit
+            addr = self.api_thunk("!noo!", "thread_exit")
+            self._thread_exit_addr = addr
+        return addr
+
+    # -- implicit TLS (.tls directory) + DLL / TLS notifications ---------------------------
+    def _tls_register(self, pe, base):
+        """Assign a TLS slot to a module with a .tls directory and hand every
+        existing thread its copy of the template."""
+        rva, size = pe.directories[DIR_TLS]
+        if not rva or not size:
+            return
+        ps = 8 if self.cpu_mode == 64 else 4
+        rd = self.mem.read64 if ps == 8 else self.mem.read32
+        d = base + rva
+        start, end, idx_addr, cbs = rd(d), rd(d + ps), rd(d + 2 * ps), rd(d + 3 * ps)
+        zero = self.mem.read32(d + 4 * ps)
+        tls = self.__dict__.setdefault("tls_modules", [])
+        slot = len(tls)
+        callbacks = []
+        a = cbs
+        while a:
+            try:
+                fn = rd(a)
+            except NOOCPUFault:
+                break
+            if not fn:
+                break
+            callbacks.append(fn)
+            a += ps
+            if len(callbacks) > 64:
+                break
+        ent = {"base": base, "start": start, "end": end, "zero": zero, "slot": slot,
+               "callbacks": callbacks}
+        tls.append(ent)
+        if idx_addr:
+            try:
+                self.mem.write32(idx_addr, slot)
+            except NOOCPUFault:
+                pass
+        for t in self.threads:
+            self._tls_thread_block(t, ent)
+
+    def _tls_thread_block(self, t, ent):
+        ps = 8 if self.cpu_mode == 64 else 4
+        arr_off = 0x58 if ps == 8 else 0x2C
+        arr = self.mem.read64(t.teb + arr_off) if ps == 8 else self.mem.read32(t.teb + arr_off)
+        if not arr:
+            arr = self.mem.alloc(0x1000, MEM_READ | MEM_WRITE, tag="tls_array")
+            if ps == 8:
+                self.mem.write64(t.teb + arr_off, arr)
+            else:
+                self.mem.write32(t.teb + arr_off, arr)
+        n = max(0, ent["end"] - ent["start"])
+        blk = self.heap_alloc(self.process_heap_handle, max(16, n + ent["zero"]))
+        if n:
+            self.mem.write(blk, self.mem.read(ent["start"], n))
+        if ent["zero"]:
+            self.mem.write(blk + n, bytes(ent["zero"]))
+        if ps == 8:
+            self.mem.write64(arr + 8 * ent["slot"], blk)
+        else:
+            self.mem.write32(arr + 4 * ent["slot"], blk)
+
+    def _tls_thread_init(self, t):
+        for ent in self.__dict__.get("tls_modules", []):
+            self._tls_thread_block(t, ent)
+
+    def _notify_module(self, base, reason, dll_main=True):
+        """TLS callbacks then DllMain for one module (Windows' loader order)."""
+        for ent in self.__dict__.get("tls_modules", []):
+            if ent["base"] == base:
+                for cb in ent["callbacks"]:
+                    try:
+                        self.call_guest(cb, [base, reason, 0])
+                    except (NOOCPUFault, NOOInternalError) as e:
+                        self.log.error("TLS callback %#x failed: %s" % (cb, e))
+        mod = self.modules.by_handle.get(base)
+        if not dll_main or mod is None or mod.pe is None or not mod.pe.is_dll:
+            return 1
+        if reason in (2, 3) and base in self.__dict__.get("no_thread_calls", set()):
+            return 1
+        entry = mod.pe.entry_rva
+        if not entry:
+            return 1
+        try:
+            r = self.call_guest(base + entry, [base, reason, 0])
+        except (NOOCPUFault, NOOInternalError) as e:
+            self.log.error("DllMain of %s failed: %s" % (mod.name, e))
+            return 0
+        return r & 0xFFFFFFFF
+
+    def _run_pending_dll_inits(self):
+        pending = self.__dict__.get("pending_dll_inits", [])
+        self.pending_dll_inits = []
+        for base in pending:
+            mod = self.modules.by_handle.get(base)
+            if not self._notify_module(base, 1):
+                self.log.error("DllMain(%s, DLL_PROCESS_ATTACH) returned FALSE"
+                               % (mod.name if mod else hex(base)))
+                raise NOOExitProcess(0xC0000142)       # STATUS_DLL_INIT_FAILED
+
+    def thread_attach_notify(self, t):
+        """New thread: TLS copies, then DLL_THREAD_ATTACH on the new thread."""
+        self._tls_thread_init(t)
+        bases = [e["base"] for e in self.__dict__.get("tls_modules", [])]
+        bases += [b for b, m in self.modules.by_handle.items()
+                  if m.pe is not None and m.pe.is_dll and b not in bases]
+        if not bases:
+            return
+        prev = self.current_thread
+        self.current_thread = t
+        try:
+            for b in bases:
+                self._notify_module(b, 2)
+        finally:
+            self.current_thread = prev
+
+    def process_detach_notify(self):
+        mods = [b for b, m in self.modules.by_handle.items()
+                if m.pe is not None and m.pe.is_dll]
+        for b in reversed(mods):
+            try:
+                self._notify_module(b, 0)
+            except NOOError:
+                pass
 
     def getenv_ptr(self, name):
         return self._env_string_ptrs.get(name.upper(), 0)
@@ -13446,6 +20328,7 @@ class NOOProcess:
         cpu = CPU(self.mem, self.cpu_mode, self.log)
         cpu.api_handler = self.dispatch_api
         cpu.api_convention = self._api_convention
+        cpu.api_cleanup = self._api_cleanup
         t = NOOThread(self, cpu, stack_base, stack_size, teb, start, param)
         top = stack_base + stack_size
         if self.cpu_mode == 32:
@@ -13464,7 +20347,7 @@ class NOOProcess:
             self.mem.write64(teb + 0x60, self.peb_addr)
             cpu.seg_gs = teb
             cpu.seg_fs = teb
-        exit_thunk = self.api_thunk("kernel32.dll", "ExitThread")
+        exit_thunk = self._thread_exit_thunk()
         cpu.regs[RSP] = top - 0x40
         if self.cpu_mode == 64:
             # Win64: thread proc gets param in RCX, return address on stack
@@ -13476,6 +20359,11 @@ class NOOProcess:
         cpu.eip = start
         t.handle = self.handles.add(t, "thread")
         self.threads.append(t)
+        try:
+            self.thread_attach_notify(t)
+        except NOOExitThread as e:
+            t.state = "dead"
+            t.exit_code = e.code
         return t.tid, t.handle
 
     def wait_for(self, handle, timeout_ms):
@@ -13545,6 +20433,16 @@ class NOOProcess:
         w = t.waiting_on
         if w is None:
             return True
+        k32 = getattr(self, "k32", None)
+        if k32 is not None:
+            prev = self.current_thread
+            self.current_thread = t            # last-error / tid belong to the waiter
+            try:
+                r = k32.wake_check(t)
+            finally:
+                self.current_thread = prev
+            if r is not None:
+                return r
         kind = w[0]
         if kind == "thread":
             return w[1].state == "dead"
@@ -13598,6 +20496,15 @@ class NOOProcess:
     # -- SEH ---------------------------------------------------------------------------
     def _try_seh(self, thread, fault):
         """Dispatch to the architecture's SEH mechanism."""
+        seh = getattr(self, "seh", None)
+        if seh is not None and seh.ret_thunk:
+            prev = self.current_thread
+            self.current_thread = thread
+            try:
+                return seh.dispatch_fault(thread, fault)
+            finally:
+                if prev is not None:
+                    self.current_thread = prev
         if thread.cpu.mode == 32:
             return self._try_seh_x86(thread, fault)
         return self._try_seh_x64(thread, fault)
@@ -13811,6 +20718,16 @@ class NOOProcess:
                     self.gui_queue.append({"hwnd": t["hwnd"], "message": WM_TIMER,
                                            "w": t["id"], "l": 0})
 
+    @staticmethod
+    def _wait_deadline(t):
+        w = t.waiting_on
+        if not w:
+            return None
+        if w[0] == "sleep":
+            return w[1]
+        d = w[-1]
+        return d if isinstance(d, float) else None
+
     def run(self):
         self.log.info("starting virtual Windows environment "
                       "(host: %s, interpreter: pure Python)" % HOST_SYSTEM)
@@ -13818,6 +20735,7 @@ class NOOProcess:
         max_instr = self.sandbox.max_instructions
         slice_n = 20000
         try:
+            self._startup_notify()
             idle_rounds = 0
             while True:
                 # wake any threads whose wait condition is now satisfied
@@ -13828,10 +20746,17 @@ class NOOProcess:
                         t.cpu.finish_yield()   # thunk ret + stdcall cleanup
                 alive = [t for t in self.threads if t.state in ("running", "guiwait")]
                 if not alive:
-                    blocked = [t for t in self.threads if t.state == "blocked"]
-                    if blocked:
-                        self.log.error("deadlock: all threads blocked")
+                    blocked = [t for t in self.threads if t.state in ("blocked", "suspended")]
+                    if not blocked:
                         break
+                    deadlines = [self._wait_deadline(t) for t in blocked
+                                 if t.state == "blocked"]
+                    deadlines = [d for d in deadlines if d is not None]
+                    if deadlines:
+                        time.sleep(max(0.0, min(0.05, min(deadlines) - time.monotonic())))
+                        continue
+                    self.log.error("deadlock: all threads are blocked with no timeout — "
+                                   "ending the process")
                     break
                 if self._gui is not None:
                     self._gui.pump()
@@ -13894,7 +20819,27 @@ class NOOProcess:
                 self.call_guest(h, [])
             except NOOError:
                 pass
+        try:
+            if self.current_thread is not None and self.current_thread.state != "dead":
+                self.process_detach_notify()
+        except BaseException:
+            pass
         return self.exit_code
+
+    def _startup_notify(self):
+        """DLL_PROCESS_ATTACH for statically imported DLLs (load order), then
+        the exe's own TLS callbacks — before the entry point runs."""
+        if not self.__dict__.get("_startup_pending"):
+            return
+        self._startup_pending = False
+        main = self.threads[0] if self.threads else None
+        prev = self.current_thread
+        self.current_thread = main
+        try:
+            self._run_pending_dll_inits()
+            self._notify_module(self.image_base, 1, dll_main=False)
+        finally:
+            self.current_thread = prev
 
     def run_until_idle(self, max_rounds=100000):
         """Cooperative driver for the AetherOS web GUI: run the scheduler until
@@ -13914,6 +20859,7 @@ class NOOProcess:
         # legitimately runs far more instructions over its lifetime.
         start_count = self.instruction_count
         try:
+            self._startup_notify()
             while True:
                 rounds += 1
                 if rounds > max_rounds:
@@ -14429,6 +21375,10 @@ class _APIShim(WinAPI):
             pass
         try:
             _crt_install(_CRT(self))
+        except Exception:
+            pass
+        try:
+            _k32_install(_K32(self))
         except Exception:
             pass
 
@@ -15906,8 +22856,9 @@ def _seh64chain_pe():
     inner's handler returns ExceptionContinueSearch(1) so NOO must apply
     inner's unwind codes (UWOP_ALLOC_SMALL for its sub rsp,0x28), pop the
     return address and re-dispatch at outer's frame, whose handler records
-    flag=2 and returns ExceptionContinueExecution(0). Execution then resumes
-    at the instruction after 'call inner' — exit code must be 2."""
+    flag=2, advances ContextRecord->Rip past the faulting 10-byte load and
+    returns ExceptionContinueExecution(0) — as on Windows, execution resumes
+    from the (edited) context: inner returns normally and outer exits with 2."""
     imps = {"kernel32.dll": ["ExitProcess"]}
     base = 0x140000000
     text = base + 0x1000
@@ -15946,6 +22897,7 @@ def _seh64chain_pe():
     code += b"\xC3"                                    # ret
     h_outer_off = len(code)
     code += b"\xC6\x05\x00\x00\x00\x00\x02"            # mov byte [rip+flag], 2
+    code += b"\x49\x83\x80\xF8\x00\x00\x00\x0A"        # add qword [r8+0xF8], 10 (ctx.Rip)
     code += b"\x31\xC0"                                # xor eax, eax (ContinueExec)
     code += b"\xC3"                                    # ret
     flag_va = text + len(code)
@@ -15974,7 +22926,7 @@ def _test_e2e_seh64_chain(tmpdir):
     _run_guest(path, expect_code=2)
     return ("x64 chained SEH: inner handler continued search, unwind codes "
             "applied (UWOP_ALLOC_SMALL + return-address pop), outer handler "
-            "resumed after the call site, exit=flag=2")
+            "edited the context and resumed it, exit=flag=2")
 
 
 def _res32_pe():
