@@ -15890,7 +15890,7 @@ const AetherBridge = {
      inject input events, and stop it. The guest's own message loop + WndProc
      do the work; these just move state across the bridge. */
   async guiStart(dataB64, argsJson) { return this._call('gui_start', dataB64, argsJson || '[]'); },
-  async guiPoll(sid) { return this._call('gui_poll', sid); },
+  async guiPoll(sid, knownJson) { return this._call('gui_poll', sid, knownJson || '{}'); },
   async guiEvent(sid, evJson) { return this._call('gui_event', sid, evJson); },
   async guiStop(sid) { return this._call('gui_stop', sid); },
   /* Installers: run an installer against a persistent C:\, list & read results */
@@ -16083,7 +16083,7 @@ const ExeHost = {
    cleanly instead of throwing.
    -------------------------------------------------------------------------- */
 const GuiApp = {
-  _apps: {},    // appId -> {sid, path, name, main hwnd, timer, closed}
+  _apps: {},    // appId -> {sid, path, name, main hwnd, timer, closed, frames}
 
   idFor(path) { return 'gui:' + path; },
 
@@ -16108,33 +16108,34 @@ const GuiApp = {
       return;
     }
     const appId = this.idFor(fullPath);
-    this._apps[appId] = {
-      sid: snap.sid, path: fullPath, name: name, probe: probe || {},
-      mainHwnd: 0, closed: false, timer: null, lastRev: -1, lastGlRev: -1, ctrlEls: {}
-    };
+    this._apps[appId] = this._newApp(snap.sid, fullPath, name, probe);
     OS.launchApp(appId);   // window shell (buildConfig)
-    // Render first frame + start the poll loop once the canvas exists.
+    // Render first frame + start the poll loop once the stage exists.
     setTimeout(() => this._afterOpen(appId, snap), 60);
+  },
+
+  _newApp(sid, path, name, probe) {
+    return { sid: sid, path: path, name: name, probe: probe || {}, mainHwnd: 0, closed: false,
+             timer: null, lastGlRev: -1, frames: {}, known: {}, origin: [0, 0], sized: '' };
   },
 
   buildConfig(appId) {
     const app = this._apps[appId];
     const title = app ? app.name : 'Windows Program';
     const cid = SecurityUtils.escapeHTML(appId);
-    // A neutral desktop-grey canvas host; the guest paints onto the canvas.
+    /* The stage is a window-sized viewport onto the guest's virtual screen,
+       anchored at the main window's frame (menu bar + client area). Every
+       guest top-level window (the main window, dialogs, menus, drop-downs,
+       tooltips) is a pixel frame the guest rendered itself. */
     const body =
       '<div class="gui-host" style="height:100%;position:relative;overflow:auto;'
-      + 'background:#c0c0c0;">'
-      + '  <div id="gui-status-' + cid + '" style="position:absolute;top:0;left:0;right:0;'
-      + '       font:12px Segoe UI,Arial,sans-serif;color:#111;background:#e7e7e7;'
-      + '       border-bottom:1px solid #9a9a9a;padding:3px 8px;z-index:5;">Starting…</div>'
-      + '  <div id="gui-stage-' + cid + '" style="position:relative;margin-top:24px;">'
-      + '    <canvas id="gui-canvas-' + cid + '" width="320" height="240" '
-      + '            style="display:block;background:#ffffff;image-rendering:pixelated;"></canvas>'
-      + '    <div id="gui-controls-' + cid + '" style="position:absolute;left:0;top:0;"></div>'
-      + '  </div>'
+      + 'background:#3a6ea5;">'
+      + '  <div id="gui-status-' + cid + '" style="position:absolute;left:4px;top:4px;'
+      + '       font:12px Segoe UI,Arial,sans-serif;color:#fff;z-index:1;">Starting…</div>'
+      + '  <div id="gui-stage-' + cid + '" tabindex="0" style="position:relative;outline:none;'
+      + '       width:320px;height:240px;cursor:default;"></div>'
       + '</div>';
-    return { title: title, w: 360, h: 300, icon: '#4f8cff', content: body };
+    return { title: title, w: 480, h: 360, icon: '#4f8cff', content: body };
   },
 
   _el(appId, which) { return document.getElementById('gui-' + which + '-' + appId); },
@@ -16142,8 +16143,8 @@ const GuiApp = {
   async _afterOpen(appId, snap, tries) {
     const app = this._apps[appId];
     if (!app || app.closed) return;
-    const canvas = this._el(appId, 'canvas');
-    if (!canvas) {
+    const stage = this._el(appId, 'stage');
+    if (!stage) {
       // Window not painted yet — retry briefly, but not forever (it may
       // have been closed before it ever appeared).
       if ((tries || 0) < 50) setTimeout(() => this._afterOpen(appId, snap, (tries || 0) + 1), 80);
@@ -16151,17 +16152,18 @@ const GuiApp = {
     }
     this._wireInput(appId);
     this._render(appId, snap);
+    try { stage.focus(); } catch (e) {}
     // Poll loop: repaints from timers/animations; also detects exit.
-    if (!app.timer) app.timer = setInterval(() => this._tick(appId), 120);
+    if (!app.timer) app.timer = setInterval(() => this._tick(appId), 100);
   },
 
   async _tick(appId) {
     const app = this._apps[appId];
-    if (!app || app.closed || app.polling) return;
+    if (!app || app.closed || app.polling || app.busy) return;
     // One poll at a time: a slow emulator step must not stack up requests.
     app.polling = true;
     let snap;
-    try { snap = await AetherBridge.guiPoll(app.sid); }
+    try { snap = await AetherBridge.guiPoll(app.sid, JSON.stringify(app.known)); }
     catch (e) { snap = null; }   // transient; try again next tick
     finally { app.polling = false; }
     if (this._apps[appId] !== app || !snap || !snap.ok) return;
@@ -16188,77 +16190,126 @@ const GuiApp = {
     if (st) st.textContent = 'Program exited (code ' +
       (snap && snap.exit_code != null ? snap.exit_code : 0) + ').';
     try { AetherBridge.guiStop(app.sid); } catch (e) {}
+    // The program is gone: close its window shortly after the last frame.
+    setTimeout(() => { if (OS.windows[appId]) OS.closeWindow(appId); }, 400);
   },
 
-  /* Pick the guest's top-level (non-child) window to map to this OS window. */
+  /* The guest's main window: the first visible, captioned, unowned top-level. */
   _mainWindow(snap) {
     const wins = (snap && snap.windows) || [];
-    let main = null;
+    let best = null;
     for (const w of wins) {
-      if (!w.visible) continue;
-      if (!w.parent) { main = w; break; }
-      if (!main) main = w;
+      if (!w.visible || w.minimized) continue;
+      if (w.caption && !w.owner && !w.tool) return w;
+      if (!best && w.caption) best = w;
     }
-    return main || wins[0] || null;
+    if (best) return best;
+    for (const w of wins) if (w.visible && !w.minimized) return w;
+    return null;
   },
 
   _render(appId, snap) {
     const app = this._apps[appId];
     if (!app) return;
-    // Message boxes the guest raised -> real OS notifications.
-    if (snap.messageboxes && snap.messageboxes.length) {
-      for (const mb of snap.messageboxes) {
-        OS.notify(mb.title || app.name, mb.text || '');
-      }
-    }
-    // OpenGL frame present? Render it with WebGL and skip the 2D path.
+    const stage = this._el(appId, 'stage');
+    if (!stage) return;
+    const st = this._el(appId, 'status');
+    // OpenGL frame present? Render it with WebGL over the main client area.
     const gl = snap.gl;
-    const hasGL = gl && gl.commands && gl.commands.length &&
-      (gl.rev !== app.lastGlRev);
-    if (hasGL) {
+    const main = this._mainWindow(snap);
+    if (gl && gl.commands && gl.commands.length && gl.rev !== app.lastGlRev) {
       app.lastGlRev = gl.rev;
-      const main = this._mainWindow(snap) || { hwnd: gl.hwnd, w: 640, h: 480, title: app.name };
-      app.mainHwnd = main.hwnd || app.mainHwnd;
-      this._renderGL(appId, gl, main);
-      const st = this._el(appId, 'status');
-      if (st && !app.closed) st.textContent = (main.title || app.name) + ' · OpenGL';
+      this._renderGL(appId, gl, main || { hwnd: gl.hwnd, w: 640, h: 480, title: app.name });
+    }
+    if (!main) {
+      if (st && !app.closed) st.textContent = snap.exited ? 'Program exited.' : 'Working…';
       return;
     }
-    // Nothing changed — or a reply that arrived out of order and is older
-    // than the frame already on screen (rev only ever increases).
-    if (snap.rev != null && snap.rev <= app.lastRev && !snap.exited) return;
-    if (snap.rev != null) app.lastRev = snap.rev;
-
-    const main = this._mainWindow(snap);
-    const canvas = this._el(appId, 'canvas');
-    const controls = this._el(appId, 'controls');
-    if (!canvas || !main) return;
+    if (st) st.textContent = '';
     app.mainHwnd = main.hwnd;
-
-    // Size canvas to the guest window's client area.
-    const cw = Math.max(64, Math.min(2000, main.w | 0));
-    const ch = Math.max(48, Math.min(1400, main.h | 0));
-    if (canvas.width !== cw) canvas.width = cw;
-    if (canvas.height !== ch) canvas.height = ch;
-
-    const ctx = canvas.getContext('2d');
-    // Erase background (WM_ERASEBKGND default is the window's grey/white).
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, cw, ch);
-
-    // Replay this window's GDI ops.
-    this._replayOps(ctx, main.ops || []);
-
-    // Child controls: draw stock BUTTON/STATIC/EDIT as DOM for crisp text +
-    // native clicking. Their ops (custom-drawn controls) also go on canvas.
-    const kids = (snap.windows || []).filter(w => w.parent === main.hwnd && w.visible);
-    this._syncControls(appId, controls, kids, main);
-
-    // Position the OS window title to match the guest.
-    const st = this._el(appId, 'status');
-    if (st && !app.closed) {
-      st.textContent = main.title || app.name;
+    // Anchor the viewport on the main window's frame (menu + client) and size
+    // the OS window to it.
+    const fr = main.frame || [0, 0, main.w, main.h];
+    const fw = Math.max(1, fr[2] - fr[0]), fh = Math.max(1, fr[3] - fr[1]);
+    app.origin = [main.x + fr[0], main.y + fr[1]];
+    stage.style.width = fw + 'px';
+    stage.style.height = fh + 'px';
+    const key = fw + 'x' + fh;
+    const win = OS.windows[appId];
+    if (win && app.sized !== key) {
+      app.sized = key;
+      const body = win.el.querySelector('.window-body');
+      const chromeW = win.el.offsetWidth - (body ? body.clientWidth : win.el.offsetWidth);
+      const chromeH = win.el.offsetHeight - (body ? body.clientHeight : win.el.offsetHeight);
+      win.el.style.width = Math.min(window.innerWidth - 20, fw + chromeW) + 'px';
+      win.el.style.height = Math.min(window.innerHeight - 60, fh + chromeH) + 'px';
     }
+    if (win) {
+      const t = win.el.querySelector('.titlebar-title');
+      if (t && t.textContent !== (main.title || app.name)) t.textContent = main.title || app.name;
+    }
+    // Pixel frames for every visible top-level window, stacked in z-order.
+    const seen = {};
+    const wins = snap.windows || [];
+    for (const w of wins) {
+      if (!w.visible || w.minimized) continue;
+      seen[w.hwnd] = true;
+      let f = app.frames[w.hwnd];
+      if (!f) {
+        const cv = document.createElement('canvas');
+        cv.style.cssText = 'position:absolute;image-rendering:pixelated;';
+        stage.appendChild(cv);
+        f = app.frames[w.hwnd] = { canvas: cv, rev: null };
+      }
+      const isMain = w.hwnd === main.hwnd;
+      const crop = isMain ? fr : [0, 0, w.w, w.h];
+      const cw = Math.max(1, crop[2] - crop[0]), ch = Math.max(1, crop[3] - crop[1]);
+      if (f.canvas.width !== cw) f.canvas.width = cw;
+      if (f.canvas.height !== ch) f.canvas.height = ch;
+      f.canvas.style.left = (isMain ? 0 : w.x - app.origin[0]) + 'px';
+      f.canvas.style.top = (isMain ? 0 : w.y - app.origin[1]) + 'px';
+      f.canvas.style.zIndex = String(1000 - (w.z || 0));
+      f.crop = crop;
+      if (w.png && f.rev !== w.rev) {
+        f.rev = w.rev;
+        app.known[w.hwnd] = w.rev;
+        const img = new Image();
+        img.onload = () => {
+          const ctx = f.canvas.getContext('2d');
+          ctx.drawImage(img, f.crop[0], f.crop[1], f.canvas.width, f.canvas.height,
+                        0, 0, f.canvas.width, f.canvas.height);
+        };
+        img.src = 'data:image/png;base64,' + w.png;
+      }
+    }
+    for (const h in app.frames) {
+      if (!seen[h]) { app.frames[h].canvas.remove(); delete app.frames[h]; delete app.known[h]; }
+    }
+    // Text caret overlay (blinks via CSS).
+    let caret = stage.querySelector('.gui-caret');
+    const c = snap.caret;
+    const cw_ = c && wins.find(w => w.hwnd === c.hwnd && w.visible);
+    if (cw_) {
+      if (!caret) {
+        caret = document.createElement('div');
+        caret.className = 'gui-caret';
+        caret.style.cssText = 'position:absolute;background:#000;z-index:2000;' +
+          'animation:guiCaretBlink 1.06s steps(1) infinite;pointer-events:none;';
+        stage.appendChild(caret);
+        if (!document.getElementById('gui-caret-style')) {
+          const s = document.createElement('style');
+          s.id = 'gui-caret-style';
+          s.textContent = '@keyframes guiCaretBlink{0%{opacity:1}50%{opacity:0}}';
+          document.head.appendChild(s);
+        }
+      }
+      caret.style.left = (cw_.x + c.x - app.origin[0]) + 'px';
+      caret.style.top = (cw_.y + c.y - app.origin[1]) + 'px';
+      caret.style.width = Math.max(1, c.w) + 'px';
+      caret.style.height = Math.max(1, c.h) + 'px';
+      caret.style.display = 'block';
+    } else if (caret) caret.style.display = 'none';
+    stage.style.cursor = snap.cursor || 'default';
   },
 
   /* Minimal fixed-function GL replay on WebGL. Supports glClear/ClearColor,
@@ -16268,8 +16319,18 @@ const GuiApp = {
      is unavailable. */
   _renderGL(appId, gl, main) {
     const app = this._apps[appId];
-    const canvas = this._el(appId, 'canvas');
-    if (!canvas) return;
+    const stage = this._el(appId, 'stage');
+    if (!stage) return;
+    let canvas = app.glCanvas;
+    if (!canvas) {
+      canvas = app.glCanvas = document.createElement('canvas');
+      canvas.style.cssText = 'position:absolute;z-index:1500;pointer-events:none;';
+      stage.appendChild(canvas);
+    }
+    const fr = main.frame || [0, 0, main.w, main.h], cl = main.client || fr;
+    canvas.style.left = ((cl[0] || 0) - (fr[0] || 0)) + 'px';
+    canvas.style.top = ((cl[1] || 0) - (fr[1] || 0)) + 'px';
+    main = { w: (cl[2] - cl[0]) || main.w, h: (cl[3] - cl[1]) || main.h };
     const cw = Math.max(64, Math.min(2000, (main.w | 0) || 640));
     const ch = Math.max(48, Math.min(1400, (main.h | 0) || 480));
     if (canvas.width !== cw) canvas.width = cw;
@@ -16356,135 +16417,71 @@ const GuiApp = {
     }
   },
 
-  _replayOps(ctx, ops) {
-    ctx.save();
-    ctx.textBaseline = 'top';
-    ctx.font = '13px "Segoe UI", Tahoma, Arial, sans-serif';
-    for (const op of ops) {
-      if (op.op === 'rect') {
-        if (op.fill) { ctx.fillStyle = op.fill; ctx.fillRect(op.l, op.t, op.r - op.l, op.b - op.t); }
-        ctx.strokeStyle = '#000'; ctx.lineWidth = 1;
-        ctx.strokeRect(op.l + 0.5, op.t + 0.5, (op.r - op.l) - 1, (op.b - op.t) - 1);
-      } else if (op.op === 'oval') {
-        ctx.strokeStyle = '#000'; ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.ellipse((op.l + op.r) / 2, (op.t + op.b) / 2,
-          Math.abs(op.r - op.l) / 2, Math.abs(op.b - op.t) / 2, 0, 0, Math.PI * 2);
-        ctx.stroke();
-      } else if (op.op === 'line') {
-        ctx.strokeStyle = '#000'; ctx.lineWidth = 1;
-        ctx.beginPath(); ctx.moveTo(op.x1 + 0.5, op.y1 + 0.5);
-        ctx.lineTo(op.x2 + 0.5, op.y2 + 0.5); ctx.stroke();
-      } else if (op.op === 'text') {
-        ctx.fillStyle = '#000';
-        ctx.fillText(String(op.s == null ? '' : op.s), op.x, op.y);
-      }
-    }
-    ctx.restore();
-  },
-
-  /* Render child controls as DOM overlaid on the canvas. Reuses elements by
-     hwnd so clicking is stable and text updates in place. */
-  _syncControls(appId, host, kids, main) {
-    const app = this._apps[appId];
-    if (!host) return;
-    const seen = {};
-    for (const k of kids) {
-      seen[k.hwnd] = true;
-      let el = app.ctrlEls[k.hwnd];
-      const cls = (k.cls || '').toUpperCase();
-      if (!el) {
-        if (cls === 'BUTTON') {
-          el = document.createElement('button');
-          el.className = 'gui-native-btn';
-          el.style.cssText = 'position:absolute;font:12px Segoe UI,Arial;padding:2px 6px;';
-          el.addEventListener('click', () => {
-            AetherBridge.guiEvent(app.sid, JSON.stringify({
-              type: 'command', hwnd: k.hwnd, parent: main.hwnd, ctrl_id: k.ctrl_id || 0
-            })).then(s => { if (s && s.ok) this._render(appId, s); });
-          });
-        } else if (cls === 'EDIT') {
-          el = document.createElement('input');
-          el.type = 'text';
-          el.style.cssText = 'position:absolute;font:12px Segoe UI,Arial;border:1px solid #7a7a7a;';
-        } else { // STATIC and others -> label
-          el = document.createElement('span');
-          el.style.cssText = 'position:absolute;font:12px Segoe UI,Arial;color:#000;';
-        }
-        host.appendChild(el);
-        app.ctrlEls[k.hwnd] = el;
-      }
-      // Position relative to the parent client area.
-      const x = (k.x || 0) - (main.x || 0);
-      const y = (k.y || 0) - (main.y || 0);
-      el.style.left = Math.max(0, x) + 'px';
-      el.style.top = Math.max(0, y) + 'px';
-      if (k.w) el.style.width = k.w + 'px';
-      if (k.h) el.style.height = k.h + 'px';
-      const label = k.title || '';
-      if ('value' in el) { if (document.activeElement !== el) el.value = label; }
-      else el.textContent = label;
-    }
-    // Remove controls no longer present.
-    for (const hwnd in app.ctrlEls) {
-      if (!seen[hwnd]) { app.ctrlEls[hwnd].remove(); delete app.ctrlEls[hwnd]; }
-    }
-  },
-
   _wireInput(appId) {
     const app = this._apps[appId];
-    const canvas = this._el(appId, 'canvas');
-    if (!canvas || !app) return;
-    if (canvas._guiWired) return;     // listeners are attached exactly once
-    canvas._guiWired = true;
+    const stage = this._el(appId, 'stage');
+    if (!stage || !app) return;
+    if (stage._guiWired) return;     // listeners are attached exactly once
+    stage._guiWired = true;
     /* Events go to the guest in order, one bridge call at a time. Mouse
        moves are coalesced: while a call is in flight only the newest move
-       is kept (each call runs the emulator; a raw mousemove per pixel
-       queued hundreds of them). Clicks and keys are never dropped. */
+       is kept. Clicks and keys are never dropped. */
     const queue = [];
-    let busy = false;
     const pump = () => {
-      if (busy || !queue.length) return;
+      if (app.busy || !queue.length) return;
       if (app.closed || this._apps[appId] !== app) { queue.length = 0; return; }
-      busy = true;
+      app.busy = true;
       const ev = queue.shift();
+      ev.known = app.known;
       AetherBridge.guiEvent(app.sid, JSON.stringify(ev))
-        .then(s => { if (s && s.ok && this._apps[appId] === app) this._render(appId, s); })
+        .then(s => { if (s && s.ok && this._apps[appId] === app) { this._render(appId, s);
+                     if (s.exited) this._finish(appId, s); } })
         .catch(() => {})
-        .finally(() => { busy = false; pump(); });
+        .finally(() => { app.busy = false; pump(); });
     };
     const send = (ev) => {
       if (app.closed) return;
       const last = queue[queue.length - 1];
-      if (ev.type === 'mousemove' && last && last.type === 'mousemove') queue[queue.length - 1] = ev;
+      if (ev.type === 'mouse' && ev.action === 'move' && last && last.type === 'mouse' &&
+          last.action === 'move') queue[queue.length - 1] = ev;
       else queue.push(ev);
       pump();
     };
+    // Stage coordinates -> guest screen coordinates.
     const pos = (e) => {
-      const r = canvas.getBoundingClientRect();
-      return { x: Math.round(e.clientX - r.left), y: Math.round(e.clientY - r.top) };
+      const r = stage.getBoundingClientRect();
+      return { x: Math.round(e.clientX - r.left) + app.origin[0],
+               y: Math.round(e.clientY - r.top) + app.origin[1] };
     };
-    canvas.addEventListener('mousemove', (e) => {
-      const p = pos(e); send({ type: 'mousemove', hwnd: app.mainHwnd, x: p.x, y: p.y });
+    const btn = (e) => (e.button === 2 ? 2 : e.button === 1 ? 1 : 0);
+    stage.addEventListener('mousemove', (e) => {
+      const p = pos(e); send({ type: 'mouse', action: 'move', hwnd: 0, x: p.x, y: p.y });
     });
-    canvas.addEventListener('mousedown', (e) => {
+    stage.addEventListener('mousedown', (e) => {
+      stage.focus(); e.preventDefault();
+      const p = pos(e); send({ type: 'mouse', action: 'down', button: btn(e), hwnd: 0, x: p.x, y: p.y });
+    });
+    stage.addEventListener('mouseup', (e) => {
+      const p = pos(e); send({ type: 'mouse', action: 'up', button: btn(e), hwnd: 0, x: p.x, y: p.y });
+    });
+    stage.addEventListener('wheel', (e) => {
+      e.preventDefault();
       const p = pos(e);
-      send({ type: e.button === 2 ? 'rmousedown' : 'mousedown', hwnd: app.mainHwnd, x: p.x, y: p.y });
-    });
-    canvas.addEventListener('mouseup', (e) => {
-      const p = pos(e); send({ type: 'mouseup', hwnd: app.mainHwnd, x: p.x, y: p.y });
-    });
-    canvas.addEventListener('contextmenu', (e) => e.preventDefault());
-    canvas.tabIndex = 0;   // focusable for keyboard
-    canvas.addEventListener('keydown', (e) => {
-      send({ type: 'keydown', hwnd: app.mainHwnd, key: e.keyCode || e.which || 0 });
-      if (e.key && e.key.length === 1) {
-        send({ type: 'char', hwnd: app.mainHwnd, char: e.key.charCodeAt(0) });
-      }
-    });
-    canvas.addEventListener('keyup', (e) => {
-      send({ type: 'keyup', hwnd: app.mainHwnd, key: e.keyCode || e.which || 0 });
-    });
+      send({ type: 'mouse', action: 'wheel', hwnd: 0, x: p.x, y: p.y,
+             delta: e.deltaY < 0 ? 120 : -120 });
+    }, { passive: false });
+    stage.addEventListener('contextmenu', (e) => e.preventDefault());
+    const keyEv = (e, action) => {
+      // Keep Tab / arrows / Backspace / F-keys / Alt inside the program.
+      if (e.key === 'Tab' || e.key === 'Backspace' || e.key.indexOf('Arrow') === 0 ||
+          e.key === 'Alt' || e.key === 'F10' || e.key === ' ' || e.altKey || e.ctrlKey)
+        e.preventDefault();
+      send({ type: 'key', action: action, vk: e.keyCode || e.which || 0,
+             char: (action === 'down' && e.key && e.key.length === 1) ? e.key : null,
+             shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey, repeat: e.repeat });
+    };
+    stage.addEventListener('keydown', (e) => keyEv(e, 'down'));
+    stage.addEventListener('keyup', (e) => keyEv(e, 'up'));
   },
 
   /* Called by the window manager when the OS window is closed by the user. */
@@ -16507,8 +16504,7 @@ const GuiApp = {
       this._dispose(appId);
       if (OS.windows[appId]) OS.closeWindow(appId);
     }
-    this._apps[appId] = { sid: snap.sid, path: fullPath, name: name, probe: {},
-      mainHwnd: 0, closed: false, timer: null, lastRev: -1, lastGlRev: -1, ctrlEls: {} };
+    this._apps[appId] = this._newApp(snap.sid, fullPath, name, {});
     OS.launchApp(appId);
     setTimeout(() => this._afterOpen(appId, snap), 60);
     return appId;

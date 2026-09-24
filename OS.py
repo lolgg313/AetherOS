@@ -1379,13 +1379,23 @@ class AetherApi:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    def gui_poll(self, sid):
-        """Return the current window/draw snapshot for a GUI session."""
+    def gui_poll(self, sid, known_json="{}"):
+        """Return the current window snapshot for a GUI session. known_json maps
+        hwnd -> frame revision the shell already has (those PNGs are omitted)."""
         noo = _load_noo()
         if noo is None:
             return {"ok": False, "error": "NOO emulator not installed."}
         try:
-            return noo.gui_poll(str(sid))
+            known = json.loads(known_json or "{}")
+            if not isinstance(known, dict):
+                known = {}
+        except Exception:
+            known = {}
+        try:
+            try:
+                return noo.gui_poll(str(sid), known)
+            except TypeError:                     # an older NOO without frame revisions
+                return noo.gui_poll(str(sid))
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 

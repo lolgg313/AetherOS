@@ -6414,16 +6414,16 @@ class WinAPI:
 
         @R("opengl32.dll", "wglCreateContext")
         def _wgl_create(cpu):
-            dc = p.handles.get(cpu.get_arg(0), "dc")
-            if dc:
-                p.gl_hwnd = dc.get("hwnd", 0) or p.gl_hwnd
+            dc = p.gdi.get(cpu.get_arg(0), "dc") if hasattr(p, "gdi") else None
+            if dc is not None:
+                p.gl_hwnd = dc.hwnd or p.gl_hwnd
             return p.handles.add({"glrc": True}, "glrc")
 
         @R("opengl32.dll", "wglMakeCurrent")
         def _wgl_make_current(cpu):
-            dc = p.handles.get(cpu.get_arg(0), "dc")
-            if dc:
-                p.gl_hwnd = dc.get("hwnd", 0) or p.gl_hwnd
+            dc = p.gdi.get(cpu.get_arg(0), "dc") if hasattr(p, "gdi") else None
+            if dc is not None:
+                p.gl_hwnd = dc.hwnd or p.gl_hwnd
             return 1
 
         @R("opengl32.dll", "wglDeleteContext")
@@ -25340,6 +25340,18449 @@ def _proc_install(k):
 
 
 # ==============================================================================
+# 10k. GDI: software rasterizer (surfaces, fonts, primitives, blits, DIBs)
+# ==============================================================================
+#
+# Every window and memory bitmap is a 32-bpp BGRX pixel surface; GDI calls
+# rasterize into it in Python exactly like a display driver would, and the
+# front-end (web canvas / Tk / PNG snapshot) shows the finished pixels.
+
+import zlib as _zlib
+import base64 as _base64
+
+_FONT_CACHE = {}
+
+
+def _font_tables():
+    """Decode the embedded bitmap fonts once: {(face, em): (asc, desc, glyphs)}."""
+    t = _FONT_CACHE.get("tables")
+    if t is not None:
+        return t
+    raw = _zlib.decompress(_base64.b64decode("".join(_NOO_FONT_B64)))
+    n = struct.unpack_from("<I", raw, 0)[0]
+    hdr = raw[4:4 + n]
+    blob = raw[4 + n:]
+    fonts = {}
+    o = 0
+    nf = struct.unpack_from("<H", hdr, o)[0]
+    o += 2
+    for _ in range(nf):
+        face, em, asc, desc, ng = struct.unpack_from("<8sBBBH", hdr, o)
+        o += 13
+        glyphs = {}
+        for _g in range(ng):
+            code, adv, xo, yo, w, h, off = struct.unpack_from("<HBbbBBI", hdr, o)
+            o += 11
+            glyphs[code] = (adv, xo, yo, w, h, off)
+        fonts[(face.rstrip(b"\0").decode(), em)] = (asc, desc, glyphs)
+    t = _FONT_CACHE["tables"] = (fonts, blob)
+    return t
+
+
+_FONT_EMS = (8, 9, 10, 11, 12, 13, 14, 16, 18, 20, 24)
+
+
+class _GFont:
+    """A realized font: face tables at the nearest size (+ integer-ish scale)."""
+
+    def __init__(self, face, em, bold=False, italic=False, underline=False, strike=False):
+        fonts, blob = _font_tables()
+        self.req_em = max(4, em)
+        best = min(_FONT_EMS, key=lambda e: abs(e - self.req_em))
+        if self.req_em > _FONT_EMS[-1]:
+            best = _FONT_EMS[-1]
+        self.scale = self.req_em / best if self.req_em > _FONT_EMS[-1] else 1.0
+        fface = face
+        if face == "sans" and bold:
+            fface = "sansb"
+        self.fake_bold = bold and fface != "sansb"
+        self.face = face
+        self.asc, self.desc, self.glyphs = fonts[(fface, best)]
+        self.blob = blob
+        self.bold, self.italic, self.underline, self.strike = bold, italic, underline, strike
+        s = self.scale
+        self.ascent = int(round(self.asc * s))
+        self.descent = int(round(self.desc * s))
+        self.height = self.ascent + self.descent
+        self.em = self.req_em
+        self._pix = {}
+        self._runs = {}
+        self.fixed = face == "mono"
+
+    def glyph(self, ch):
+        g = self.glyphs.get(ord(ch))
+        if g is None:
+            g = self.glyphs.get(0x3F)
+        return g
+
+    def advance(self, ch):
+        g = self.glyph(ch)
+        adv = g[0] if g else 0
+        if self.fake_bold and adv:
+            adv += 1
+        return int(round(adv * self.scale))
+
+    def width(self, text):
+        return sum(self.advance(c) for c in text)
+
+    def pixels(self, ch):
+        """[(dx, dy), ...] set pixels of a glyph relative to the cell top-left."""
+        p = self._pix.get(ch)
+        if p is not None:
+            return p
+        g = self.glyph(ch)
+        out = []
+        if g:
+            adv, xo, yo, w, h, off = g
+            rb = (w + 7) >> 3
+            blob = self.blob
+            for y in range(h):
+                row = blob[off + y * rb: off + y * rb + rb]
+                for x in range(w):
+                    if row[x >> 3] & (0x80 >> (x & 7)):
+                        out.append((xo + x, yo + y))
+            if self.fake_bold:
+                out = out + [(x + 1, y) for (x, y) in out]
+            if self.italic:
+                a = self.asc
+                out = [(x + (a - y) // 4, y) for (x, y) in out]
+            if self.scale != 1.0:
+                s = self.scale
+                sc = set()
+                for (x, y) in out:
+                    x0, y0 = int(x * s), int(y * s)
+                    x1, y1 = int((x + 1) * s), int((y + 1) * s)
+                    for yy in range(y0, max(y1, y0 + 1)):
+                        for xx in range(x0, max(x1, x0 + 1)):
+                            sc.add((xx, yy))
+                out = sorted(sc)
+        self._pix[ch] = out
+        return out
+
+    def runs(self, ch):
+        """Horizontal pixel runs [(dy, x0, x1), ...] of a glyph (cell-relative)."""
+        r = self._runs.get(ch)
+        if r is not None:
+            return r
+        rows = {}
+        for (x, y) in self.pixels(ch):
+            rows.setdefault(y, []).append(x)
+        r = []
+        for y in sorted(rows):
+            xs = sorted(set(rows[y]))
+            s = prev = xs[0]
+            for x in xs[1:]:
+                if x != prev + 1:
+                    r.append((y, s, prev + 1))
+                    s = x
+                prev = x
+            r.append((y, s, prev + 1))
+        self._runs[ch] = r
+        return r
+
+
+def _font_from_logfont(height, weight, italic, underline, strike, pitch, face_name):
+    fn = (face_name or "").lower()
+    if any(k in fn for k in ("courier", "consol", "mono", "terminal", "fixedsys", "lucida console",
+                             "system fixed", "oem")) or (pitch & 3) == 1:
+        face = "mono"
+    else:
+        face = "sans"
+    if height == 0:
+        em = 11 if face == "sans" else 12
+    elif height < 0:
+        em = -height
+    else:
+        # positive = cell height; the DejaVu em is ~0.85 of the cell
+        em = max(4, int(round(height * 0.84)))
+    return _GFont(face, em, weight >= 600, bool(italic), bool(underline), bool(strike))
+
+
+def _cr_pix(cr):
+    """COLORREF (0x00BBGGRR) -> 4 pixel bytes (B, G, R, 0)."""
+    return bytes(((cr >> 16) & 255, (cr >> 8) & 255, cr & 255, 0))
+
+
+def _pix_cr(b):
+    return b[2] | (b[1] << 8) | (b[0] << 16)
+
+
+class _Surf:
+    """Top-down 32-bpp BGRX pixels."""
+
+    def __init__(self, w, h, fill=None):
+        self.w = max(0, int(w))
+        self.h = max(0, int(h))
+        self.px = bytearray(self.w * self.h * 4) if fill is None else \
+            bytearray(fill * (self.w * self.h))
+        self.rev = 0
+        self.dib = None                     # guest-memory DIB section (see _DibInfo)
+
+    def resize(self, w, h, fill=b"\xff\xff\xff\x00"):
+        w, h = max(0, int(w)), max(0, int(h))
+        if (w, h) == (self.w, self.h):
+            return
+        new = bytearray(fill * (w * h))
+        cw, ch = min(w, self.w), min(h, self.h)
+        for y in range(ch):
+            new[y * w * 4: (y * w + cw) * 4] = self.px[y * self.w * 4: (y * self.w + cw) * 4]
+        self.w, self.h, self.px = w, h, new
+        self.rev += 1
+
+    def get(self, x, y):
+        if 0 <= x < self.w and 0 <= y < self.h:
+            o = (y * self.w + x) * 4
+            return _pix_cr(self.px[o:o + 4])
+        return 0xFFFFFFFF
+
+    def to_png(self, x0=0, y0=0, x1=None, y1=None):
+        x1 = self.w if x1 is None else x1
+        y1 = self.h if y1 is None else y1
+        w, h = max(1, x1 - x0), max(1, y1 - y0)
+        rows = bytearray()
+        px = self.px
+        for y in range(y0, y0 + h):
+            rows.append(0)
+            if 0 <= y < self.h:
+                row = px[(y * self.w + x0) * 4:(y * self.w + x0 + w) * 4]
+                rgb = bytearray(len(row) // 4 * 3)
+                rgb[0::3] = row[2::4]
+                rgb[1::3] = row[1::4]
+                rgb[2::3] = row[0::4]
+                rows += rgb
+            else:
+                rows += bytes(3 * w)
+
+        def chunk(t, d):
+            c = struct.pack(">I", len(d)) + t + d
+            return c + struct.pack(">I", _zlib.crc32(t + d) & 0xFFFFFFFF)
+        return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", _zlib.compress(bytes(rows), 3)) + chunk(b"IEND", b""))
+
+
+# -- clipping ---------------------------------------------------------------------
+
+def _rect_and(a, b):
+    l, t = max(a[0], b[0]), max(a[1], b[1])
+    r, bt = min(a[2], b[2]), min(a[3], b[3])
+    return (l, t, r, bt) if l < r and t < bt else None
+
+
+def _rects_sub(rects, cut):
+    """Rect list minus one rect."""
+    out = []
+    for r in rects:
+        i = _rect_and(r, cut)
+        if i is None:
+            out.append(r)
+            continue
+        l, t, rr, b = r
+        il, it, ir, ib = i
+        if t < it:
+            out.append((l, t, rr, it))
+        if ib < b:
+            out.append((l, ib, rr, b))
+        if l < il:
+            out.append((l, it, il, ib))
+        if ir < rr:
+            out.append((ir, it, rr, ib))
+    return out
+
+
+def _rects_and(rects, other):
+    out = []
+    for a in rects:
+        for b in other:
+            i = _rect_and(a, b)
+            if i:
+                out.append(i)
+    return out
+
+
+def _rects_or(a, b):
+    out = list(a)
+    for r in b:
+        out = _rects_sub(out, r)
+    return out + list(b)
+
+
+# -- primitives (device coordinates, clip = list of rects) -------------------------------
+
+_R2_OPS = {
+    1: lambda d, s: 0,                         # R2_BLACK
+    2: lambda d, s: ~(d | s),                  # R2_NOTMERGEPEN
+    3: lambda d, s: d & ~s,                    # R2_MASKNOTPEN
+    4: lambda d, s: ~s,                        # R2_NOTCOPYPEN
+    5: lambda d, s: s & ~d,                    # R2_MASKPENNOT
+    6: lambda d, s: ~d,                        # R2_NOT
+    7: lambda d, s: d ^ s,                     # R2_XORPEN
+    8: lambda d, s: ~(d & s),                  # R2_NOTMASKPEN
+    9: lambda d, s: d & s,                     # R2_MASKPEN
+    10: lambda d, s: ~(d ^ s),                 # R2_NOTXORPEN
+    11: lambda d, s: d,                        # R2_NOP
+    12: lambda d, s: d | ~s,                   # R2_MERGENOTPEN
+    14: lambda d, s: s | ~d,                   # R2_MERGEPENNOT
+    15: lambda d, s: d | s,                    # R2_MERGEPEN
+    16: lambda d, s: -1,                       # R2_WHITE
+}
+
+
+def _span(surf, clip, y, x0, x1, pix, rop=13):
+    """Fill [x0, x1) on row y."""
+    if y < 0 or y >= surf.h:
+        return
+    w = surf.w
+    for (cl, ct, cr, cb) in clip:
+        if ct <= y < cb:
+            a, b = max(x0, cl, 0), min(x1, cr, w)
+            if a < b:
+                o0, o1 = (y * w + a) * 4, (y * w + b) * 4
+                if rop == 13:
+                    surf.px[o0:o1] = pix * (b - a)
+                else:
+                    n = o1 - o0
+                    d = int.from_bytes(surf.px[o0:o1], "little")
+                    s_ = int.from_bytes(pix * (b - a), "little")
+                    mask = (1 << (8 * n)) - 1
+                    v = _R2_OPS.get(rop, lambda d_, s2: s2)(d, s_) & mask
+                    # keep the X byte of each pixel zero
+                    surf.px[o0:o1] = v.to_bytes(n, "little")
+                    surf.px[o0 + 3:o1:4] = bytes(b - a)
+
+
+def _fill(surf, clip, l, t, r, b, pix, rop=13):
+    if rop == 13:
+        w = surf.w
+        for (cl, ct, cr, cb) in clip:
+            a, bb = max(l, cl, 0), min(r, cr, w)
+            y0, y1 = max(t, ct, 0), min(b, cb, surf.h)
+            if a < bb and y0 < y1:
+                run = pix * (bb - a)
+                px = surf.px
+                for y in range(y0, y1):
+                    o = (y * w + a) * 4
+                    px[o:o + len(run)] = run
+        return
+    for y in range(max(t, 0), min(b, surf.h)):
+        _span(surf, clip, y, l, r, pix, rop)
+
+
+def _plot(surf, clip, x, y, pix, rop=13):
+    if 0 <= x < surf.w and 0 <= y < surf.h:
+        for (cl, ct, cr, cb) in clip:
+            if cl <= x < cr and ct <= y < cb:
+                o = (y * surf.w + x) * 4
+                if rop == 13:
+                    surf.px[o:o + 4] = pix
+                else:
+                    d = int.from_bytes(surf.px[o:o + 4], "little")
+                    s_ = int.from_bytes(pix, "little")
+                    v = _R2_OPS.get(rop, lambda d_, s2: s2)(d, s_) & 0xFFFFFF
+                    surf.px[o:o + 4] = v.to_bytes(4, "little")
+                return
+
+
+def _line(surf, clip, x0, y0, x1, y1, pix, width=1, rop=13, style=0, last=False):
+    """Bresenham; the end point is excluded (Windows semantics) unless last."""
+    if x0 == x1 and y0 == y1:
+        if last:
+            _plot(surf, clip, x0, y0, pix, rop)
+        return
+    if width <= 1 and style == 0:
+        if y0 == y1 and rop == 13:
+            a, b = (x0, x1 + (1 if last else 0)) if x0 < x1 else (x1 + 1, x0 + 1)
+            _span(surf, clip, y0, a, b, pix)
+            return
+        if x0 == x1 and rop == 13:
+            a, b = (y0, y1 + (1 if last else 0)) if y0 < y1 else (y1 + 1, y0 + 1)
+            for y in range(a, b):
+                _span(surf, clip, y, x0, x0 + 1, pix)
+            return
+    dx, dy = abs(x1 - x0), -abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx + dy
+    x, y = x0, y0
+    n = 0
+    half = width // 2
+    dash = {1: (6, 2), 2: (2, 2), 3: (6, 2, 2, 2), 4: (6, 2, 2, 2, 2, 2)}.get(style)
+    while True:
+        if x == x1 and y == y1 and not last:
+            break
+        on = True
+        if dash:
+            pos = n % sum(dash)
+            acc = 0
+            for i, seg in enumerate(dash):
+                acc += seg
+                if pos < acc:
+                    on = i % 2 == 0
+                    break
+        if on:
+            if width <= 1:
+                _plot(surf, clip, x, y, pix, rop)
+            else:
+                _fill(surf, clip, x - half, y - half, x - half + width, y - half + width, pix, rop)
+        if x == x1 and y == y1:
+            break
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x += sx
+        if e2 <= dx:
+            err += dx
+            y += sy
+        n += 1
+
+
+def _poly_spans(pts, alternate=True):
+    """Scanline polygon fill -> {y: [(x0, x1), ...]} (pts in device coords)."""
+    if len(pts) < 3:
+        return {}
+    ys = [p[1] for p in pts]
+    out = {}
+    n = len(pts)
+    for y in range(min(ys), max(ys)):
+        yc = y + 0.5
+        xs = []
+        for i in range(n):
+            (xa, ya), (xb, yb) = pts[i], pts[(i + 1) % n]
+            if (ya <= yc < yb) or (yb <= yc < ya):
+                x = xa + (yc - ya) * (xb - xa) / (yb - ya)
+                xs.append((x, 1 if yb > ya else -1))
+        if not xs:
+            continue
+        xs.sort()
+        spans = []
+        if alternate:
+            for i in range(0, len(xs) - 1, 2):
+                spans.append((int(xs[i][0] + 0.5), int(xs[i + 1][0] + 0.5)))
+        else:
+            wind = 0
+            for i in range(len(xs) - 1):
+                wind += xs[i][1]
+                if wind:
+                    spans.append((int(xs[i][0] + 0.5), int(xs[i + 1][0] + 0.5)))
+        out[y] = spans
+    return out
+
+
+def _ellipse_spans(l, t, r, b):
+    """Filled ellipse inscribed in [l, r) x [t, b) -> {y: (x0, x1)}."""
+    out = {}
+    w, h = r - l, b - t
+    if w <= 0 or h <= 0:
+        return out
+    cx, cy = l + w / 2.0, t + h / 2.0
+    a, bb = w / 2.0, h / 2.0
+    for y in range(t, b):
+        dy = (y + 0.5 - cy) / bb
+        if abs(dy) > 1:
+            continue
+        dx = a * math.sqrt(max(0.0, 1 - dy * dy))
+        x0, x1 = int(round(cx - dx)), int(round(cx + dx))
+        if x1 > x0:
+            out[y] = (x0, x1)
+    return out
+
+
+def _ellipse_outline(l, t, r, b):
+    """Outline points of an ellipse (for pens), closed polyline."""
+    w, h = r - l - 1, b - t - 1
+    if w <= 0 or h <= 0:
+        return [(l, t), (r - 1, t), (r - 1, b - 1), (l, b - 1), (l, t)]
+    cx, cy = l + w / 2.0, t + h / 2.0
+    n = max(16, int((w + h) * 1.2))
+    return [(int(round(cx + w / 2.0 * math.cos(2 * math.pi * i / n))),
+             int(round(cy + h / 2.0 * math.sin(2 * math.pi * i / n)))) for i in range(n + 1)]
+
+
+def _arc_points(l, t, r, b, xs, ys, xe, ye, ccw=True):
+    """Points along an ellipse arc from the start radial to the end radial."""
+    w, h = r - l, b - t
+    cx, cy = l + w / 2.0, t + h / 2.0
+    a0 = math.atan2(-(ys - cy) / max(h, 1), (xs - cx) / max(w, 1))
+    a1 = math.atan2(-(ye - cy) / max(h, 1), (xe - cx) / max(w, 1))
+    if ccw:
+        while a1 <= a0:
+            a1 += 2 * math.pi
+    else:
+        while a1 >= a0:
+            a1 -= 2 * math.pi
+    n = max(8, int(abs(a1 - a0) * (w + h) / 3))
+    return [(int(round(cx + (w / 2.0 - 0.5) * math.cos(a0 + (a1 - a0) * i / n))),
+             int(round(cy - (h / 2.0 - 0.5) * math.sin(a0 + (a1 - a0) * i / n))))
+            for i in range(n + 1)]
+
+
+# -- GDI objects ------------------------------------------------------------------------
+
+def _rgb(r, g, b):
+    return (r & 255) | ((g & 255) << 8) | ((b & 255) << 16)
+
+
+# Classic (Windows 2000) system colors, indexed by COLOR_*.
+_SYS_COLORS = [
+    _rgb(212, 208, 200),   # 0  COLOR_SCROLLBAR
+    _rgb(58, 110, 165),    # 1  COLOR_BACKGROUND (desktop)
+    _rgb(10, 36, 106),     # 2  COLOR_ACTIVECAPTION
+    _rgb(128, 128, 128),   # 3  COLOR_INACTIVECAPTION
+    _rgb(212, 208, 200),   # 4  COLOR_MENU
+    _rgb(255, 255, 255),   # 5  COLOR_WINDOW
+    _rgb(0, 0, 0),         # 6  COLOR_WINDOWFRAME
+    _rgb(0, 0, 0),         # 7  COLOR_MENUTEXT
+    _rgb(0, 0, 0),         # 8  COLOR_WINDOWTEXT
+    _rgb(255, 255, 255),   # 9  COLOR_CAPTIONTEXT
+    _rgb(212, 208, 200),   # 10 COLOR_ACTIVEBORDER
+    _rgb(212, 208, 200),   # 11 COLOR_INACTIVEBORDER
+    _rgb(128, 128, 128),   # 12 COLOR_APPWORKSPACE
+    _rgb(10, 36, 106),     # 13 COLOR_HIGHLIGHT
+    _rgb(255, 255, 255),   # 14 COLOR_HIGHLIGHTTEXT
+    _rgb(212, 208, 200),   # 15 COLOR_BTNFACE
+    _rgb(128, 128, 128),   # 16 COLOR_BTNSHADOW
+    _rgb(128, 128, 128),   # 17 COLOR_GRAYTEXT
+    _rgb(0, 0, 0),         # 18 COLOR_BTNTEXT
+    _rgb(212, 208, 200),   # 19 COLOR_INACTIVECAPTIONTEXT
+    _rgb(255, 255, 255),   # 20 COLOR_BTNHIGHLIGHT
+    _rgb(64, 64, 64),      # 21 COLOR_3DDKSHADOW
+    _rgb(212, 208, 200),   # 22 COLOR_3DLIGHT
+    _rgb(0, 0, 0),         # 23 COLOR_INFOTEXT
+    _rgb(255, 255, 225),   # 24 COLOR_INFOBK
+    _rgb(181, 181, 181),   # 25 (unused)
+    _rgb(0, 0, 128),       # 26 COLOR_HOTLIGHT
+    _rgb(166, 202, 240),   # 27 COLOR_GRADIENTACTIVECAPTION
+    _rgb(192, 192, 192),   # 28 COLOR_GRADIENTINACTIVECAPTION
+    _rgb(49, 106, 197),    # 29 COLOR_MENUHILIGHT
+    _rgb(236, 233, 216),   # 30 COLOR_MENUBAR
+]
+
+_HATCHES = {   # HS_* 8x8 patterns, one byte per row, MSB = leftmost pixel
+    0: (0, 0, 0, 0xFF, 0, 0, 0, 0),                                   # HS_HORIZONTAL
+    1: (0x08,) * 8,                                                   # HS_VERTICAL
+    2: (0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01),              # HS_FDIAGONAL
+    3: (0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80),              # HS_BDIAGONAL
+    4: (0x08, 0x08, 0x08, 0xFF, 0x08, 0x08, 0x08, 0x08),              # HS_CROSS
+    5: (0x81, 0x42, 0x24, 0x18, 0x18, 0x24, 0x42, 0x81),              # HS_DIAGCROSS
+}
+
+
+class _GObj:
+    kind = "obj"
+    stock = False
+    h = 0
+
+
+class _GPen(_GObj):
+    kind = "pen"
+
+    def __init__(self, style, width, color, dcpen=False):
+        self.style = style & 0xF
+        self.width = max(1, width)
+        self.color = color & 0xFFFFFF
+        self.dcpen = dcpen
+        self.raw_style = style
+        self.raw_width = width
+
+
+class _GBrush(_GObj):
+    kind = "brush"
+
+    def __init__(self, style=0, color=0, hatch=0, pat=None, mono=False, sysidx=None,
+                 dcbrush=False):
+        self.style, self.color, self.hatch = style, color & 0xFFFFFF, hatch
+        self.pat = pat                # _Surf tile for BS_PATTERN / BS_DIBPATTERN
+        self.mono = mono              # mono pattern: 0 -> text color, 1 -> bk color
+        self.sysidx = sysidx
+        self.dcbrush = dcbrush
+        self.pat_bmp = 0
+
+
+class _GFontObj(_GObj):
+    kind = "font"
+
+    def __init__(self, height=0, width=0, esc=0, orient=0, weight=400, italic=0,
+                 underline=0, strike=0, charset=1, outprec=0, clipprec=0, quality=0,
+                 pitch=0, face=""):
+        self.lf = [height, width, esc, orient, weight, italic, underline, strike,
+                   charset, outprec, clipprec, quality, pitch, face]
+        self._real = None
+
+    def realize(self):
+        if self._real is None:
+            lf = self.lf
+            self._real = _font_from_logfont(lf[0], lf[4], lf[5], lf[6], lf[7], lf[12], lf[13])
+        return self._real
+
+    @property
+    def face(self):
+        f = self.lf[13]
+        if f:
+            return f
+        return "Courier New" if self.realize().fixed else "MS Sans Serif"
+
+
+class _GBitmap(_GObj):
+    kind = "bitmap"
+
+    def __init__(self, w, h, bpp=32, fill=None):
+        self.surf = _Surf(w, h, fill if fill is not None else
+                          (b"\x00\x00\x00\x00"))
+        self.bpp = bpp
+        self.dib = None               # _DibSec for CreateDIBSection bitmaps
+        self.dc = 0                   # the memory DC it is selected into
+        self.dim = (0, 0)             # SetBitmapDimensionEx
+
+
+class _GRgn(_GObj):
+    kind = "region"
+
+    def __init__(self, rects=None):
+        self.rects = list(rects or [])
+
+    def box(self):
+        if not self.rects:
+            return (0, 0, 0, 0)
+        return (min(r[0] for r in self.rects), min(r[1] for r in self.rects),
+                max(r[2] for r in self.rects), max(r[3] for r in self.rects))
+
+    def complexity(self):
+        return 1 if not self.rects else 2 if len(self.rects) == 1 else 3
+
+
+class _GPalette(_GObj):
+    kind = "palette"
+
+    def __init__(self, entries):
+        self.entries = list(entries)
+
+
+class _GMisc(_GObj):
+    def __init__(self, kind, **kw):
+        self.kind = kind
+        self.__dict__.update(kw)
+
+
+def _rgn_normalize(rects):
+    """Disjoint rect list (union of possibly overlapping rects)."""
+    out = []
+    for r in rects:
+        if r[0] < r[2] and r[1] < r[3]:
+            out = _rects_sub(out, r)
+            out.append(tuple(r))
+    return out
+
+
+def _rgn_combine(a, b, mode):
+    """RGN_AND 1, RGN_OR 2, RGN_XOR 3, RGN_DIFF 4, RGN_COPY 5."""
+    if mode == 1:
+        return _rects_and(a, b)
+    if mode == 2:
+        return _rects_or(a, b)
+    if mode == 3:
+        x = list(a)
+        for r in b:
+            x = _rects_sub(x, r)
+        y = list(b)
+        for r in a:
+            y = _rects_sub(y, r)
+        return x + y
+    if mode == 4:
+        x = list(a)
+        for r in b:
+            x = _rects_sub(x, r)
+        return x
+    return list(a)
+
+
+def _spans_to_rects(spans):
+    """{y: [(x0, x1), ...]} -> rect list, merging identical consecutive rows."""
+    out = []
+    open_ = {}
+    for y in sorted(spans):
+        row = spans[y]
+        if isinstance(row, tuple):
+            row = [row]
+        cur = {}
+        for (x0, x1) in row:
+            if x1 <= x0:
+                continue
+            key = (x0, x1)
+            if key in open_ and open_[key][1] == y:
+                cur[key] = (open_[key][0], y + 1)
+            else:
+                cur[key] = (y, y + 1)
+        for key, (y0, y1) in open_.items():
+            if key not in cur or cur[key][0] != y0:
+                out.append((key[0], y0, key[1], y1))
+        open_ = cur
+    for key, (y0, y1) in open_.items():
+        out.append((key[0], y0, key[1], y1))
+    return out
+
+
+# -- DIB format conversion -------------------------------------------------------------------
+
+class _DibSec:
+    """Pixel storage in guest memory (CreateDIBSection) mirrored by a _Surf."""
+
+    def __init__(self, addr, w, h, bpp, topdown, colors, masks, own=True):
+        self.addr, self.w, self.h, self.bpp = addr, w, h, bpp
+        self.topdown = topdown
+        self.colors = colors          # list of 4-byte BGRX palette entries
+        self.masks = masks            # (r, g, b) for 16/32 bpp bitfields, or None
+        self.stride = ((w * bpp + 31) // 32) * 4
+        self.size = self.stride * h
+        self.own = own
+        self.last = None              # bytes last pushed (skip redundant pulls)
+
+
+def _pal_tables(colors):
+    """Per-channel translate tables for palette index -> B, G, R bytes."""
+    tb, tg, tr = bytearray(256), bytearray(256), bytearray(256)
+    for i, c in enumerate(colors[:256]):
+        tb[i], tg[i], tr[i] = c[0], c[1], c[2]
+    return bytes(tb), bytes(tg), bytes(tr)
+
+
+_BIT_TABLES = None
+_NIB_TABLES = None
+_TBL16 = {}
+
+
+def _expand_bits(row, w):
+    """1-bpp row -> one byte (0/1) per pixel."""
+    global _BIT_TABLES
+    if _BIT_TABLES is None:
+        _BIT_TABLES = [bytes((v >> (7 - b)) & 1 for v in range(256)) for b in range(8)]
+    n = len(row)
+    out = bytearray(n * 8)
+    for b in range(8):
+        out[b::8] = row.translate(_BIT_TABLES[b])
+    return out[:w]
+
+
+def _expand_nibbles(row, w):
+    global _NIB_TABLES
+    if _NIB_TABLES is None:
+        _NIB_TABLES = (bytes(v >> 4 for v in range(256)), bytes(v & 15 for v in range(256)))
+    n = len(row)
+    out = bytearray(n * 2)
+    out[0::2] = row.translate(_NIB_TABLES[0])
+    out[1::2] = row.translate(_NIB_TABLES[1])
+    return out[:w]
+
+
+def _mask_shift(m):
+    if not m:
+        return 0, 0
+    s = 0
+    while not (m >> s) & 1:
+        s += 1
+    n = 0
+    while (m >> (s + n)) & 1:
+        n += 1
+    return s, n
+
+
+def _chan(v, s, n):
+    x = (v >> s) & ((1 << n) - 1)
+    if n >= 8:
+        return x >> (n - 8)
+    return (x << (8 - n)) | (x >> (2 * n - 8)) if n > 4 else (x * 255 // ((1 << n) - 1) if n else 0)
+
+
+def _row_to_bgrx(row, w, bpp, colors=None, masks=None, tables=None):
+    """One DIB scanline -> w*4 bytes BGRX."""
+    out = bytearray(w * 4)
+    if bpp == 32:
+        if masks and masks != (0xFF0000, 0xFF00, 0xFF):
+            import array as _arr
+            a = _arr.array("I", bytes(row[:w * 4]))
+            (rs, rn), (gs, gn), (bs, bn) = (_mask_shift(m) for m in masks)
+            for i, v in enumerate(a):
+                out[i * 4] = _chan(v, bs, bn)
+                out[i * 4 + 1] = _chan(v, gs, gn)
+                out[i * 4 + 2] = _chan(v, rs, rn)
+            return out
+        out[:] = row[:w * 4]
+        out[3::4] = bytes(w)
+        return out
+    if bpp == 24:
+        src = row[:w * 3]
+        out[0::4] = src[0::3]
+        out[1::4] = src[1::3]
+        out[2::4] = src[2::3]
+        return out
+    if bpp == 16:
+        key = masks or (0x7C00, 0x3E0, 0x1F)
+        tbl = _TBL16.get(key)
+        if tbl is None:
+            (rs, rn), (gs, gn), (bs, bn) = (_mask_shift(m) for m in key)
+            tbl = [bytes((_chan(v, bs, bn), _chan(v, gs, gn), _chan(v, rs, rn), 0))
+                   for v in range(65536)]
+            _TBL16[key] = tbl
+        import array as _arr
+        a = _arr.array("H", bytes(row[:w * 2]))
+        return bytearray(b"".join(map(tbl.__getitem__, a)))
+    if bpp in (1, 4, 8):
+        if bpp == 8:
+            idx = bytes(row[:w])
+        elif bpp == 4:
+            idx = bytes(_expand_nibbles(bytes(row), w))
+        else:
+            idx = bytes(_expand_bits(bytes(row), w))
+        tb, tg, tr = tables or _pal_tables(colors or [])
+        out[0::4] = idx.translate(tb)
+        out[1::4] = idx.translate(tg)
+        out[2::4] = idx.translate(tr)
+        return out
+    return out
+
+
+def _bgrx_to_row(px, w, bpp, colors=None, masks=None):
+    """w*4 bytes BGRX -> one DIB scanline (padded to a DWORD)."""
+    stride = ((w * bpp + 31) // 32) * 4
+    out = bytearray(stride)
+    if bpp == 32:
+        if masks and masks != (0xFF0000, 0xFF00, 0xFF):
+            (rs, rn), (gs, gn), (bs, bn) = (_mask_shift(m) for m in masks)
+            for i in range(w):
+                b, g, r = px[i * 4], px[i * 4 + 1], px[i * 4 + 2]
+                v = (((r >> (8 - rn)) << rs) | ((g >> (8 - gn)) << gs) |
+                     ((b >> (8 - bn)) << bs)) if rn <= 8 else 0
+                struct.pack_into("<I", out, i * 4, v)
+            return out
+        out[:w * 4] = px[:w * 4]
+        return out
+    if bpp == 24:
+        out[0:w * 3:3] = px[0::4]
+        out[1:w * 3:3] = px[1::4]
+        out[2:w * 3:3] = px[2::4]
+        return out
+    if bpp == 16:
+        (rs, rn), (gs, gn), (bs, bn) = (_mask_shift(m) for m in (masks or (0x7C00, 0x3E0, 0x1F)))
+        for i in range(w):
+            b, g, r = px[i * 4], px[i * 4 + 1], px[i * 4 + 2]
+            v = ((r >> (8 - rn)) << rs) | ((g >> (8 - gn)) << gs) | ((b >> (8 - bn)) << bs)
+            out[i * 2] = v & 255
+            out[i * 2 + 1] = v >> 8
+        return out
+    if bpp in (1, 4, 8):
+        cols = colors or [b"\0\0\0\0", b"\xff\xff\xff\0"]
+        cache = {}
+        idxs = bytearray(w)
+        for i in range(w):
+            k = bytes(px[i * 4:i * 4 + 3])
+            v = cache.get(k)
+            if v is None:
+                v = _nearest_index(k, cols)
+                cache[k] = v
+            idxs[i] = v
+        if bpp == 8:
+            out[:w] = idxs
+        elif bpp == 4:
+            for i in range(0, w, 2):
+                hi = idxs[i] & 15
+                lo = idxs[i + 1] & 15 if i + 1 < w else 0
+                out[i // 2] = (hi << 4) | lo
+        else:
+            for i in range(w):
+                if idxs[i]:
+                    out[i >> 3] |= 0x80 >> (i & 7)
+        return out
+    return out
+
+
+def _nearest_index(bgr, cols):
+    b, g, r = bgr[0], bgr[1], bgr[2]
+    best, bd = 0, 1 << 30
+    for i, c in enumerate(cols):
+        d = (c[0] - b) ** 2 + (c[1] - g) ** 2 + (c[2] - r) ** 2
+        if d < bd:
+            best, bd = i, d
+            if d == 0:
+                break
+    return best
+
+
+def _read_bmi(mem, bmi, usage=0, pal_dc=None):
+    """BITMAPINFO -> (w, h, bpp, topdown, colors, masks, compression, hdr_size)."""
+    size = mem.read32(bmi)
+    if size == 12:                                  # BITMAPCOREHEADER
+        w = mem.read16(bmi + 4)
+        h = mem.read16(bmi + 6)
+        bpp = mem.read16(bmi + 10)
+        comp, clr_used = 0, 0
+        ent = 3
+    else:
+        w = _s32(mem.read32(bmi + 4))
+        h = _s32(mem.read32(bmi + 8))
+        bpp = mem.read16(bmi + 14)
+        comp = mem.read32(bmi + 16)
+        clr_used = mem.read32(bmi + 32)
+        ent = 4
+    topdown = h < 0
+    h = abs(h)
+    colors, masks = [], None
+    tab = bmi + size
+    if comp == 3 or comp == 6:                      # BI_BITFIELDS / BI_ALPHABITFIELDS
+        if size >= 52:
+            masks = (mem.read32(bmi + 40), mem.read32(bmi + 44), mem.read32(bmi + 48))
+        else:
+            masks = (mem.read32(tab), mem.read32(tab + 4), mem.read32(tab + 8))
+            tab += 12
+    elif bpp == 32:
+        masks = (0xFF0000, 0xFF00, 0xFF)
+    if bpp <= 8:
+        n = clr_used or (1 << bpp)
+        n = min(n, 1 << bpp)
+        if usage == 1:                              # DIB_PAL_COLORS: WORD indices
+            raw = mem.read(tab, 2 * n)
+            for i in range(n):
+                v = struct.unpack_from("<H", raw, 2 * i)[0]
+                c = _SYS_PAL16[v % 16]
+                colors.append(_cr_pix(c))
+        else:
+            raw = mem.read(tab, ent * n)
+            for i in range(n):
+                colors.append(bytes(raw[i * ent:i * ent + 3]) + b"\0")
+    return w, h, bpp, topdown, colors, masks, comp, size
+
+
+_SYS_PAL16 = [0x000000, 0x000080, 0x008000, 0x008080, 0x800000, 0x800080, 0x808000,
+              0xC0C0C0, 0xC0DCC0, 0xF0CAA6, 0xF0FBFF, 0xA4A0A0, 0x808080, 0x0000FF,
+              0x00FF00, 0x00FFFF]
+
+
+def _dib_rows_to_surf(mem, bits, w, h, bpp, topdown, colors, masks, surf, y0=0, nrows=None,
+                      dst_y=0, comp=0):
+    """Decode DIB pixel rows from guest memory into surf rows."""
+    stride = ((w * bpp + 31) // 32) * 4
+    nrows = h if nrows is None else nrows
+    tables = _pal_tables(colors) if bpp <= 8 else None
+    if comp in (1, 2):                              # BI_RLE8 / BI_RLE4
+        rows = _rle_decode(mem, bits, w, h, bpp)
+        for i in range(h):
+            idx = bytes(rows[i])
+            tb, tg, tr = tables
+            out = bytearray(w * 4)
+            out[0::4] = idx.translate(tb)
+            out[1::4] = idx.translate(tg)
+            out[2::4] = idx.translate(tr)
+            y = i if topdown else h - 1 - i
+            if 0 <= y < surf.h:
+                n = min(w, surf.w)
+                surf.px[y * surf.w * 4:(y * surf.w + n) * 4] = out[:n * 4]
+        return
+    raw = mem.read(bits, stride * nrows) if nrows > 0 else b""
+    sw = surf.w
+    n = min(w, sw)
+    for i in range(nrows):
+        # row i in memory order -> surface row
+        if topdown:
+            y = dst_y + i
+        else:
+            y = dst_y + (nrows - 1 - i)
+        if not 0 <= y < surf.h:
+            continue
+        row = raw[i * stride:(i + 1) * stride]
+        px = _row_to_bgrx(row, w, bpp, colors, masks, tables)
+        surf.px[y * sw * 4:(y * sw + n) * 4] = px[:n * 4]
+
+
+def _rle_decode(mem, bits, w, h, bpp):
+    rows = [bytearray(w) for _ in range(h)]
+    data = mem.read(bits, 1 << 22) if False else None
+    x = y = 0
+    p = bits
+    rd = mem.read8
+    for _ in range(w * h * 2 + 16):
+        n = rd(p)
+        c = rd(p + 1)
+        p += 2
+        if n:
+            for i in range(n):
+                v = c if bpp == 8 else ((c >> 4) if i % 2 == 0 else (c & 15))
+                if x < w and y < h:
+                    rows[y][x] = v
+                x += 1
+        elif c == 0:
+            x, y = 0, y + 1
+        elif c == 1:
+            break
+        elif c == 2:
+            x += rd(p)
+            y += rd(p + 1)
+            p += 2
+        else:
+            cnt = c
+            if bpp == 8:
+                for i in range(cnt):
+                    if x < w and y < h:
+                        rows[y][x] = rd(p + i)
+                    x += 1
+                p += (cnt + 1) & ~1
+            else:
+                nb = (cnt + 1) // 2
+                for i in range(cnt):
+                    b = rd(p + i // 2)
+                    v = (b >> 4) if i % 2 == 0 else (b & 15)
+                    if x < w and y < h:
+                        rows[y][x] = v
+                    x += 1
+                p += (nb + 1) & ~1
+        if y >= h:
+            break
+    return rows
+
+
+def _dib_pull(mem, bm):
+    """Guest memory -> surface for a DIB section (before GDI reads/draws)."""
+    d = bm.dib
+    if d is None:
+        return
+    try:
+        raw = mem.read(d.addr, d.size)
+    except Exception:
+        return
+    if d.last is not None and raw == d.last:
+        return
+    s = bm.surf
+    w = d.w
+    if d.bpp == 32 and (d.masks is None or d.masks == (0xFF0000, 0xFF00, 0xFF)):
+        if d.topdown:
+            s.px[:] = raw
+        else:
+            st = d.stride
+            px = s.px
+            for i in range(d.h):
+                y = d.h - 1 - i
+                px[y * w * 4:(y + 1) * w * 4] = raw[i * st:i * st + w * 4]
+    else:
+        tables = _pal_tables(d.colors) if d.bpp <= 8 else None
+        st = d.stride
+        for i in range(d.h):
+            y = i if d.topdown else d.h - 1 - i
+            s.px[y * w * 4:(y + 1) * w * 4] = _row_to_bgrx(raw[i * st:(i + 1) * st], w, d.bpp,
+                                                         d.colors, d.masks, tables)
+    d.last = raw
+    s.rev += 1
+
+
+def _dib_push(mem, bm):
+    """Surface -> guest memory after GDI drew into a DIB section."""
+    d = bm.dib
+    if d is None:
+        return
+    s = bm.surf
+    w = d.w
+    if d.bpp == 32 and (d.masks is None or d.masks == (0xFF0000, 0xFF00, 0xFF)):
+        if d.topdown:
+            raw = bytes(s.px)
+        else:
+            parts = []
+            for i in range(d.h):
+                y = d.h - 1 - i
+                parts.append(s.px[y * w * 4:(y + 1) * w * 4])
+            raw = b"".join(parts)
+    else:
+        parts = []
+        for i in range(d.h):
+            y = i if d.topdown else d.h - 1 - i
+            parts.append(bytes(_bgrx_to_row(s.px[y * w * 4:(y + 1) * w * 4], w, d.bpp,
+                                            d.colors, d.masks)))
+        raw = b"".join(parts)
+    if raw != d.last:
+        try:
+            mem.write(d.addr, raw)
+        except Exception:
+            return
+        d.last = raw
+
+
+# -- device contexts -----------------------------------------------------------------
+
+_DC_STATE = ("pen", "brush", "font", "palette", "text_color", "bk_color", "bk_mode", "rop2",
+             "poly_fill", "stretch_mode", "text_align", "char_extra", "map_mode", "wox", "woy",
+             "wex", "wey", "vox", "voy", "vex", "vey", "brush_org", "pos", "dc_brush", "dc_pen",
+             "arc_dir", "gmode", "layout", "clip", "bitmap_h", "break_extra", "break_count",
+             "xform", "miter", "rel_abs", "icm")
+
+
+class _DC(_GObj):
+    kind = "dc"
+
+    def __init__(self, gdi, dckind, hwnd=0):
+        self.gdi = gdi
+        self.dckind = dckind          # "mem" | "window" | "client" | "screen" | "info"
+        self.hwnd = hwnd
+        self.paint = None             # BeginPaint update rects (client coords)
+        self.pen = gdi.stock[7].h     # BLACK_PEN
+        self.brush = gdi.stock[0].h   # WHITE_BRUSH
+        self.font = gdi.stock[13].h   # SYSTEM_FONT
+        self.palette = gdi.stock[15].h
+        self.bitmap_h = gdi.stock_bitmap.h if dckind == "mem" else 0
+        self.text_color, self.bk_color = 0, 0xFFFFFF
+        self.bk_mode, self.rop2, self.poly_fill, self.stretch_mode = 2, 13, 1, 1
+        self.text_align = self.char_extra = 0
+        self.map_mode = 1
+        self.wox = self.woy = self.vox = self.voy = 0
+        self.wex = self.wey = self.vex = self.vey = 1
+        self.brush_org = (0, 0)
+        self.pos = (0, 0)
+        self.dc_brush, self.dc_pen = 0xFFFFFF, 0
+        self.arc_dir = 1
+        self.gmode = 1
+        self.layout = 0
+        self.clip = None              # app clip region: device-coord rect list or None
+        self.break_extra = self.break_count = 0
+        self.xform = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+        self.miter = 10.0
+        self.rel_abs = 1
+        self.icm = 0
+        self.saved = []
+        self.path = None              # list of figures while a path bracket is open
+        self.path_done = None
+        self._ver = 0
+        self._cache = None
+        self.bounds = None
+        self.owner_tid = 0
+        self.released = False
+
+    # -- state helpers --------------------------------------------------------------
+    def changed(self):
+        self._ver += 1
+        self._cache = None
+
+    def save(self):
+        self.saved.append({k: getattr(self, k) for k in _DC_STATE})
+        return len(self.saved)
+
+    def restore(self, n):
+        if n < 0:
+            n = len(self.saved) + 1 + n
+        if n <= 0 or n > len(self.saved):
+            return False
+        st = self.saved[n - 1]
+        del self.saved[n - 1:]
+        for k, v in st.items():
+            setattr(self, k, v)
+        if self.dckind == "mem":
+            bm = self.gdi.get(self.bitmap_h, "bitmap")
+            if bm is not None:
+                bm.dc = self.h
+        self.changed()
+        return True
+
+    # -- geometry ------------------------------------------------------------------
+    def target(self):
+        """-> (surf, ox, oy, clip_rects in surface coords, bitmap-or-None)."""
+        g = self.gdi
+        wm = g.wm
+        key = (self._ver, wm.gen if (wm is not None and self.hwnd) else 0)
+        c = self._cache
+        if c is not None and c[0] == key:
+            return c[1]
+        bm = None
+        if self.dckind == "mem":
+            bm = g.get(self.bitmap_h, "bitmap") or g.stock_bitmap
+            surf = bm.surf
+            ox = oy = 0
+            vis = [(0, 0, surf.w, surf.h)]
+        elif self.hwnd and wm is not None:
+            surf, ox, oy, vis = wm.dc_geometry(self.hwnd, self.dckind == "client", self)
+        else:
+            surf = g.screen
+            ox = oy = 0
+            vis = [(0, 0, surf.w, surf.h)]
+        if self.paint is not None:
+            vis = _rects_and(vis, [(l + ox, t + oy, r + ox, b + oy) for (l, t, r, b) in self.paint])
+        if self.clip is not None:
+            vis = _rects_and(vis, [(l + ox, t + oy, r + ox, b + oy) for (l, t, r, b) in self.clip])
+        res = (surf, ox, oy, vis, bm)
+        self._cache = (key, res)
+        return res
+
+    def simple(self):
+        return self.map_mode == 1 or (self.wex == self.vex and self.wey == self.vey)
+
+    def lp2dp(self, x, y):
+        if self.wex == self.vex and self.wey == self.vey:
+            x, y = x - self.wox + self.vox, y - self.woy + self.voy
+        else:
+            x = int(round((x - self.wox) * self.vex / float(self.wex or 1))) + self.vox
+            y = int(round((y - self.woy) * self.vey / float(self.wey or 1))) + self.voy
+        if self.xform != (1.0, 0.0, 0.0, 1.0, 0.0, 0.0) and self.gmode == 2:
+            m11, m12, m21, m22, dx, dy = self.xform
+            x, y = int(round(x * m11 + y * m21 + dx)), int(round(x * m12 + y * m22 + dy))
+        return x, y
+
+    def dp2lp(self, x, y):
+        if self.wex == self.vex and self.wey == self.vey:
+            return x - self.vox + self.wox, y - self.voy + self.woy
+        return (int(round((x - self.vox) * self.wex / float(self.vex or 1))) + self.wox,
+                int(round((y - self.voy) * self.wey / float(self.vey or 1))) + self.woy)
+
+    def ldist(self, n, axis=0):
+        """Logical length -> device length."""
+        if self.wex == self.vex and self.wey == self.vey:
+            return n
+        if axis == 0:
+            return abs(int(round(n * self.vex / float(self.wex or 1))))
+        return abs(int(round(n * self.vey / float(self.wey or 1))))
+
+    def rect(self, l, t, r, b):
+        """Logical rect -> normalized device rect."""
+        x0, y0 = self.lp2dp(l, t)
+        x1, y1 = self.lp2dp(r, b)
+        if x0 > x1:
+            x0, x1 = x1 + 1, x0 + 1
+        if y0 > y1:
+            y0, y1 = y1 + 1, y0 + 1
+        return x0, y0, x1, y1
+
+    # -- objects ------------------------------------------------------------------------
+    def pen_obj(self):
+        return self.gdi.get(self.pen, "pen") or self.gdi.stock[7]
+
+    def brush_obj(self):
+        return self.gdi.brush(self.brush) or self.gdi.stock[0]
+
+    def font_obj(self):
+        return self.gdi.get(self.font, "font") or self.gdi.stock[13]
+
+    def gfont(self):
+        return self.font_obj().realize()
+
+    def pen_color(self, pen):
+        return self.dc_pen if pen.dcpen else pen.color
+
+    def mono(self):
+        """Drawing into a 1-bpp bitmap: colors collapse to black/white."""
+        if self.dckind != "mem":
+            return False
+        bm = self.gdi.get(self.bitmap_h, "bitmap") or self.gdi.stock_bitmap
+        return bm.bpp == 1
+
+    def pix(self, cr):
+        cr &= 0xFFFFFF
+        if self.mono():
+            return b"\xff\xff\xff\x00" if cr == (self.bk_color & 0xFFFFFF) or \
+                _lum(cr) >= 128 and cr != (self.text_color & 0xFFFFFF) else b"\x00\x00\x00\x00"
+        return _cr_pix(cr)
+
+
+def _lum(cr):
+    return ((cr & 255) * 30 + ((cr >> 8) & 255) * 59 + ((cr >> 16) & 255) * 11) // 100
+
+
+class _GDI:
+    """Process-wide GDI object table and screen."""
+
+    def __init__(self, p):
+        self.p = p
+        self.objs = {}
+        self.next = 0x00500000
+        self.wm = None
+        sw, sh = 1024, 768
+        env = os.environ.get("NOO_SCREEN", "")
+        if "x" in env:
+            try:
+                sw, sh = (int(v) for v in env.lower().split("x", 1))
+            except ValueError:
+                pass
+        self.screen = _Surf(sw, sh, _cr_pix(_SYS_COLORS[1]))
+        self.sys_colors = list(_SYS_COLORS)
+        self.stock = {}
+        mk = self._stock
+        mk(0, _GBrush(0, 0xFFFFFF))
+        mk(1, _GBrush(0, 0xC0C0C0))
+        mk(2, _GBrush(0, 0x808080))
+        mk(3, _GBrush(0, 0x404040))
+        mk(4, _GBrush(0, 0x000000))
+        mk(5, _GBrush(1, 0))
+        mk(6, _GPen(0, 1, 0xFFFFFF))
+        mk(7, _GPen(0, 1, 0x000000))
+        mk(8, _GPen(5, 1, 0))
+        mk(10, _GFontObj(-12, pitch=1, face="Terminal"))
+        mk(11, _GFontObj(-12, pitch=1, face="Courier"))
+        mk(12, _GFontObj(-11, face="MS Sans Serif"))
+        mk(13, _GFontObj(-12, weight=700, face="System"))
+        mk(14, _GFontObj(-12, weight=700, face="System"))
+        mk(15, _GPalette([_cr_pix(c) for c in _SYS_PAL16]))
+        mk(16, _GFontObj(-12, pitch=1, face="Fixedsys"))
+        mk(17, _GFontObj(-11, face="MS Shell Dlg"))
+        mk(18, _GBrush(0, 0xFFFFFF, dcbrush=True))
+        mk(19, _GPen(0, 1, 0, dcpen=True))
+        self.stock_bitmap = _GBitmap(1, 1, 1, b"\x00\x00\x00\x00")
+        self.stock_bitmap.stock = True
+        self.add(self.stock_bitmap)
+        self.sys_brushes = {}
+        self.gui_font = self.stock[17]
+
+    def _stock(self, idx, obj):
+        obj.stock = True
+        obj.h = 0x00410000 + idx * 4
+        self.objs[obj.h] = obj
+        self.stock[idx] = obj
+
+    def add(self, obj):
+        h = self.next
+        self.next += 4
+        obj.h = h
+        self.objs[h] = obj
+        return h
+
+    def get(self, h, kind=None):
+        o = self.objs.get(h & 0xFFFFFFFF)
+        if o is None or (kind and o.kind != kind):
+            return None
+        return o
+
+    def brush(self, h):
+        h &= 0xFFFFFFFF
+        if 0 < h <= 31:                               # (HBRUSH)(COLOR_xxx + 1)
+            return self.sys_brush(h - 1)
+        return self.get(h, "brush")
+
+    def sys_brush(self, idx):
+        b = self.sys_brushes.get(idx)
+        if b is None:
+            b = _GBrush(0, self.sys_colors[idx % len(self.sys_colors)], sysidx=idx)
+            b.stock = True
+            self.add(b)
+            self.sys_brushes[idx] = b
+        return b
+
+    def sys_color(self, idx):
+        return self.sys_colors[idx] if 0 <= idx < len(self.sys_colors) else 0
+
+    def delete(self, h):
+        o = self.get(h)
+        if o is None:
+            return False
+        if o.stock:
+            return True
+        if o.kind == "bitmap" and o.dc:
+            return False
+        del self.objs[h & 0xFFFFFFFF]
+        if o.kind == "bitmap" and o.dib is not None and o.dib.own:
+            try:
+                self.p.mem.free(o.dib.addr)
+            except Exception:
+                pass
+        return True
+
+    def new_dc(self, dckind, hwnd=0):
+        dc = _DC(self, dckind, hwnd)
+        self.add(dc)
+        if dckind == "mem":
+            self.stock_bitmap.dc = 0
+        return dc
+
+    # -- per-op begin/end: DIB sync + dirty tracking ------------------------------------------
+    def begin(self, dc):
+        t = dc.target()
+        bm = t[4]
+        if bm is not None and bm.dib is not None:
+            _dib_pull(self.p.mem, bm)
+        return t
+
+    def end(self, dc, t):
+        t[0].rev += 1
+        bm = t[4]
+        if bm is not None and bm.dib is not None:
+            _dib_push(self.p.mem, bm)
+        wm = self.wm
+        if wm is not None and dc.hwnd:
+            wm.surface_dirty(dc.hwnd)
+
+
+# -- brush filling ------------------------------------------------------------------
+
+def _brush_tile(dc, br):
+    """Brush -> (solid_pix or None, tile rows [bytes], tile w, transparent_mask rows)."""
+    if br.style == 0:
+        c = dc.dc_brush if br.dcbrush else br.color
+        if br.sysidx is not None:
+            c = dc.gdi.sys_color(br.sysidx)
+        return dc.pix(c), None, 0, None
+    if br.style == 2:
+        fg = dc.pix(br.color)
+        bg = dc.pix(dc.bk_color)
+        bits = _HATCHES.get(br.hatch, _HATCHES[0])
+        rows, masks = [], []
+        for v in bits:
+            rows.append(b"".join(fg if (v >> (7 - i)) & 1 else bg for i in range(8)))
+            masks.append([(v >> (7 - i)) & 1 for i in range(8)])
+        return None, rows, 8, (masks if dc.bk_mode == 1 else None)
+    if br.style in (3, 5, 6) and br.pat is not None:
+        s = br.pat
+        rows = []
+        if br.mono:
+            fg, bg = dc.pix(dc.text_color), dc.pix(dc.bk_color)
+            for y in range(s.h):
+                r = s.px[y * s.w * 4:(y + 1) * s.w * 4]
+                rows.append(b"".join(bg if r[i * 4] else fg for i in range(s.w)))
+        else:
+            for y in range(s.h):
+                rows.append(bytes(s.px[y * s.w * 4:(y + 1) * s.w * 4]))
+        return None, rows, s.w, None
+    return None, None, 0, None                        # BS_NULL
+
+
+def _fill_brush(dc, surf, clip, l, t, r, b, br, rop=13, ox=0, oy=0):
+    """Fill a surface-coordinate rect with a brush (rop = R2 code)."""
+    if br is None or br.style == 1 or l >= r or t >= b:
+        return
+    solid, rows, tw, tmask = _brush_tile(dc, br)
+    if solid is not None:
+        _fill(surf, clip, l, t, r, b, solid, rop)
+        return
+    if not rows:
+        return
+    th = len(rows)
+    bx, by = dc.brush_org[0] + ox, dc.brush_org[1] + oy
+    for (cl, ct, cr, cb) in clip:
+        a0, a1 = max(l, cl, 0), min(r, cr, surf.w)
+        y0, y1 = max(t, ct, 0), min(b, cb, surf.h)
+        if a0 >= a1:
+            continue
+        n = a1 - a0
+        for y in range(y0, y1):
+            ty = (y - by) % th
+            tile = rows[ty]
+            ph = (a0 - bx) % tw
+            reps = (n + ph) // tw + 2
+            run = (tile * reps)[ph * 4:(ph + n) * 4]
+            if tmask is not None:
+                m = tmask[ty]
+                for i in range(n):
+                    if m[(ph + i) % tw]:
+                        _plot(surf, clip, a0 + i, y, run[i * 4:i * 4 + 4], rop)
+            elif rop == 13:
+                o = (y * surf.w + a0) * 4
+                surf.px[o:o + n * 4] = run
+            else:
+                for i in range(n):
+                    _plot(surf, clip, a0 + i, y, run[i * 4:i * 4 + 4], rop)
+
+
+def _fill_spans(dc, surf, clip, spans, br, rop=13, ox=0, oy=0):
+    for y, row in spans.items():
+        if isinstance(row, tuple):
+            row = [row]
+        for (x0, x1) in row:
+            _fill_brush(dc, surf, clip, x0, y, x1, y + 1, br, rop, ox, oy)
+
+
+def _outline_spans(spans):
+    """Boundary pixels of a filled shape given as {y: (x0, x1)} -> [(y, x0, x1)] runs."""
+    out = []
+    for y, sp in spans.items():
+        x0, x1 = sp if isinstance(sp, tuple) else sp[0]
+        up, dn = spans.get(y - 1), spans.get(y + 1)
+        if up is None or dn is None:
+            out.append((y, x0, x1))
+            continue
+        if not isinstance(up, tuple):
+            up = up[0]
+        if not isinstance(dn, tuple):
+            dn = dn[0]
+        i0, i1 = max(up[0], dn[0], x0 + 1), min(up[1], dn[1], x1 - 1)
+        if i0 >= i1:
+            out.append((y, x0, x1))
+        else:
+            out.append((y, x0, i0))
+            out.append((y, i1, x1))
+    return out
+
+
+def _pen_stroke(dc, surf, clip, pts, pen, closed=False, ox=0, oy=0):
+    """Polyline in surface coords with the DC's pen / ROP2."""
+    if pen.style == 5 or len(pts) < 2:
+        return
+    pix = dc.pix(dc.pen_color(pen))
+    w = pen.width if pen.width > 1 else 1
+    style = pen.style if pen.style in (1, 2, 3, 4) and w == 1 else 0
+    seq = list(pts) + ([pts[0]] if closed and pts[0] != pts[-1] else [])
+    for i in range(len(seq) - 1):
+        (x0, y0), (x1, y1) = seq[i], seq[i + 1]
+        _line(surf, clip, x0, y0, x1, y1, pix, w, dc.rop2, style)
+    if closed:
+        return
+
+
+def _stroke_runs(dc, surf, clip, runs, pen):
+    if pen.style == 5:
+        return
+    pix = dc.pix(dc.pen_color(pen))
+    for (y, x0, x1) in runs:
+        _span(surf, clip, y, x0, x1, pix, dc.rop2)
+
+
+def _roundrect_spans(l, t, r, b, ew, eh):
+    ew, eh = min(ew, r - l), min(eh, b - t)
+    if ew <= 1 or eh <= 1:
+        return {y: (l, r) for y in range(t, b)}
+    corners = _ellipse_spans(0, 0, ew, eh)
+    out = {}
+    hh = eh / 2.0
+    for y in range(t, b):
+        if y - t < hh:
+            sp = corners.get(y - t)
+        elif b - 1 - y < hh:
+            sp = corners.get(eh - 1 - (b - 1 - y))
+        else:
+            sp = None
+        if sp is None:
+            out[y] = (l, r)
+        else:
+            inset = sp[0]
+            out[y] = (l + inset, r - inset)
+    return out
+
+
+# -- text ---------------------------------------------------------------------------
+
+def _text_widths(font, text, extra=0):
+    return [font.advance(c) + extra for c in text]
+
+
+def _draw_glyphs(dc, surf, clip, x, ytop, text, font, widths, pix):
+    """Paint glyph runs at surface coords (x, ytop)."""
+    px = surf.px
+    sw, sh = surf.w, surf.h
+    one = len(clip) == 1
+    if one:
+        cl, ct, cr, cb = clip[0]
+    for i, ch in enumerate(text):
+        if ch not in (" ", "\t", "\r", "\n"):
+            runs = font.runs(ch)
+            if one:
+                for (dy, a, b) in runs:
+                    y = ytop + dy
+                    if ct <= y < cb:
+                        a2, b2 = max(x + a, cl), min(x + b, cr)
+                        if a2 < b2:
+                            o = (y * sw + a2) * 4
+                            px[o:o + (b2 - a2) * 4] = pix * (b2 - a2)
+            else:
+                for (dy, a, b) in runs:
+                    _span(surf, clip, ytop + dy, x + a, x + b, pix)
+        x += widths[i]
+    return x
+
+
+def _text_out(dc, x, y, text, opts=0, rect=None, dx=None):
+    """ExtTextOut semantics in logical coords. Returns the advance width."""
+    gdi = dc.gdi
+    surf, ox, oy, clip, bm = gdi.begin(dc)
+    t = (surf, ox, oy, clip, bm)
+    font = dc.gfont()
+    if dc.text_align & 1:                              # TA_UPDATECP
+        x, y = dc.pos
+    extra = dc.char_extra
+    widths = list(dx[:len(text)]) if dx else _text_widths(font, text, extra)
+    if dx and len(widths) < len(text):
+        widths += _text_widths(font, text[len(widths):], extra)
+    total = sum(widths)
+    dx0, dy0 = dc.lp2dp(x, y)
+    sx, sy = dx0 + ox, dy0 + oy
+    ha = dc.text_align & 6
+    if ha == 6:
+        sx -= total // 2
+    elif ha == 2:
+        sx -= total
+    va = dc.text_align & 24
+    if va == 24:
+        sy -= font.ascent
+    elif va == 8:
+        sy -= font.height
+    if rect is not None:
+        rl, rt, rr, rb = dc.rect(*rect)
+        rsurf = (rl + ox, rt + oy, rr + ox, rb + oy)
+        if opts & 2:                                   # ETO_OPAQUE
+            _fill(surf, clip, rsurf[0], rsurf[1], rsurf[2], rsurf[3], dc.pix(dc.bk_color))
+        if opts & 4:                                   # ETO_CLIPPED
+            clip = _rects_and(clip, [rsurf])
+    if dc.bk_mode == 2 and not (opts & 2 and rect is not None):
+        _fill(surf, clip, sx, sy, sx + total, sy + font.height, dc.pix(dc.bk_color))
+    pix = dc.pix(dc.text_color)
+    _draw_glyphs(dc, surf, clip, sx, sy, text, font, widths, pix)
+    if font.underline:
+        uy = sy + font.ascent + max(1, font.descent // 3)
+        _span(surf, clip, uy, sx, sx + total, pix)
+    if font.strike:
+        _span(surf, clip, sy + font.ascent * 2 // 3, sx, sx + total, pix)
+    if dc.text_align & 1:
+        if ha == 2:
+            dc.pos = (x - total, y)
+        elif ha != 6:
+            dc.pos = (x + total, y)
+    gdi.end(dc, t)
+    return total
+
+
+def _strip_prefix(text):
+    """'&File' -> ('File', 0): index of the underlined char or -1."""
+    out = []
+    ul = -1
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c == "&" and i + 1 < len(text):
+            if text[i + 1] == "&":
+                out.append("&")
+                i += 2
+                continue
+            ul = len(out)
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out), ul
+
+
+def _wrap_line(font, line, width, extra=0):
+    """Word-wrap a single line to width pixels -> list of lines."""
+    if width <= 0:
+        return [line]
+    words = re.split(r"(\s+)", line)
+    lines, cur, cw = [], "", 0
+    for wd in words:
+        if not wd:
+            continue
+        ww = sum(font.advance(c) + extra for c in wd)
+        if cw + ww <= width or not cur:
+            if not cur and wd.isspace():
+                continue
+            cur += wd
+            cw += ww
+            # a single word wider than the box is broken by characters (DT_EDITCONTROL-ish)
+            while cw > width and len(cur) > 1 and not cur.isspace() and " " not in cur:
+                k = len(cur)
+                while k > 1 and sum(font.advance(c) + extra for c in cur[:k]) > width:
+                    k -= 1
+                lines.append(cur[:k])
+                cur = cur[k:]
+                cw = sum(font.advance(c) + extra for c in cur)
+        else:
+            lines.append(cur.rstrip())
+            if wd.isspace():
+                cur, cw = "", 0
+            else:
+                cur, cw = wd, ww
+    lines.append(cur.rstrip() if lines else cur)
+    return lines
+
+
+def _ellipsize(font, s, width, mode, extra=0):
+    wf = lambda t: sum(font.advance(c) + extra for c in t)
+    if wf(s) <= width:
+        return s
+    ell = "..."
+    if mode == "path":
+        cut = max(s.rfind("\\"), s.rfind("/"))
+        tail = s[cut:] if cut >= 0 else s
+        head = s[:cut] if cut >= 0 else ""
+        while head and wf(head + ell + tail) > width:
+            head = head[:-1]
+        if wf(head + ell + tail) <= width:
+            return head + ell + tail
+    t = s
+    while t and wf(t + ell) > width:
+        t = t[:-1]
+    if mode == "word" and " " in t:
+        t = t[:t.rfind(" ")] if t.rfind(" ") > 0 else t
+    return t + ell
+
+
+def _draw_text_fmt(dc, text, rect, fmt, tabsize=8, margins=(0, 0), draw=True):
+    """DrawText(Ex). rect = logical (l, t, r, b). Returns (height, calc_rect)."""
+    font = dc.gfont()
+    extra = dc.char_extra
+    l, t, r, b = rect
+    l += margins[0]
+    r -= margins[1]
+    width = r - l
+    single = fmt & 0x20
+    prefix = not (fmt & 0x800)
+    if fmt & 0x80:                                     # DT_TABSTOP
+        tabsize = (fmt >> 8) & 0xFF or 8
+        fmt &= ~0xFF00 | 0xFF
+    if fmt & 0x40:                                     # DT_EXPANDTABS
+        tabw = tabsize * font.advance(" ")
+    else:
+        tabw = 0
+    if single:
+        raw_lines = [text.replace("\r", "").replace("\n", "")] if not (fmt & 0x2000) else \
+            [text.replace("\r\n", " ").replace("\n", " ")]
+    else:
+        raw_lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    lines = []
+    for ln in raw_lines:
+        ul = -1
+        if prefix:
+            ln, ul = _strip_prefix(ln)
+        if tabw:
+            parts = ln.split("\t")
+            if len(parts) > 1:
+                acc = ""
+                for j, part in enumerate(parts):
+                    acc += part
+                    if j < len(parts) - 1:
+                        cw = sum(font.advance(c) + extra for c in acc)
+                        nxt = (cw // tabw + 1) * tabw
+                        sp = max(1, (nxt - cw + font.advance(" ") - 1) // max(1, font.advance(" ")))
+                        acc += " " * sp
+                ln = acc
+        if (fmt & 0x10) and not single:                # DT_WORDBREAK
+            wrapped = _wrap_line(font, ln, width, extra)
+            for j, w in enumerate(wrapped):
+                lines.append((w, ul if j == 0 and ul < len(w) else -1))
+        else:
+            lines.append((ln, ul))
+    if fmt & (0x8000 | 0x4000 | 0x40000):
+        mode = "path" if fmt & 0x4000 else "word" if fmt & 0x40000 else "end"
+        lines = [(_ellipsize(font, s, width, mode, extra), u) for (s, u) in lines]
+    lh = font.height
+    total_h = lh * len(lines)
+    maxw = 0
+    for (s, _u) in lines:
+        maxw = max(maxw, sum(font.advance(c) + extra for c in s))
+    if fmt & 0x400:                                    # DT_CALCRECT
+        nr = l + maxw
+        if not (fmt & 0x10) and single is False and False:
+            pass
+        return total_h, (l - margins[0], t, nr + margins[1], t + total_h)
+    y = t
+    if single:
+        if fmt & 4:                                    # DT_VCENTER
+            y = t + ((b - t) - lh) // 2
+        elif fmt & 8:                                  # DT_BOTTOM
+            y = b - lh
+    if not draw:
+        return total_h, rect
+    gdi = dc.gdi
+    surf, ox, oy, clip, bm = tg = gdi.begin(dc)
+    if not (fmt & 0x100):                              # DT_NOCLIP
+        rl, rt, rr, rb = dc.rect(rect[0], rect[1], rect[2], rect[3])
+        clip = _rects_and(clip, [(rl + ox, rt + oy, rr + ox, rb + oy)])
+    pix = dc.pix(dc.text_color)
+    bkpix = dc.pix(dc.bk_color)
+    hide = fmt & 0x100000                              # DT_HIDEPREFIX
+    for (s, ul) in lines:
+        widths = [font.advance(c) + extra for c in s]
+        lw = sum(widths)
+        if fmt & 1:
+            x = l + (width - lw) // 2
+        elif fmt & 2:
+            x = r - lw
+        else:
+            x = l
+        dx, dy = dc.lp2dp(x, y)
+        sx, sy = dx + ox, dy + oy
+        if dc.bk_mode == 2:
+            _fill(surf, clip, sx, sy, sx + lw, sy + lh, bkpix)
+        if not (fmt & 0x200000):                       # DT_PREFIXONLY
+            _draw_glyphs(dc, surf, clip, sx, sy, s, font, widths, pix)
+        if font.underline:
+            _span(surf, clip, sy + font.ascent + 1, sx, sx + lw, pix)
+        if font.strike:
+            _span(surf, clip, sy + font.ascent * 2 // 3, sx, sx + lw, pix)
+        if 0 <= ul < len(s) and not hide:
+            ux = sx + sum(widths[:ul])
+            _span(surf, clip, sy + font.ascent + 1, ux, ux + widths[ul] - extra, pix)
+        y += lh
+    gdi.end(dc, tg)
+    if single and fmt & (4 | 8):
+        return (y - t), rect
+    return total_h, rect
+
+
+# -- blits --------------------------------------------------------------------------
+
+def _rop_uses(idx):
+    src = ((idx >> 2) ^ idx) & 0x33 != 0
+    pat = ((idx >> 4) ^ idx) & 0x0F != 0
+    dst = ((idx >> 1) ^ idx) & 0x55 != 0
+    return src, pat, dst
+
+
+_ROP_FAST = {
+    0xCC: lambda P, S, D, M: S,
+    0xEE: lambda P, S, D, M: S | D,
+    0x88: lambda P, S, D, M: S & D,
+    0x66: lambda P, S, D, M: S ^ D,
+    0x44: lambda P, S, D, M: S & (M ^ D),
+    0x33: lambda P, S, D, M: M ^ S,
+    0x11: lambda P, S, D, M: M ^ (S | D),
+    0xC0: lambda P, S, D, M: P & S,
+    0xBB: lambda P, S, D, M: (M ^ S) | D,
+    0xF0: lambda P, S, D, M: P,
+    0xFB: lambda P, S, D, M: P | (M ^ S) | D,
+    0x5A: lambda P, S, D, M: P ^ D,
+    0x55: lambda P, S, D, M: M ^ D,
+    0x00: lambda P, S, D, M: 0,
+    0xFF: lambda P, S, D, M: M,
+    0xAA: lambda P, S, D, M: D,
+    0xB8: lambda P, S, D, M: (P & ~S | S & D) & M,       # PSDPxax (transparent trick)
+    0xE2: lambda P, S, D, M: (D & ~S | P & S) & M,       # DSPDxax
+    0x22: lambda P, S, D, M: D & (M ^ S),                # DSna
+}
+
+
+def _rop_eval(idx, P, S, D, M):
+    f = _ROP_FAST.get(idx)
+    if f is not None:
+        return f(P, S, D, M) & M
+    r = 0
+    nP, nS, nD = M ^ P, M ^ S, M ^ D
+    for i in range(8):
+        if (idx >> i) & 1:
+            r |= (P if i & 4 else nP) & (S if i & 2 else nS) & (D if i & 1 else nD)
+    return r & M
+
+
+def _src_rows(sdc, ssurf, sbm, x0, y0, w, h, dst_dc, dmono):
+    """Fetch w x h source pixels (surface coords) converted for the destination."""
+    rows = []
+    sw = ssurf.w
+    smono = sbm is not None and sbm.bpp == 1
+    fg = bg = None
+    if smono and not dmono:
+        fg, bg = _cr_pix(dst_dc.text_color), _cr_pix(dst_dc.bk_color)
+    key = None
+    if dmono and not smono and sdc is not None:
+        key = _cr_pix(sdc.bk_color)[:3]
+    for yy in range(y0, y0 + h):
+        if 0 <= yy < ssurf.h:
+            a, b = max(x0, 0), min(x0 + w, sw)
+            row = bytearray(4 * w)
+            if a < b:
+                row[(a - x0) * 4:(b - x0) * 4] = ssurf.px[(yy * sw + a) * 4:(yy * sw + b) * 4]
+        else:
+            row = bytearray(4 * w)
+        if fg is not None:
+            row = bytearray(b"".join(fg if row[i * 4] == 0 else bg for i in range(w)))
+        elif key is not None:
+            row = bytearray(b"".join(b"\xff\xff\xff\x00" if row[i * 4:i * 4 + 3] == key
+                                     else b"\x00\x00\x00\x00" for i in range(w)))
+        rows.append(row)
+    return rows
+
+
+def _blit(ddc, x, y, w, h, sdc, sx, sy, rop, sw=None, sh=None):
+    """BitBlt / StretchBlt / PatBlt core (logical coordinates)."""
+    idx = (rop >> 16) & 0xFF
+    use_src, use_pat, use_dst = _rop_uses(idx)
+    gdi = ddc.gdi
+    dsurf, dox, doy, dclip, dbm = tg = gdi.begin(ddc)
+    x0, y0 = ddc.lp2dp(x, y)
+    x1, y1 = ddc.lp2dp(x + w, y + h)
+    dw, dh = x1 - x0, y1 - y0
+    flipx, flipy = dw < 0, dh < 0
+    if flipx:
+        x0, dw = x1, -dw
+    if flipy:
+        y0, dh = y1, -dh
+    if dw == 0 or dh == 0:
+        return True
+    X0, Y0 = x0 + dox, y0 + doy
+    dmono = dbm is not None and dbm.bpp == 1
+    srows = None
+    if use_src:
+        if sdc is None:
+            return False
+        ssurf, sox, soy, _sclip, sbm = gdi.begin(sdc) if sdc is not ddc else tg
+        sx0, sy0 = sdc.lp2dp(sx, sy)
+        if sw is None:
+            sw_, sh_ = dw, dh
+        else:
+            sx1, sy1 = sdc.lp2dp(sx + sw, sy + sh)
+            sw_, sh_ = sx1 - sx0, sy1 - sy0
+            if sw_ < 0:
+                sx0, sw_ = sx1, -sw_
+                flipx = not flipx
+            if sh_ < 0:
+                sy0, sh_ = sy1, -sh_
+                flipy = not flipy
+        if sw_ == 0 or sh_ == 0:
+            return True
+        raw = _src_rows(sdc, ssurf, sbm, sx0 + sox, sy0 + soy, sw_, sh_, ddc, dmono)
+        if (sw_, sh_) != (dw, dh) or flipx or flipy:
+            xs = [((i * sw_) // dw) for i in range(dw)]
+            if flipx:
+                xs = [sw_ - 1 - v for v in xs]
+            srows = []
+            cache = {}
+            for j in range(dh):
+                sj = (j * sh_) // dh
+                if flipy:
+                    sj = sh_ - 1 - sj
+                r = cache.get(sj)
+                if r is None:
+                    src = raw[sj]
+                    if xs == list(range(dw)):
+                        r = bytes(src)
+                    else:
+                        mv = memoryview(bytes(src))
+                        r = b"".join(mv[i * 4:i * 4 + 4] for i in xs)
+                    cache[sj] = r
+                srows.append(r)
+        else:
+            srows = raw
+    pat_rows = None
+    if use_pat:
+        br = ddc.brush_obj()
+        solid, rows, tw, _tm = _brush_tile(ddc, br)
+        if solid is not None:
+            pat_rows = ("solid", solid)
+        elif rows:
+            pat_rows = ("tile", rows, tw)
+        else:
+            pat_rows = ("solid", b"\x00\x00\x00\x00")
+    # destination clipping
+    for (cl, ct, cr, cb) in dclip:
+        a0, a1 = max(X0, cl, 0), min(X0 + dw, cr, dsurf.w)
+        b0, b1 = max(Y0, ct, 0), min(Y0 + dh, cb, dsurf.h)
+        if a0 >= a1 or b0 >= b1:
+            continue
+        n = a1 - a0
+        M = (1 << (32 * n)) - 1
+        xmask = int.from_bytes(b"\xff\xff\xff\x00" * n, "little")
+        for yy in range(b0, b1):
+            o = (yy * dsurf.w + a0) * 4
+            if idx == 0xCC and srows is not None:
+                row = srows[yy - Y0]
+                dsurf.px[o:o + n * 4] = row[(a0 - X0) * 4:(a1 - X0) * 4]
+                continue
+            if idx == 0xF0 and pat_rows[0] == "solid":
+                dsurf.px[o:o + n * 4] = pat_rows[1] * n
+                continue
+            S = int.from_bytes(srows[yy - Y0][(a0 - X0) * 4:(a1 - X0) * 4], "little") \
+                if srows is not None else 0
+            if pat_rows is None:
+                P = 0
+            elif pat_rows[0] == "solid":
+                P = int.from_bytes(pat_rows[1] * n, "little")
+            else:
+                rows, tw = pat_rows[1], pat_rows[2]
+                bx, by = ddc.brush_org[0] + dox, ddc.brush_org[1] + doy
+                tile = rows[(yy - by) % len(rows)]
+                ph = (a0 - bx) % tw
+                P = int.from_bytes((tile * ((n + ph) // tw + 2))[ph * 4:(ph + n) * 4], "little")
+            D = int.from_bytes(dsurf.px[o:o + n * 4], "little") if use_dst else 0
+            v = _rop_eval(idx, P, S, D, M) & xmask
+            dsurf.px[o:o + n * 4] = v.to_bytes(n * 4, "little")
+    gdi.end(ddc, tg)
+    return True
+
+
+def _alpha_blend(ddc, x, y, w, h, sdc, sx, sy, sw, sh, blend):
+    """AlphaBlend: blend = (op, flags, SourceConstantAlpha, AlphaFormat)."""
+    _op, _fl, sca, fmt = blend
+    gdi = ddc.gdi
+    dsurf, dox, doy, dclip, dbm = tg = gdi.begin(ddc)
+    ssurf, sox, soy, _c, sbm = gdi.begin(sdc)
+    X0, Y0 = ddc.lp2dp(x, y)
+    X0 += dox
+    Y0 += doy
+    SX, SY = sdc.lp2dp(sx, sy)
+    SX += sox
+    SY += soy
+    if w <= 0 or h <= 0 or sw <= 0 or sh <= 0:
+        return False
+    per_pixel = fmt & 1                                 # AC_SRC_ALPHA
+    dpx, spx = dsurf.px, ssurf.px
+    for j in range(h):
+        yy = Y0 + j
+        if not 0 <= yy < dsurf.h:
+            continue
+        syy = SY + (j * sh) // h
+        if not 0 <= syy < ssurf.h:
+            continue
+        for i in range(w):
+            xx = X0 + i
+            if not 0 <= xx < dsurf.w:
+                continue
+            if not any(cl <= xx < cr and ct <= yy < cb for (cl, ct, cr, cb) in dclip):
+                continue
+            sxx = SX + (i * sw) // w
+            if not 0 <= sxx < ssurf.w:
+                continue
+            so = (syy * ssurf.w + sxx) * 4
+            do = (yy * dsurf.w + xx) * 4
+            sb, sg, sr = spx[so], spx[so + 1], spx[so + 2]
+            if per_pixel:
+                sa = spx[so + 3]
+                sa = sa * sca // 255
+                sb, sg, sr = sb * sca // 255, sg * sca // 255, sr * sca // 255
+                inv = 255 - sa
+                dpx[do] = min(255, sb + dpx[do] * inv // 255)
+                dpx[do + 1] = min(255, sg + dpx[do + 1] * inv // 255)
+                dpx[do + 2] = min(255, sr + dpx[do + 2] * inv // 255)
+            else:
+                inv = 255 - sca
+                dpx[do] = (sb * sca + dpx[do] * inv) // 255
+                dpx[do + 1] = (sg * sca + dpx[do + 1] * inv) // 255
+                dpx[do + 2] = (sr * sca + dpx[do + 2] * inv) // 255
+    gdi.end(ddc, tg)
+    return True
+
+
+def _transparent_blt(ddc, x, y, w, h, sdc, sx, sy, sw, sh, key):
+    gdi = ddc.gdi
+    dsurf, dox, doy, dclip, dbm = tg = gdi.begin(ddc)
+    ssurf, sox, soy, _c, sbm = gdi.begin(sdc)
+    X0, Y0 = ddc.lp2dp(x, y)
+    X0 += dox
+    Y0 += doy
+    SX, SY = sdc.lp2dp(sx, sy)
+    SX += sox
+    SY += soy
+    kb = _cr_pix(key)[:3]
+    if w <= 0 or h <= 0 or sw <= 0 or sh <= 0:
+        return False
+    for j in range(h):
+        yy = Y0 + j
+        syy = SY + (j * sh) // h
+        if not (0 <= yy < dsurf.h and 0 <= syy < ssurf.h):
+            continue
+        for i in range(w):
+            sxx = SX + (i * sw) // w
+            if not 0 <= sxx < ssurf.w:
+                continue
+            so = (syy * ssurf.w + sxx) * 4
+            if ssurf.px[so:so + 3] == kb:
+                continue
+            _plot(dsurf, dclip, X0 + i, yy, bytes(ssurf.px[so:so + 3]) + b"\0")
+    gdi.end(ddc, tg)
+    return True
+
+
+def _gradient_rect(ddc, v0, v1, vertical):
+    """GradientFill GRADIENT_FILL_RECT_H/V between two TRIVERTEX (x, y, r, g, b)."""
+    gdi = ddc.gdi
+    surf, ox, oy, clip, bm = tg = gdi.begin(ddc)
+    (x0, y0, r0, g0, b0), (x1, y1, r1, g1, b1) = v0, v1
+    X0, Y0 = ddc.lp2dp(x0, y0)
+    X1, Y1 = ddc.lp2dp(x1, y1)
+    if X0 > X1:
+        X0, X1 = X1, X0
+    if Y0 > Y1:
+        Y0, Y1 = Y1, Y0
+    n = (Y1 - Y0) if vertical else (X1 - X0)
+    for i in range(max(n, 0)):
+        f = i / float(max(n - 1, 1))
+        c = _rgb(int((r0 + (r1 - r0) * f)) >> 8, int((g0 + (g1 - g0) * f)) >> 8,
+                 int((b0 + (b1 - b0) * f)) >> 8)
+        pix = _cr_pix(c)
+        if vertical:
+            _fill(surf, clip, X0 + ox, Y0 + i + oy, X1 + ox, Y0 + i + 1 + oy, pix)
+        else:
+            _fill(surf, clip, X0 + i + ox, Y0 + oy, X0 + i + 1 + ox, Y1 + oy, pix)
+    gdi.end(ddc, tg)
+
+
+def _flood_fill(dc, x, y, color, ftype):
+    """ExtFloodFill: FLOODFILLBORDER 0 (stop at color) / FLOODFILLSURFACE 1."""
+    gdi = dc.gdi
+    surf, ox, oy, clip, bm = tg = gdi.begin(dc)
+    X, Y = dc.lp2dp(x, y)
+    X += ox
+    Y += oy
+    if not (0 <= X < surf.w and 0 <= Y < surf.h):
+        return False
+    key = _cr_pix(color)[:3]
+    px = surf.px
+    W = surf.w
+
+    def inside(xx, yy):
+        o = (yy * W + xx) * 4
+        c = px[o:o + 3]
+        return (c != key) if ftype == 0 else (c == key)
+
+    def vis(xx, yy):
+        return any(cl <= xx < cr and ct <= yy < cb for (cl, ct, cr, cb) in clip)
+
+    if not inside(X, Y) or not vis(X, Y):
+        return False
+    br = dc.brush_obj()
+    seen = set()
+    stack = [(X, Y)]
+    spans = {}
+    while stack:
+        sx, sy = stack.pop()
+        if (sx, sy) in seen:
+            continue
+        a = sx
+        while a > 0 and inside(a - 1, sy) and vis(a - 1, sy) and (a - 1, sy) not in seen:
+            a -= 1
+        b = sx
+        while b + 1 < W and inside(b + 1, sy) and vis(b + 1, sy) and (b + 1, sy) not in seen:
+            b += 1
+        for xx in range(a, b + 1):
+            seen.add((xx, sy))
+        spans.setdefault(sy, []).append((a, b + 1))
+        for ny in (sy - 1, sy + 1):
+            if 0 <= ny < surf.h:
+                for xx in range(a, b + 1):
+                    if (xx, ny) not in seen and inside(xx, ny) and vis(xx, ny):
+                        stack.append((xx, ny))
+        if len(seen) > 4_000_000:
+            break
+    _fill_spans(dc, surf, clip, spans, br, 13, ox, oy)
+    gdi.end(dc, tg)
+    return True
+
+
+def _bezier(pts, steps=16):
+    """Cubic Bezier segments (1 + 3n points) -> polyline."""
+    out = [pts[0]]
+    for i in range(0, len(pts) - 3, 3):
+        (x0, y0), (x1, y1), (x2, y2), (x3, y3) = pts[i:i + 4]
+        for s in range(1, steps + 1):
+            t = s / float(steps)
+            u = 1 - t
+            x = u * u * u * x0 + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x3
+            y = u * u * u * y0 + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y3
+            out.append((int(round(x)), int(round(y))))
+    return out
+
+
+# -- gdi32 API ----------------------------------------------------------------------
+
+_GDI_ERROR = 0xFFFFFFFF
+_CLR_INVALID = 0xFFFFFFFF
+
+
+def _rd_rect(mem, a):
+    return (_s32(mem.read32(a)), _s32(mem.read32(a + 4)),
+            _s32(mem.read32(a + 8)), _s32(mem.read32(a + 12)))
+
+
+def _wr_rect(mem, a, r):
+    mem.write(a, struct.pack("<iiii", *(int(v) for v in r)))
+
+
+def _rd_points(mem, a, n):
+    raw = mem.read(a, 8 * n) if n > 0 else b""
+    return [struct.unpack_from("<ii", raw, 8 * i) for i in range(n)]
+
+
+def _gstr(mem, a, n, wide):
+    """Counted string argument (n < 0 = NUL-terminated)."""
+    if not a:
+        return ""
+    if wide:
+        raw = mem.read_wstring(a, 1 << 20) if n < 0 else mem.read(a, 2 * n)
+        return raw.decode("utf-16-le", "replace")
+    raw = mem.read_cstring(a, 1 << 20) if n < 0 else mem.read(a, n)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", "replace")
+
+
+def _read_logfont(mem, a, wide):
+    v = struct.unpack("<iiiiiBBBBBBBB", mem.read(a, 28))
+    if wide:
+        face = mem.read(a + 28, 64).decode("utf-16-le", "replace").split("\0", 1)[0]
+    else:
+        face = mem.read(a + 28, 32).split(b"\0", 1)[0].decode("cp1252", "replace")
+    return list(v) + [face]
+
+
+def _write_logfont(mem, a, lf, wide):
+    mem.write(a, struct.pack("<iiiiiBBBBBBBB", *[int(x) & (0xFF if i >= 5 else 0xFFFFFFFF)
+                                                 if i >= 5 else int(x)
+                                                 for i, x in enumerate(lf[:13])]))
+    face = lf[13] or ""
+    if wide:
+        mem.write(a + 28, (face.encode("utf-16-le")[:62] + b"\0\0").ljust(64, b"\0"))
+    else:
+        mem.write(a + 28, (face.encode("cp1252", "replace")[:31] + b"\0").ljust(32, b"\0"))
+
+
+def _textmetric(font, fobj, wide):
+    """TEXTMETRIC{A,W} bytes."""
+    avg = font.advance("x") if not font.fixed else font.advance("M")
+    mx = max(font.advance(c) for c in "WM@")
+    weight = fobj.lf[4] or 400
+    first, last, default, brk = 32, 255, 31 if not wide else 0x1F, 32
+    head = struct.pack("<iiiiiiiiiii", font.height, font.ascent, font.descent, 0,
+                       max(0, font.height // 8), avg, mx, weight, 0, 96, 96)
+    if wide:
+        chars = struct.pack("<HHHH", first, 0xFFFC, 0x1F, 32)
+    else:
+        chars = struct.pack("<BBBB", first, last, default, brk)
+    pitch = (0 if font.fixed else 1) | 2 | 4                  # TMPF_VECTOR|TMPF_TRUETYPE
+    fam = (0x30 if font.fixed else 0x20)                    # FF_MODERN / FF_SWISS
+    tail = struct.pack("<BBBBB", 1 if font.italic else 0, 1 if font.underline else 0,
+                       1 if font.strike else 0, pitch | fam, fobj.lf[8] & 0xFF)
+    data = head + chars + tail
+    return data + bytes((60 if wide else 56) - len(data))
+
+
+def _gdi_install(k):
+    R = k.reg
+    p = k.p
+    M_ = p.mem
+    gdi = p.gdi = _GDI(p)
+    G32 = ("gdi32.dll",)
+    U32 = ("user32.dll",)
+    MSI = ("msimg32.dll", "gdi32.dll")
+
+    def reg(names, sig="", ret="i", dlls=G32):
+        return R(names, sig, ret, dlls=dlls)
+
+    def DC(h):
+        return gdi.get(h, "dc")
+
+    def lp(dc, x, y):
+        return dc.lp2dp(x, y)
+
+    # ---- DC creation ---------------------------------------------------------------
+    @reg("CreateCompatibleDC", "p")
+    def _ccdc(c, h):
+        dc = gdi.new_dc("mem")
+        src = DC(h) if h else None
+        if src is not None:
+            dc.layout = src.layout
+        return dc.h
+
+    def _create_dc(c, drv, dev, out, init, wide):
+        name = _gstr(M_, drv, -1, wide).upper() if drv else ""
+        dc = gdi.new_dc("screen" if name in ("DISPLAY", "") else "info")
+        return dc.h
+
+    @reg("CreateDCA", "pppp")
+    def _cdca(c, a, b, d, e):
+        return _create_dc(c, a, b, d, e, False)
+
+    @reg("CreateDCW", "pppp")
+    def _cdcw(c, a, b, d, e):
+        return _create_dc(c, a, b, d, e, True)
+
+    @reg("CreateICA", "pppp")
+    def _cica(c, a, b, d, e):
+        return gdi.new_dc("info").h
+
+    @reg("CreateICW", "pppp")
+    def _cicw(c, a, b, d, e):
+        return gdi.new_dc("info").h
+
+    @reg("DeleteDC", "p")
+    def _deldc(c, h):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        if dc.dckind == "mem":
+            bm = gdi.get(dc.bitmap_h, "bitmap")
+            if bm is not None and bm.dc == dc.h:
+                bm.dc = 0
+        gdi.objs.pop(dc.h, None)
+        return 1
+
+    @reg("SaveDC", "p")
+    def _savedc(c, h):
+        dc = DC(h)
+        return dc.save() if dc else 0
+
+    @reg("RestoreDC", "pi")
+    def _restoredc(c, h, n):
+        dc = DC(h)
+        return 1 if dc and dc.restore(n) else 0
+
+    @reg("ResetDCA ResetDCW", "pp")
+    def _resetdc(c, h, dm):
+        return h
+
+    @reg("GetDCOrgEx", "pp")
+    def _dcorg(c, h, pt):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        ox = oy = 0
+        if dc.hwnd and gdi.wm is not None:
+            ox, oy = gdi.wm.dc_screen_origin(dc.hwnd, dc.dckind == "client")
+        M_.write(pt, struct.pack("<ii", ox, oy))
+        return 1
+
+    @reg("GetObjectType", "p")
+    def _objtype(c, h):
+        o = gdi.get(h)
+        if o is None:
+            return 0
+        return {"pen": 1, "brush": 2, "dc": 3, "palette": 5, "font": 6, "bitmap": 7,
+                "region": 8, "extpen": 11, "enhmetadc": 12, "enhmetafile": 13,
+                "colorspace": 14}.get(o.kind, 0) if not (o.kind == "dc" and o.dckind == "mem") \
+            else 10
+
+    # ---- object creation --------------------------------------------------------------
+    @reg("CreatePen", "uiu")
+    def _cpen(c, style, width, color):
+        return gdi.add(_GPen(style, width, color))
+
+    @reg("CreatePenIndirect", "p")
+    def _cpeni(c, a):
+        style, w, _y, color = struct.unpack("<IiiI", M_.read(a, 16))
+        return gdi.add(_GPen(style, w, color))
+
+    @reg("ExtCreatePen", "uupup")
+    def _extpen(c, style, width, lb, n, st):
+        _bs, color, _hatch = struct.unpack("<IIi", M_.read(lb, 12))
+        pen = _GPen(style & 0xF, width if style & 0x10000 else 1, color)
+        return gdi.add(pen)
+
+    @reg("CreateSolidBrush", "u")
+    def _csb(c, color):
+        return gdi.add(_GBrush(0, color))
+
+    @reg("CreateHatchBrush", "iu")
+    def _chb(c, hatch, color):
+        return gdi.add(_GBrush(2, color, hatch))
+
+    def _pattern_from_bitmap(bm):
+        s = _Surf(bm.surf.w, bm.surf.h)
+        s.px[:] = bm.surf.px
+        return s
+
+    @reg("CreatePatternBrush", "p")
+    def _cpb(c, hbm):
+        bm = gdi.get(hbm, "bitmap")
+        if bm is None:
+            return 0
+        if bm.dib is not None:
+            _dib_pull(M_, bm)
+        br = _GBrush(3, 0, pat=_pattern_from_bitmap(bm), mono=bm.bpp == 1)
+        br.pat_bmp = hbm
+        return gdi.add(br)
+
+    def _dib_pattern(packed, usage):
+        w, h, bpp, top, colors, masks, comp, hsz = _read_bmi(M_, packed, usage)
+        ncol = len(colors)
+        bits = packed + hsz + (ncol * (2 if usage == 1 else 4)) + \
+            (12 if comp == 3 and hsz < 52 else 0)
+        s = _Surf(w, h)
+        _dib_rows_to_surf(M_, bits, w, h, bpp, top, colors, masks, s)
+        return _GBrush(5, 0, pat=s)
+
+    @reg("CreateDIBPatternBrushPt", "pu")
+    def _cdpbpt(c, packed, usage):
+        return gdi.add(_dib_pattern(packed, usage))
+
+    @reg("CreateDIBPatternBrush", "pu")
+    def _cdpb(c, hglob, usage):
+        return gdi.add(_dib_pattern(hglob, usage))
+
+    @reg("CreateBrushIndirect", "p")
+    def _cbi(c, a):
+        style, color, hatch = struct.unpack("<IIi" if p.cpu_mode != 64 else "<IIi",
+                                            M_.read(a, 12))
+        if p.cpu_mode == 64:
+            hatch = M_.read64(a + 8)
+        if style == 1:
+            return gdi.stock[5].h
+        if style == 2:
+            return gdi.add(_GBrush(2, color, hatch))
+        if style == 3:
+            return _cpb(c, hatch)
+        if style in (5, 6):
+            return gdi.add(_dib_pattern(hatch, color & 0xFFFF))
+        return gdi.add(_GBrush(0, color))
+
+    def _create_font(lf):
+        return gdi.add(_GFontObj(*lf))
+
+    @reg("CreateFontIndirectA", "p")
+    def _cfia(c, a):
+        return _create_font(_read_logfont(M_, a, False)) if a else 0
+
+    @reg("CreateFontIndirectW", "p")
+    def _cfiw(c, a):
+        return _create_font(_read_logfont(M_, a, True)) if a else 0
+
+    @reg("CreateFontIndirectExA", "p")
+    def _cfiea(c, a):
+        return _create_font(_read_logfont(M_, a, False)) if a else 0
+
+    @reg("CreateFontIndirectExW", "p")
+    def _cfiew(c, a):
+        return _create_font(_read_logfont(M_, a, True)) if a else 0
+
+    def _create_font_args(c, v, wide):
+        face = _gstr(M_, v[13], -1, wide) if v[13] else ""
+        return _create_font([_s32(v[0]), _s32(v[1]), _s32(v[2]), _s32(v[3]), _s32(v[4])] +
+                            [x & 0xFF for x in v[5:13]] + [face])
+
+    @reg("CreateFontA", "iiiiiuuuuuuuup")
+    def _cfa(c, *v):
+        return _create_font_args(c, v, False)
+
+    @reg("CreateFontW", "iiiiiuuuuuuuup")
+    def _cfw(c, *v):
+        return _create_font_args(c, v, True)
+
+    @reg("CreateBitmap", "iiuup")
+    def _cbmp(c, w, h, planes, bpp, bits):
+        if w <= 0 or h <= 0:
+            if w == 0 or h == 0:
+                return gdi.stock_bitmap.h
+            return 0
+        tb = bpp * planes
+        bm = _GBitmap(w, h, 1 if tb == 1 else 32)
+        if bits:
+            stride = ((w * tb + 15) // 16) * 2            # WORD-aligned DDB rows
+            raw = M_.read(bits, stride * h)
+            cols = [b"\0\0\0\0", b"\xff\xff\xff\0"] if tb == 1 else None
+            tables = _pal_tables(cols) if tb == 1 else None
+            for y in range(h):
+                row = raw[y * stride:(y + 1) * stride]
+                if tb in (1, 24, 32, 16, 8, 4):
+                    px = _row_to_bgrx(row, w, tb, cols, None, tables) if tb != 8 else \
+                        _row_to_bgrx(row, w, 8, [_cr_pix(v) for v in _SYS_PAL16] * 16)
+                    bm.surf.px[y * w * 4:(y + 1) * w * 4] = px[:w * 4]
+        elif tb == 1:
+            bm.surf.px[:] = b"\x00\x00\x00\x00" * (w * h)
+        return gdi.add(bm)
+
+    @reg("CreateBitmapIndirect", "p")
+    def _cbmpi(c, a):
+        t, w, h, wb, planes, bpp = struct.unpack("<iiiiHH", M_.read(a, 20))
+        bits = M_.read64(a + 24) if p.cpu_mode == 64 else M_.read32(a + 20)
+        return _cbmp(c, w, h, planes, bpp, bits)
+
+    @reg("CreateCompatibleBitmap", "pii")
+    def _ccbmp(c, h, w, hh):
+        dc = DC(h)
+        if w <= 0 or hh <= 0:
+            return gdi.stock_bitmap.h if w == 0 or hh == 0 else 0
+        mono = dc is not None and dc.mono()
+        bm = _GBitmap(w, hh, 1 if mono else 32)
+        return gdi.add(bm)
+
+    @reg("CreateDiscardableBitmap", "pii")
+    def _cdbmp(c, h, w, hh):
+        return _ccbmp(c, h, w, hh)
+
+    @reg("CreateDIBSection", "ppuppu")
+    def _cdibs(c, h, bmi, usage, ppbits, hsec, off):
+        w, hh, bpp, top, colors, masks, comp, _sz = _read_bmi(M_, bmi, usage)
+        if w <= 0 or hh <= 0 or bpp not in (1, 4, 8, 16, 24, 32):
+            k.p.last_error = ERROR_INVALID_PARAMETER
+            if ppbits:
+                k.wptr(ppbits, 0)
+            return 0
+        if bpp == 16 and masks is None:
+            masks = (0x7C00, 0x3E0, 0x1F)
+        stride = ((w * bpp + 31) // 32) * 4
+        size = stride * hh
+        if hsec:
+            sec = p.handles.get(hsec)
+            addr = 0
+            try:
+                addr = k.map_section(hsec, off, size) if hasattr(k, "map_section") else 0
+            except Exception:
+                addr = 0
+            if not addr:
+                addr = M_.alloc(size, MEM_READ | MEM_WRITE, tag="dibsection")
+                own = True
+            else:
+                own = False
+        else:
+            addr = M_.alloc(size, MEM_READ | MEM_WRITE, tag="dibsection")
+            own = True
+        bm = _GBitmap(w, hh, bpp)
+        bm.dib = _DibSec(addr, w, hh, bpp, top, colors, masks, own)
+        bm.dib.hdr = bytes(M_.read(bmi, 40))
+        if not own:
+            _dib_pull(M_, bm)
+        else:
+            bm.dib.last = bytes(size)
+        if ppbits:
+            k.wptr(ppbits, addr)
+        return gdi.add(bm)
+
+    @reg("CreateDIBitmap", "pppppu")
+    def _cdibm(c, h, bih, init, bits, bmi, usage):
+        if not bih:
+            return 0
+        w = _s32(M_.read32(bih + 4))
+        hh = abs(_s32(M_.read32(bih + 8)))
+        bpp = M_.read16(bih + 14)
+        if w <= 0 or hh <= 0:
+            return 0
+        dc = DC(h)
+        mono = bpp == 1 and (dc is None or dc.mono())
+        bm = _GBitmap(w, hh, 1 if mono else 32)
+        if init & 4 and bits and bmi:                  # CBM_INIT
+            ww, h2, bpp2, top, colors, masks, comp, _s = _read_bmi(M_, bmi, usage)
+            _dib_rows_to_surf(M_, bits, ww, h2, bpp2, top, colors, masks, bm.surf, comp=comp)
+        return gdi.add(bm)
+
+    @reg("SelectObject", "pp")
+    def _select(c, h, obj):
+        dc = DC(h)
+        o = gdi.get(obj) if obj > 31 else gdi.brush(obj)
+        if dc is None or o is None:
+            return 0
+        kind = o.kind
+        if kind == "region":
+            dc.clip = list(o.rects)
+            dc.changed()
+            return o.complexity()
+        if kind == "pen":
+            prev, dc.pen = dc.pen, o.h
+        elif kind == "brush":
+            prev, dc.brush = dc.brush, o.h
+        elif kind == "font":
+            prev, dc.font = dc.font, o.h
+        elif kind == "bitmap":
+            if dc.dckind != "mem":
+                return 0
+            if o.dc and o.dc != dc.h and not o.stock:
+                return 0                                 # already selected elsewhere
+            old = gdi.get(dc.bitmap_h, "bitmap")
+            if old is not None and old.dc == dc.h:
+                old.dc = 0
+            prev, dc.bitmap_h = dc.bitmap_h, o.h
+            if not o.stock:
+                o.dc = dc.h
+            dc.changed()
+        elif kind == "palette":
+            prev, dc.palette = dc.palette, o.h
+        else:
+            return 0
+        return prev
+
+    @reg("DeleteObject", "p")
+    def _delobj(c, h):
+        o = gdi.get(h)
+        if o is None:
+            return 0
+        if o.kind == "dc":
+            return 0
+        # a selected object may be deleted in Windows only after deselection;
+        # tolerate it (the DC keeps using its copy)
+        return 1 if gdi.delete(h) else 0
+
+    @reg("GetStockObject", "i")
+    def _stock(c, i):
+        if i == 21:                                     # DEFAULT_BITMAP (undocumented)
+            return gdi.stock_bitmap.h
+        o = gdi.stock.get(i)
+        return o.h if o else 0
+
+    @reg("GetCurrentObject", "pu")
+    def _curobj(c, h, t):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        return {1: dc.pen, 2: dc.brush, 5: dc.palette, 6: dc.font, 7: dc.bitmap_h}.get(t, 0)
+
+    def _get_object(c, h, n, buf, wide):
+        o = gdi.get(h) if h > 31 else gdi.brush(h)
+        if o is None:
+            return 0
+        ps = 8 if p.cpu_mode == 64 else 4
+        if o.kind == "pen":
+            data = struct.pack("<IiiI", o.raw_style, o.width, 0, o.color)
+        elif o.kind == "brush":
+            color = o.color if o.sysidx is None else gdi.sys_color(o.sysidx)
+            data = struct.pack("<II", o.style, color) + \
+                (struct.pack("<Q", o.hatch) if ps == 8 else struct.pack("<I", o.hatch))
+        elif o.kind == "font":
+            size = 92 if wide else 60
+            if not buf:
+                return size
+            tmp = bytearray(size)
+            if n >= size:
+                _write_logfont(M_, buf, o.lf, wide)
+                return size
+            return 0
+        elif o.kind == "bitmap":
+            w, hh = o.surf.w, o.surf.h
+            bpp = o.bpp if o.dib is not None else (1 if o.bpp == 1 else 32)
+            wb = ((w * bpp + 15) // 16) * 2 if o.dib is None else ((w * bpp + 31) // 32) * 4
+            bits = o.dib.addr if o.dib is not None else 0
+            bm = struct.pack("<iiiiHH", 0, w, hh, wb, 1, bpp)
+            bm += (struct.pack("<I", 0) + struct.pack("<Q", bits)) if ps == 8 else \
+                struct.pack("<I", bits)
+            data = bm
+            if o.dib is not None and n >= len(bm) + 60:
+                d = o.dib
+                bih = struct.pack("<IiiHHIIiiII", 40, w, hh if not d.topdown else -hh, 1, bpp,
+                                  3 if d.masks and bpp in (16, 32) else 0, d.size, 0, 0,
+                                  len(d.colors), 0)
+                masks = struct.pack("<III", *(d.masks or (0, 0, 0)))
+                data = bm + bih + masks + struct.pack("<IP" if False else "<I", 0) + \
+                    (struct.pack("<I", 0) if ps == 8 else b"")
+        elif o.kind == "palette":
+            if buf and n >= 2:
+                M_.write16(buf, len(o.entries))
+            return 2
+        elif o.kind == "region":
+            return 0
+        else:
+            return 0
+        if not buf:
+            return len(data)
+        data = data[:max(0, n)]
+        M_.write(buf, data)
+        return len(data)
+
+    @reg("GetObjectA", "pip")
+    def _goa(c, h, n, buf):
+        return _get_object(c, h, n, buf, False)
+
+    @reg("GetObjectW GetObject", "pip")
+    def _gow(c, h, n, buf):
+        return _get_object(c, h, n, buf, True)
+
+    @reg("UnrealizeObject", "p")
+    def _unreal(c, h):
+        return 1
+
+    @reg("GdiFlush GdiSetBatchLimit", "")
+    def _gdiflush(c):
+        return 1
+
+    @reg("GdiGetBatchLimit", "")
+    def _gdibl(c):
+        return 1
+
+    # ---- DC attributes ----------------------------------------------------------------
+    def attr(name, sig="pu", ret_prev=True, post=None):
+        def setter(c, h, v):
+            dc = DC(h)
+            if dc is None:
+                return 0 if name not in ("text_color", "bk_color") else _CLR_INVALID
+            prev = getattr(dc, name)
+            setattr(dc, name, v)
+            if post:
+                post(dc)
+            return prev
+        return setter
+
+    for nm, field in (("SetTextColor", "text_color"), ("SetBkColor", "bk_color"),
+                      ("SetBkMode", "bk_mode"), ("SetROP2", "rop2"),
+                      ("SetPolyFillMode", "poly_fill"), ("SetStretchBltMode", "stretch_mode"),
+                      ("SetTextAlign", "text_align"), ("SetTextCharacterExtra", "char_extra"),
+                      ("SetDCBrushColor", "dc_brush"), ("SetDCPenColor", "dc_pen"),
+                      ("SetArcDirection", "arc_dir"), ("SetGraphicsMode", "gmode"),
+                      ("SetLayout", "layout"), ("SetICMMode", "icm")):
+        reg(nm, "pu")(attr(field))
+
+    for nm, field in (("GetTextColor", "text_color"), ("GetBkColor", "bk_color"),
+                      ("GetBkMode", "bk_mode"), ("GetROP2", "rop2"),
+                      ("GetPolyFillMode", "poly_fill"), ("GetStretchBltMode", "stretch_mode"),
+                      ("GetTextAlign", "text_align"), ("GetTextCharacterExtra", "char_extra"),
+                      ("GetDCBrushColor", "dc_brush"), ("GetDCPenColor", "dc_pen"),
+                      ("GetArcDirection", "arc_dir"), ("GetGraphicsMode", "gmode"),
+                      ("GetMapMode", "map_mode"), ("GetLayout", "layout"),
+                      ("GetRelAbs", "rel_abs")):
+        def getter(c, h, _f=field):
+            dc = DC(h)
+            return getattr(dc, _f) if dc else 0
+        reg(nm, "p")(getter)
+
+    @reg("SetTextJustification", "pii")
+    def _stj(c, h, extra, count):
+        dc = DC(h)
+        if dc:
+            dc.break_extra, dc.break_count = extra, count
+        return 1
+
+    @reg("SetMapperFlags", "pu")
+    def _smf(c, h, f):
+        return 0
+
+    @reg("SetRelAbs", "pi")
+    def _sra(c, h, v):
+        return 1
+
+    @reg("SetMiterLimit", "pfp")
+    def _sml(c, h, v, old):
+        if old:
+            M_.write(old, struct.pack("<f", 10.0))
+        return 1
+
+    @reg("GetMiterLimit", "pp")
+    def _gml(c, h, out):
+        M_.write(out, struct.pack("<f", 10.0))
+        return 1
+
+    # ---- coordinate spaces ----------------------------------------------------------------
+    def _write_pt(a, x, y):
+        if a:
+            M_.write(a, struct.pack("<ii", x, y))
+
+    def _map_mode_extents(dc):
+        mm = dc.map_mode
+        dpi = 96
+        if mm == 1:
+            dc.wex = dc.wey = dc.vex = dc.vey = 1
+        elif mm in (2, 3, 4, 5, 6):                    # LOMETRIC/HIMETRIC/LOENGLISH/HIENGLISH/TWIPS
+            units = {2: 254, 3: 2540, 4: 100, 5: 1000, 6: 1440}[mm]
+            dc.wex, dc.wey = units, units
+            dc.vex, dc.vey = dpi, -dpi
+        dc.changed()
+
+    @reg("SetMapMode", "pi")
+    def _smm(c, h, mm):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        prev = dc.map_mode
+        dc.map_mode = mm
+        if mm not in (7, 8):
+            _map_mode_extents(dc)
+        elif prev not in (7, 8):
+            pass
+        return prev
+
+    def _org_ext(fieldx, fieldy, allow):
+        def fn(c, h, x, y, old):
+            dc = DC(h)
+            if dc is None:
+                return 0
+            _write_pt(old, getattr(dc, fieldx), getattr(dc, fieldy))
+            if allow(dc):
+                if x == 0 or y == 0:
+                    if fieldx in ("wex", "vex"):
+                        return 0
+                setattr(dc, fieldx, x)
+                setattr(dc, fieldy, y)
+                if dc.map_mode == 7 and fieldx in ("wex", "vex") and dc.wex and dc.wey:
+                    # MM_ISOTROPIC: keep aspect 1:1
+                    sx = dc.vex / float(dc.wex)
+                    sy = dc.vey / float(dc.wey)
+                    m = min(abs(sx), abs(sy))
+                    dc.vex = int(round(m * dc.wex)) * (1 if sx >= 0 else -1)
+                    dc.vey = int(round(m * dc.wey)) * (1 if sy >= 0 else -1)
+                dc.changed()
+            return 1
+        return fn
+
+    anymode = lambda dc: True
+    scalable = lambda dc: dc.map_mode in (7, 8)
+    reg("SetWindowOrgEx", "piip")(_org_ext("wox", "woy", anymode))
+    reg("SetViewportOrgEx", "piip")(_org_ext("vox", "voy", anymode))
+    reg("SetWindowExtEx", "piip")(_org_ext("wex", "wey", scalable))
+    reg("SetViewportExtEx", "piip")(_org_ext("vex", "vey", scalable))
+
+    def _get_pair(fx, fy):
+        def fn(c, h, out):
+            dc = DC(h)
+            if dc is None:
+                return 0
+            _write_pt(out, getattr(dc, fx), getattr(dc, fy))
+            return 1
+        return fn
+
+    reg("GetWindowOrgEx", "pp")(_get_pair("wox", "woy"))
+    reg("GetViewportOrgEx", "pp")(_get_pair("vox", "voy"))
+    reg("GetWindowExtEx", "pp")(_get_pair("wex", "wey"))
+    reg("GetViewportExtEx", "pp")(_get_pair("vex", "vey"))
+
+    def _offset(fx, fy):
+        def fn(c, h, x, y, old):
+            dc = DC(h)
+            if dc is None:
+                return 0
+            _write_pt(old, getattr(dc, fx), getattr(dc, fy))
+            setattr(dc, fx, getattr(dc, fx) + x)
+            setattr(dc, fy, getattr(dc, fy) + y)
+            dc.changed()
+            return 1
+        return fn
+
+    reg("OffsetWindowOrgEx", "piip")(_offset("wox", "woy"))
+    reg("OffsetViewportOrgEx", "piip")(_offset("vox", "voy"))
+
+    def _scale(fx, fy):
+        def fn(c, h, xn, xd, yn, yd, old):
+            dc = DC(h)
+            if dc is None:
+                return 0
+            _write_pt(old, getattr(dc, fx), getattr(dc, fy))
+            if dc.map_mode in (7, 8) and xd and yd:
+                setattr(dc, fx, getattr(dc, fx) * xn // xd)
+                setattr(dc, fy, getattr(dc, fy) * yn // yd)
+                dc.changed()
+            return 1
+        return fn
+
+    reg("ScaleWindowExtEx", "piiiip")(_scale("wex", "wey"))
+    reg("ScaleViewportExtEx", "piiiip")(_scale("vex", "vey"))
+
+    @reg("LPtoDP", "ppi")
+    def _lptodp(c, h, pts, n):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        for i in range(max(n, 0)):
+            x, y = struct.unpack("<ii", M_.read(pts + 8 * i, 8))
+            M_.write(pts + 8 * i, struct.pack("<ii", *dc.lp2dp(x, y)))
+        return 1
+
+    @reg("DPtoLP", "ppi")
+    def _dptolp(c, h, pts, n):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        for i in range(max(n, 0)):
+            x, y = struct.unpack("<ii", M_.read(pts + 8 * i, 8))
+            M_.write(pts + 8 * i, struct.pack("<ii", *dc.dp2lp(x, y)))
+        return 1
+
+    @reg("SetBrushOrgEx", "piip")
+    def _sbo(c, h, x, y, old):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        _write_pt(old, *dc.brush_org)
+        dc.brush_org = (x, y)
+        return 1
+
+    @reg("GetBrushOrgEx", "pp")
+    def _gbo(c, h, out):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        _write_pt(out, *dc.brush_org)
+        return 1
+
+    @reg("SetWorldTransform", "pp")
+    def _swt(c, h, xf):
+        dc = DC(h)
+        if dc is None or dc.gmode != 2:
+            return 0
+        dc.xform = struct.unpack("<6f", M_.read(xf, 24))
+        dc.changed()
+        return 1
+
+    @reg("GetWorldTransform", "pp")
+    def _gwt(c, h, xf):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        M_.write(xf, struct.pack("<6f", *dc.xform))
+        return 1
+
+    @reg("ModifyWorldTransform", "ppu")
+    def _mwt(c, h, xf, mode):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        if mode == 1:                                   # MWT_IDENTITY
+            dc.xform = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+        else:
+            a = struct.unpack("<6f", M_.read(xf, 24))
+            b = dc.xform
+            if mode == 2:                               # MWT_LEFTMULTIPLY: a * b
+                x, y = a, b
+            else:
+                x, y = b, a
+            dc.xform = (x[0] * y[0] + x[1] * y[2], x[0] * y[1] + x[1] * y[3],
+                        x[2] * y[0] + x[3] * y[2], x[2] * y[1] + x[3] * y[3],
+                        x[4] * y[0] + x[5] * y[2] + y[4], x[4] * y[1] + x[5] * y[3] + y[5])
+        dc.changed()
+        return 1
+
+    @reg("SetBoundsRect", "ppu")
+    def _sbr(c, h, r, f):
+        return 2                                         # DCB_RESET
+
+    @reg("GetBoundsRect", "ppu")
+    def _gbr(c, h, r, f):
+        if r:
+            _wr_rect(M_, r, (0, 0, 0, 0))
+        return 2
+
+    # ---- device caps ------------------------------------------------------------------------
+    @reg("GetDeviceCaps", "pi")
+    def _gdc(c, h, idx):
+        dc = DC(h)
+        sw, sh = gdi.screen.w, gdi.screen.h
+        bpp = 32
+        if dc is not None and dc.dckind == "mem" and dc.mono():
+            bpp = 32
+        return {0: 0x4000, 2: 1, 4: sw * 254 // 960, 6: sh * 254 // 960, 8: sw, 10: sh,
+                12: bpp, 14: 1, 18: 0, 20: -1 & 0xFFFFFFFF, 22: -1 & 0xFFFFFFFF,
+                24: 0xFFFFFFFF, 26: 0, 28: 0xFF, 30: 0xFE, 32: 0xFF, 34: 0x7807,
+                36: 1, 38: 0x7E99, 40: 36, 42: 36, 44: 51, 88: 96, 90: 96,
+                104: 0, 106: 0, 108: 24, 110: 0, 111: 0, 112: 0, 113: 0, 114: 0, 115: 0,
+                116: 60, 117: sh, 118: sw, 119: 1, 120: 0x7F, 121: 0x7FFFFFFF,
+                122: 0}.get(idx, 0)
+
+    # ---- pixels / lines / shapes ---------------------------------------------------------
+    @reg("SetPixel", "piiu")
+    def _setpixel(c, h, x, y, color):
+        dc = DC(h)
+        if dc is None:
+            return _CLR_INVALID
+        t = gdi.begin(dc)
+        surf, ox, oy, clip, bm = t
+        X, Y = lp(dc, x, y)
+        pix = dc.pix(color)
+        _plot(surf, clip, X + ox, Y + oy, pix)
+        gdi.end(dc, t)
+        return _pix_cr(pix)
+
+    @reg("SetPixelV", "piiu")
+    def _setpixelv(c, h, x, y, color):
+        return 1 if _setpixel(c, h, x, y, color) != _CLR_INVALID else 0
+
+    @reg("GetPixel", "pii")
+    def _getpixel(c, h, x, y):
+        dc = DC(h)
+        if dc is None:
+            return _CLR_INVALID
+        surf, ox, oy, clip, bm = gdi.begin(dc)
+        X, Y = lp(dc, x, y)
+        X += ox
+        Y += oy
+        if not any(cl <= X < cr and ct <= Y < cb for (cl, ct, cr, cb) in clip):
+            return _CLR_INVALID
+        return surf.get(X, Y) & 0xFFFFFF
+
+    @reg("MoveToEx", "piip")
+    def _moveto(c, h, x, y, old):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        _write_pt(old, *dc.pos)
+        dc.pos = (x, y)
+        if dc.path is not None:
+            dc.path.append([(x, y)])
+        return 1
+
+    @reg("GetCurrentPositionEx", "pp")
+    def _gcp(c, h, out):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        _write_pt(out, *dc.pos)
+        return 1
+
+    def _path_add(dc, pts, closed=False):
+        if not dc.path:
+            dc.path.append([dc.pos])
+        fig = dc.path[-1]
+        if not fig or fig[-1] != pts[0]:
+            fig.append(pts[0])
+        fig.extend(pts[1:])
+        if closed:
+            dc.path.append([pts[-1]])
+
+    def _stroke(dc, pts_logical, closed=False):
+        if dc.path is not None:
+            _path_add(dc, pts_logical, closed)
+            return
+        t = gdi.begin(dc)
+        surf, ox, oy, clip, bm = t
+        pts = [(X + ox, Y + oy) for (X, Y) in (dc.lp2dp(x, y) for (x, y) in pts_logical)]
+        _pen_stroke(dc, surf, clip, pts, dc.pen_obj(), closed)
+        gdi.end(dc, t)
+
+    @reg("LineTo", "pii")
+    def _lineto(c, h, x, y):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        _stroke(dc, [dc.pos, (x, y)])
+        dc.pos = (x, y)
+        return 1
+
+    @reg("Polyline", "ppi")
+    def _polyline(c, h, a, n):
+        dc = DC(h)
+        if dc is None or n < 2:
+            return 0
+        pts = _rd_points(M_, a, n)
+        _stroke(dc, pts)
+        # the last pixel of a polyline is not drawn; Windows includes interior joins
+        return 1
+
+    @reg("PolylineTo", "ppu")
+    def _polylineto(c, h, a, n):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        pts = _rd_points(M_, a, n)
+        if pts:
+            _stroke(dc, [dc.pos] + pts)
+            dc.pos = pts[-1]
+        return 1
+
+    @reg("PolyPolyline", "pppu")
+    def _polypolyline(c, h, a, counts, n):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        off = 0
+        for i in range(n):
+            cnt = M_.read32(counts + 4 * i)
+            _stroke(dc, _rd_points(M_, a + 8 * off, cnt))
+            off += cnt
+        return 1
+
+    @reg("PolyBezier", "ppu")
+    def _pbez(c, h, a, n):
+        dc = DC(h)
+        if dc is None or n < 4:
+            return 0
+        _stroke(dc, _bezier(_rd_points(M_, a, n)))
+        return 1
+
+    @reg("PolyBezierTo", "ppu")
+    def _pbezto(c, h, a, n):
+        dc = DC(h)
+        if dc is None or n < 3:
+            return 0
+        pts = [dc.pos] + _rd_points(M_, a, n)
+        _stroke(dc, _bezier(pts))
+        dc.pos = pts[-1]
+        return 1
+
+    @reg("PolyDraw", "pppi")
+    def _polydraw(c, h, a, types, n):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        pts = _rd_points(M_, a, n)
+        tps = M_.read(types, n)
+        i = 0
+        start = dc.pos
+        while i < n:
+            t = tps[i] & ~1
+            if t == 6:                                  # PT_MOVETO
+                dc.pos = start = pts[i]
+                i += 1
+            elif t == 2:                                # PT_LINETO
+                _stroke(dc, [dc.pos, pts[i]])
+                dc.pos = pts[i]
+                if tps[i] & 1:
+                    _stroke(dc, [dc.pos, start])
+                    dc.pos = start
+                i += 1
+            elif t == 4 and i + 2 < n:                  # PT_BEZIERTO
+                _stroke(dc, _bezier([dc.pos] + pts[i:i + 3]))
+                dc.pos = pts[i + 2]
+                i += 3
+            else:
+                i += 1
+        return 1
+
+    def _shape(dc, spans_dev, outline_runs=None, outline_pts=None, closed=True):
+        """Fill device-space spans with the brush, then stroke the pen."""
+        t = gdi.begin(dc)
+        surf, ox, oy, clip, bm = t
+        br = dc.brush_obj()
+        if spans_dev and br.style != 1:
+            sp = {y + oy: ([(a + ox, b + ox) for (a, b) in (v if isinstance(v, list) else [v])])
+                  for y, v in spans_dev.items()}
+            _fill_spans(dc, surf, clip, sp, br, dc.rop2, ox, oy)
+        pen = dc.pen_obj()
+        if pen.style != 5:
+            if outline_runs is not None:
+                pix = dc.pix(dc.pen_color(pen))
+                for (y, a, b) in outline_runs:
+                    _span(surf, clip, y + oy, a + ox, b + ox, pix, dc.rop2)
+            elif outline_pts:
+                _pen_stroke(dc, surf, clip, [(x + ox, y + oy) for (x, y) in outline_pts],
+                            pen, closed)
+        gdi.end(dc, t)
+
+    def _pen_w(dc):
+        pen = dc.pen_obj()
+        return 0 if pen.style == 5 else pen.width
+
+    @reg("Rectangle", "piiii")
+    def _rectangle(c, h, l, t, r, b):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        if dc.path is not None:
+            _path_add(dc, [(l, t), (r, t), (r, b), (l, b), (l, t)], True)
+            return 1
+        L, T, Rr, B = dc.rect(l, t, r, b)
+        pw = _pen_w(dc)
+        pen = dc.pen_obj()
+        if pw == 0:
+            spans = {y: (L, Rr - 1) for y in range(T, B - 1)}
+            _shape(dc, spans)
+            return 1
+        if pen.style == 6 or pw == 1:
+            inner = {y: (L + pw, Rr - pw) for y in range(T + pw, B - pw)}
+            runs = []
+            for y in range(T, B):
+                if y < T + pw or y >= B - pw:
+                    runs.append((y, L, Rr))
+                else:
+                    runs.append((y, L, L + pw))
+                    runs.append((y, Rr - pw, Rr))
+            if pen.style in (1, 2, 3, 4):
+                _shape(dc, inner, None, [(L, T), (Rr - 1, T), (Rr - 1, B - 1), (L, B - 1)])
+            else:
+                _shape(dc, inner, runs)
+            return 1
+        h0 = pw // 2
+        L2, T2, R2, B2 = L - h0, T - h0, Rr - 1 + (pw - h0), B - 1 + (pw - h0)
+        inner = {y: (L2 + pw, R2 - pw) for y in range(T2 + pw, B2 - pw)}
+        runs = []
+        for y in range(T2, B2):
+            if y < T2 + pw or y >= B2 - pw:
+                runs.append((y, L2, R2))
+            else:
+                runs.append((y, L2, L2 + pw))
+                runs.append((y, R2 - pw, R2))
+        _shape(dc, inner, runs)
+        return 1
+
+    @reg("RoundRect", "piiiiii")
+    def _roundrect(c, h, l, t, r, b, ew, eh):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        L, T, Rr, B = dc.rect(l, t, r, b)
+        ew, eh = dc.ldist(ew, 0), dc.ldist(eh, 1)
+        spans = _roundrect_spans(L, T, Rr, B, ew, eh)
+        pw = _pen_w(dc)
+        runs = []
+        if pw:
+            cur = spans
+            for i in range(pw):
+                runs += _outline_spans(cur)
+                cur = _roundrect_spans(L + i + 1, T + i + 1, Rr - i - 1, B - i - 1,
+                                       max(0, ew - 2 * (i + 1)), max(0, eh - 2 * (i + 1)))
+            inner = cur
+        else:
+            inner = spans
+        _shape(dc, inner, runs)
+        return 1
+
+    @reg("Ellipse", "piiii")
+    def _ellipse(c, h, l, t, r, b):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        L, T, Rr, B = dc.rect(l, t, r, b)
+        if dc.path is not None:
+            _path_add(dc, [(x, y) for (x, y) in _ellipse_outline(l, t, r, b)], True)
+            return 1
+        pw = _pen_w(dc)
+        spans = _ellipse_spans(L, T, Rr, B)
+        runs = []
+        inner = spans
+        if pw:
+            cur = spans
+            for i in range(pw):
+                runs += _outline_spans(cur)
+                cur = _ellipse_spans(L + i + 1, T + i + 1, Rr - i - 1, B - i - 1)
+            inner = cur
+        _shape(dc, inner, runs)
+        return 1
+
+    def _arc_common(h, l, t, r, b, xs, ys, xe, ye, mode):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        L, T, Rr, B = dc.rect(l, t, r, b)
+        Xs, Ys = dc.lp2dp(xs, ys)
+        Xe, Ye = dc.lp2dp(xe, ye)
+        ccw = dc.arc_dir == 1
+        pts = _arc_points(L, T, Rr, B, Xs, Ys, Xe, Ye, ccw)
+        if mode == "arc":
+            _shape(dc, None, None, pts, closed=False)
+        elif mode == "chord":
+            spans = _poly_spans(pts, True)
+            _shape(dc, spans, None, pts, closed=True)
+        else:                                            # pie
+            cx, cy = (L + Rr) // 2, (T + B) // 2
+            poly = [(cx, cy)] + pts
+            spans = _poly_spans(poly, True)
+            _shape(dc, spans, None, poly, closed=True)
+        return pts
+
+    @reg("Arc", "piiiiiiii")
+    def _arc(c, h, l, t, r, b, xs, ys, xe, ye):
+        return 1 if _arc_common(h, l, t, r, b, xs, ys, xe, ye, "arc") else 0
+
+    @reg("ArcTo", "piiiiiiii")
+    def _arcto(c, h, l, t, r, b, xs, ys, xe, ye):
+        dc = DC(h)
+        pts = _arc_common(h, l, t, r, b, xs, ys, xe, ye, "arc")
+        if pts and dc is not None:
+            _stroke(dc, [dc.pos, dc.dp2lp(*pts[0])])
+            dc.pos = dc.dp2lp(*pts[-1])
+        return 1 if pts else 0
+
+    @reg("Chord", "piiiiiiii")
+    def _chord(c, h, l, t, r, b, xs, ys, xe, ye):
+        return 1 if _arc_common(h, l, t, r, b, xs, ys, xe, ye, "chord") else 0
+
+    @reg("Pie", "piiiiiiii")
+    def _pie(c, h, l, t, r, b, xs, ys, xe, ye):
+        return 1 if _arc_common(h, l, t, r, b, xs, ys, xe, ye, "pie") else 0
+
+    @reg("AngleArc", "piiuff")
+    def _anglearc(c, h, x, y, rad, a0, sweep):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        n = max(8, int(abs(sweep) / 5))
+        pts = [(int(round(x + rad * math.cos(math.radians(a0 + sweep * i / n)))),
+                int(round(y - rad * math.sin(math.radians(a0 + sweep * i / n)))))
+               for i in range(n + 1)]
+        _stroke(dc, [dc.pos] + pts)
+        dc.pos = pts[-1]
+        return 1
+
+    def _polygon(dc, polys):
+        if dc.path is not None:
+            for pts in polys:
+                _path_add(dc, pts + [pts[0]], True)
+            return
+        dev = [[dc.lp2dp(x, y) for (x, y) in pts] for pts in polys]
+        alt = dc.poly_fill == 1
+        flat = []
+        spans = {}
+        if len(dev) == 1:
+            spans = _poly_spans(dev[0], alt)
+        else:
+            # union edge set for PolyPolygon
+            edges_pts = []
+            for pts in dev:
+                edges_pts.append(pts)
+            spans = _polypoly_spans(edges_pts, alt)
+        t = gdi.begin(dc)
+        surf, ox, oy, clip, bm = t
+        br = dc.brush_obj()
+        if br.style != 1:
+            sp = {y + oy: [(a + ox, b + ox) for (a, b) in v] for y, v in spans.items()}
+            _fill_spans(dc, surf, clip, sp, br, dc.rop2, ox, oy)
+        pen = dc.pen_obj()
+        for pts in dev:
+            _pen_stroke(dc, surf, clip, [(x + ox, y + oy) for (x, y) in pts], pen, True)
+        gdi.end(dc, t)
+
+    @reg("Polygon", "ppi")
+    def _polygon_api(c, h, a, n):
+        dc = DC(h)
+        if dc is None or n < 2:
+            return 0
+        _polygon(dc, [_rd_points(M_, a, n)])
+        return 1
+
+    @reg("PolyPolygon", "pppi")
+    def _polypolygon(c, h, a, counts, n):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        polys = []
+        off = 0
+        for i in range(n):
+            cnt = _s32(M_.read32(counts + 4 * i))
+            polys.append(_rd_points(M_, a + 8 * off, cnt))
+            off += cnt
+        _polygon(dc, polys)
+        return 1
+
+    @reg("PatBlt", "piiiiu")
+    def _patblt(c, h, x, y, w, hh, rop):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        return 1 if _blit(dc, x, y, w, hh, None, 0, 0, rop) else 0
+
+    @reg("BitBlt", "piiiipiiu")
+    def _bitblt(c, hd, x, y, w, h, hs, sx, sy, rop):
+        dc = DC(hd)
+        if dc is None:
+            return 0
+        sdc = DC(hs) if hs else None
+        return 1 if _blit(dc, x, y, w, h, sdc, sx, sy, rop & 0xFFFFFF) else 0
+
+    @reg("StretchBlt", "piiiipiiiiu")
+    def _stretchblt(c, hd, x, y, w, h, hs, sx, sy, sw, sh, rop):
+        dc = DC(hd)
+        if dc is None:
+            return 0
+        sdc = DC(hs) if hs else None
+        return 1 if _blit(dc, x, y, w, h, sdc, sx, sy, rop & 0xFFFFFF, sw, sh) else 0
+
+    @reg("MaskBlt", "piiiipiipiiu")
+    def _maskblt(c, hd, x, y, w, h, hs, sx, sy, hmask, mx, my, rop):
+        dc = DC(hd)
+        if dc is None:
+            return 0
+        sdc = DC(hs) if hs else None
+        fore = rop & 0xFFFFFF
+        if not hmask:
+            return 1 if _blit(dc, x, y, w, h, sdc, sx, sy, fore) else 0
+        mb = gdi.get(hmask, "bitmap")
+        back = ((rop >> 8) & 0xFF0000) | 0x0000AA29 if False else ((rop >> 24) & 0xFF) << 16
+        if mb is None:
+            return 0
+        # per-pixel: mask bit 1 -> foreground rop, 0 -> background rop
+        tmp = gdi.new_dc("mem")
+        fg_bm = _GBitmap(w, h)
+        bg_bm = _GBitmap(w, h)
+        for bm_, r in ((fg_bm, fore), (bg_bm, back | 0x0000)):
+            tmp.bitmap_h = gdi.add(bm_)
+            tmp.changed()
+            _blit(tmp, 0, 0, w, h, dc, x, y, 0xCC0020)
+            tmp.brush = dc.brush
+            tmp.text_color, tmp.bk_color = dc.text_color, dc.bk_color
+            _blit(tmp, 0, 0, w, h, sdc, sx, sy, r)
+        surf, ox, oy, clip, bm = t = gdi.begin(dc)
+        X, Y = dc.lp2dp(x, y)
+        for j in range(h):
+            for i in range(w):
+                mv = mb.surf.get(mx + i, my + j)
+                src = fg_bm if (mv & 0xFFFFFF) else bg_bm
+                o = (j * w + i) * 4
+                _plot(surf, clip, X + ox + i, Y + oy + j, bytes(src.surf.px[o:o + 4]))
+        gdi.end(dc, t)
+        for bm_ in (fg_bm, bg_bm):
+            gdi.objs.pop(bm_.h, None)
+        gdi.objs.pop(tmp.h, None)
+        return 1
+
+    @reg("PlgBlt", "pppiiiipii")
+    def _plgblt(c, *a):
+        return 0
+
+    @reg("TransparentBlt GdiTransparentBlt", "piiiipiiiiu", dlls=MSI)
+    def _tblt(c, hd, x, y, w, h, hs, sx, sy, sw, sh, key):
+        dc, sdc = DC(hd), DC(hs)
+        if dc is None or sdc is None:
+            return 0
+        return 1 if _transparent_blt(dc, x, y, w, h, sdc, sx, sy, sw, sh, key) else 0
+
+    @reg("AlphaBlend GdiAlphaBlend", "piiiipiiiiu", dlls=MSI)
+    def _ablend(c, hd, x, y, w, h, hs, sx, sy, sw, sh, bf):
+        dc, sdc = DC(hd), DC(hs)
+        if dc is None or sdc is None:
+            return 0
+        blend = (bf & 255, (bf >> 8) & 255, (bf >> 16) & 255, (bf >> 24) & 255)
+        return 1 if _alpha_blend(dc, x, y, w, h, sdc, sx, sy, sw, sh, blend) else 0
+
+    @reg("GradientFill GdiGradientFill", "ppupuu", dlls=MSI)
+    def _gfill(c, hd, verts, nv, mesh, nm, mode):
+        dc = DC(hd)
+        if dc is None:
+            return 0
+        vs = []
+        for i in range(nv):
+            x, y, r, g, b, a = struct.unpack("<iiHHHH", M_.read(verts + 16 * i, 16))
+            vs.append((x, y, r, g, b))
+        if mode in (0, 1):
+            for i in range(nm):
+                ul, lr = struct.unpack("<II", M_.read(mesh + 8 * i, 8))
+                if ul < nv and lr < nv:
+                    _gradient_rect(dc, vs[ul], vs[lr], mode == 1)
+        else:                                           # triangles: flat average color
+            for i in range(nm):
+                a_, b_, c_ = struct.unpack("<III", M_.read(mesh + 12 * i, 12))
+                if max(a_, b_, c_) >= nv:
+                    continue
+                pts = [vs[a_][:2], vs[b_][:2], vs[c_][:2]]
+                col = _rgb(*[sum(v[j] for v in (vs[a_], vs[b_], vs[c_])) // 3 >> 8
+                             for j in (2, 3, 4)])
+                old = dc.brush
+                tmpb = _GBrush(0, col)
+                gdi.add(tmpb)
+                dc.brush = tmpb.h
+                oldp = dc.pen
+                dc.pen = gdi.stock[8].h
+                _polygon(dc, [pts])
+                dc.brush, dc.pen = old, oldp
+                gdi.objs.pop(tmpb.h, None)
+        return 1
+
+    @reg("FloodFill", "piiu")
+    def _ffill(c, h, x, y, color):
+        dc = DC(h)
+        return 1 if dc and _flood_fill(dc, x, y, color, 0) else 0
+
+    @reg("ExtFloodFill", "piiuu")
+    def _effill(c, h, x, y, color, t):
+        dc = DC(h)
+        return 1 if dc and _flood_fill(dc, x, y, color, t) else 0
+
+    # ---- text ---------------------------------------------------------------------------
+    def _textout_api(c, h, x, y, s, n, wide):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        text = _gstr(M_, s, n, wide)
+        if dc.path is not None:
+            return 1
+        _text_out(dc, x, y, text)
+        return 1
+
+    @reg("TextOutA", "piipi")
+    def _toa(c, h, x, y, s, n):
+        return _textout_api(c, h, x, y, s, n, False)
+
+    @reg("TextOutW", "piipi")
+    def _tow(c, h, x, y, s, n):
+        return _textout_api(c, h, x, y, s, n, True)
+
+    def _ext_textout(c, h, x, y, opts, rect, s, n, dx, wide):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        if opts & 0x10:                                   # ETO_GLYPH_INDEX
+            text = "?" * n
+        else:
+            text = _gstr(M_, s, n, wide) if s and n else ""
+        r = _rd_rect(M_, rect) if rect else None
+        dxs = None
+        if dx and text:
+            step = 2 if opts & 0x2000 else 1             # ETO_PDY
+            raw = M_.read(dx, 4 * len(text) * step)
+            dxs = [_s32(struct.unpack_from("<I", raw, 4 * i * step)[0]) for i in range(len(text))]
+        if not text:
+            if r is not None and opts & 2:
+                surf, ox, oy, clip, bm = t = gdi.begin(dc)
+                L, T, Rr, B = dc.rect(*r)
+                _fill(surf, clip, L + ox, T + oy, Rr + ox, B + oy, dc.pix(dc.bk_color))
+                gdi.end(dc, t)
+            return 1
+        _text_out(dc, x, y, text, opts, r, dxs)
+        return 1
+
+    @reg("ExtTextOutA", "piiuppup")
+    def _etoa(c, h, x, y, o, r, s, n, dx):
+        return _ext_textout(c, h, x, y, o, r, s, n, dx, False)
+
+    @reg("ExtTextOutW", "piiuppup")
+    def _etow(c, h, x, y, o, r, s, n, dx):
+        return _ext_textout(c, h, x, y, o, r, s, n, dx, True)
+
+    @reg("PolyTextOutA", "ppi")
+    def _ptoa(c, h, a, n):
+        return 1
+
+    @reg("PolyTextOutW", "ppi")
+    def _ptow(c, h, a, n):
+        return 1
+
+    def _extent(dc, text):
+        f = dc.gfont()
+        return sum(f.advance(ch) + dc.char_extra for ch in text), f.height
+
+    def _gtep(c, h, s, n, size, wide):
+        dc = DC(h)
+        if dc is None or not size:
+            return 0
+        w, hh = _extent(dc, _gstr(M_, s, n, wide) if n else "")
+        M_.write(size, struct.pack("<ii", w, hh))
+        return 1
+
+    @reg("GetTextExtentPoint32A GetTextExtentPointA", "ppip")
+    def _gtepa(c, h, s, n, size):
+        return _gtep(c, h, s, n, size, False)
+
+    @reg("GetTextExtentPoint32W GetTextExtentPointW", "ppip")
+    def _gtepw(c, h, s, n, size):
+        return _gtep(c, h, s, n, size, True)
+
+    def _gtexp(c, h, s, n, maxext, fit, dx, size, wide):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        text = _gstr(M_, s, n, wide) if n else ""
+        f = dc.gfont()
+        acc = 0
+        nfit = 0
+        for i, ch in enumerate(text):
+            acc += f.advance(ch) + dc.char_extra
+            if dx:
+                M_.write32(dx + 4 * i, acc)
+            if acc <= maxext or maxext < 0:
+                nfit = i + 1
+        if fit:
+            M_.write32(fit, nfit if maxext >= 0 else len(text))
+        if size:
+            M_.write(size, struct.pack("<ii", acc, f.height))
+        return 1
+
+    @reg("GetTextExtentExPointA", "ppiippp")
+    def _gtexpa(c, h, s, n, mx, fit, dx, size):
+        return _gtexp(c, h, s, n, mx, fit, dx, size, False)
+
+    @reg("GetTextExtentExPointW", "ppiippp")
+    def _gtexpw(c, h, s, n, mx, fit, dx, size):
+        return _gtexp(c, h, s, n, mx, fit, dx, size, True)
+
+    @reg("GetTextExtentExPointI", "ppiippp")
+    def _gtexpi(c, h, s, n, mx, fit, dx, size):
+        return _gtexp(c, h, s, n, mx, fit, dx, size, True)
+
+    @reg("GetTextExtentPointI", "ppip")
+    def _gtepi(c, h, s, n, size):
+        return _gtep(c, h, s, n, size, True)
+
+    @reg("GetTextMetricsA", "pp")
+    def _gtma(c, h, buf):
+        dc = DC(h)
+        if dc is None or not buf:
+            return 0
+        M_.write(buf, _textmetric(dc.gfont(), dc.font_obj(), False))
+        return 1
+
+    @reg("GetTextMetricsW", "pp")
+    def _gtmw(c, h, buf):
+        dc = DC(h)
+        if dc is None or not buf:
+            return 0
+        M_.write(buf, _textmetric(dc.gfont(), dc.font_obj(), True))
+        return 1
+
+    def _char_widths(c, h, first, last, buf, abc=False, flt=False):
+        dc = DC(h)
+        if dc is None or not buf:
+            return 0
+        f = dc.gfont()
+        for i, code in enumerate(range(first, last + 1)):
+            w = f.advance(chr(code))
+            if abc:
+                M_.write(buf + 12 * i, struct.pack("<iIi", 0, w, 0))
+            elif flt:
+                M_.write(buf + 4 * i, struct.pack("<f", float(w)))
+            else:
+                M_.write32(buf + 4 * i, w)
+        return 1
+
+    @reg("GetCharWidthA GetCharWidthW GetCharWidth32A GetCharWidth32W", "puup")
+    def _gcw(c, h, a, b, buf):
+        return _char_widths(c, h, a, b, buf)
+
+    @reg("GetCharWidthFloatA GetCharWidthFloatW", "puup")
+    def _gcwf(c, h, a, b, buf):
+        return _char_widths(c, h, a, b, buf, flt=True)
+
+    @reg("GetCharABCWidthsA GetCharABCWidthsW", "puup")
+    def _gcabc(c, h, a, b, buf):
+        return _char_widths(c, h, a, b, buf, abc=True)
+
+    @reg("GetCharABCWidthsFloatA GetCharABCWidthsFloatW", "puup")
+    def _gcabcf(c, h, a, b, buf):
+        dc = DC(h)
+        if dc is None or not buf:
+            return 0
+        f = dc.gfont()
+        for i, code in enumerate(range(a, b + 1)):
+            M_.write(buf + 12 * i, struct.pack("<fff", 0.0, float(f.advance(chr(code))), 0.0))
+        return 1
+
+    @reg("GetCharWidthI", "puppp")
+    def _gcwi(c, h, first, n, idx, buf):
+        dc = DC(h)
+        if dc is None or not buf:
+            return 0
+        f = dc.gfont()
+        for i in range(n):
+            M_.write32(buf + 4 * i, f.advance(" "))
+        return 1
+
+    @reg("GetGlyphIndicesA GetGlyphIndicesW", "ppipu")
+    def _ggi(c, h, s, n, out, fl):
+        for i in range(max(0, n)):
+            M_.write16(out + 2 * i, M_.read16(s + 2 * i) if True else 0)
+        return n
+
+    def _gtf(c, h, n, buf, wide):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        face = dc.font_obj().face
+        if not buf:
+            return len(face) + 1
+        return k.put(buf, n, face, wide) + 1 if n > len(face) else k.put(buf, n, face, wide)
+
+    @reg("GetTextFaceA", "pip")
+    def _gtfa(c, h, n, buf):
+        return _gtf(c, h, n, buf, False)
+
+    @reg("GetTextFaceW", "pip")
+    def _gtfw(c, h, n, buf):
+        return _gtf(c, h, n, buf, True)
+
+    @reg("GetTextCharset", "p")
+    def _gtcs(c, h):
+        return 0
+
+    @reg("GetTextCharsetInfo", "ppu")
+    def _gtcsi(c, h, sig, f):
+        if sig:
+            M_.write(sig, bytes(24))
+        return 0
+
+    @reg("GetFontLanguageInfo", "p")
+    def _gfli(c, h):
+        return 0
+
+    @reg("GetFontData", "puupu")
+    def _gfd(c, h, table, off, buf, n):
+        return _GDI_ERROR
+
+    @reg("GetOutlineTextMetricsA GetOutlineTextMetricsW", "pup")
+    def _gotm(c, h, n, buf):
+        return 0
+
+    @reg("GetGlyphOutlineA GetGlyphOutlineW GetGlyphOutline", "puupupp")
+    def _ggo(c, h, ch, fmt, gm, n, buf, mat):
+        dc = DC(h)
+        if dc is None:
+            return _GDI_ERROR
+        f = dc.gfont()
+        if gm:
+            w = f.advance(chr(ch & 0xFFFF))
+            M_.write(gm, struct.pack("<IIiihh", max(1, w), f.height, 0, f.ascent, w, 0))
+        return 0
+
+    @reg("GetKerningPairsA GetKerningPairsW", "pup")
+    def _gkp(c, h, n, buf):
+        return 0
+
+    @reg("GetCharacterPlacementA GetCharacterPlacementW", "ppiipu")
+    def _gcpl(c, h, s, n, mx, res, fl):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        w, hh = _extent(dc, "x" * max(0, n))
+        return (hh << 16) | (w & 0xFFFF)
+
+    @reg("GetFontUnicodeRanges", "pp")
+    def _gfur(c, h, buf):
+        size = 16 + 4 * 2
+        if buf:
+            M_.write(buf, struct.pack("<IIIIHH HH", size, 0, 224, 2, 32, 95, 160, 96)
+                     if False else struct.pack("<IIII", size, 0, 191, 2) +
+                     struct.pack("<HH", 32, 95) + struct.pack("<HH", 160, 96))
+        return size
+
+    @reg("AddFontResourceA AddFontResourceW", "p")
+    def _afr(c, a):
+        return 1
+
+    @reg("AddFontResourceExA AddFontResourceExW", "pup")
+    def _afrex(c, a, fl, r):
+        return 1
+
+    @reg("RemoveFontResourceA RemoveFontResourceW", "p")
+    def _rfr(c, a):
+        return 1
+
+    @reg("RemoveFontResourceExA RemoveFontResourceExW", "pup")
+    def _rfrex(c, a, fl, r):
+        return 1
+
+    @reg("AddFontMemResourceEx", "pupp")
+    def _afmr(c, a, n, r, num):
+        if num:
+            M_.write32(num, 1)
+        return gdi.add(_GMisc("fontmem"))
+
+    @reg("RemoveFontMemResourceEx", "p")
+    def _rfmr(c, h):
+        return 1
+
+    # EnumFontFamilies(Ex) / EnumFonts: advertise the classic Windows faces
+    _FACES = [("MS Sans Serif", False), ("MS Shell Dlg", False), ("MS Shell Dlg 2", False),
+              ("Tahoma", False), ("Arial", False), ("Microsoft Sans Serif", False),
+              ("Segoe UI", False), ("Verdana", False), ("Times New Roman", False),
+              ("Courier New", True), ("Courier", True), ("Lucida Console", True),
+              ("Consolas", True), ("Fixedsys", True), ("Terminal", True), ("System", False)]
+
+    def _enum_fonts(c, h, face_filter, proc, lparam, wide, ex):
+        ps = 8 if p.cpu_mode == 64 else 4
+        lf_size = 92 if wide else 60
+        elf_size = lf_size + (64 * 2 + 32 * 2 if wide else 64 + 32)
+        buf = p.heap_alloc(p.process_heap_handle, elf_size + 128)
+        tm = p.heap_alloc(p.process_heap_handle, 128)
+        last = 1
+        try:
+            for face, fixed in _FACES:
+                if face_filter and face_filter.lower() != face.lower():
+                    continue
+                fo = _GFontObj(-13, pitch=1 if fixed else 2, face=face)
+                lf = fo.lf
+                lf[0] = -13
+                M_.write(buf, bytes(elf_size + 128))
+                _write_logfont(M_, buf, lf, wide)
+                full = face.encode("utf-16-le") if wide else face.encode()
+                M_.write(buf + lf_size, full + (b"\0\0" if wide else b"\0"))
+                M_.write(tm, _textmetric(fo.realize(), fo, wide) + bytes(24))
+                ftype = 4                               # TRUETYPE_FONTTYPE
+                last = p.call_guest(proc, [buf, tm, ftype, lparam])
+                last = _s32(last & 0xFFFFFFFF)
+                if last == 0:
+                    break
+        finally:
+            p.heap_free(p.process_heap_handle, buf)
+            p.heap_free(p.process_heap_handle, tm)
+        return last
+
+    @reg("EnumFontFamiliesExA", "ppppu")
+    def _effexa(c, h, lf, proc, lp_, fl):
+        face = M_.read(lf + 28, 32).split(b"\0", 1)[0].decode("cp1252", "replace") if lf else ""
+        return _enum_fonts(c, h, face, proc, lp_, False, True)
+
+    @reg("EnumFontFamiliesExW", "ppppu")
+    def _effexw(c, h, lf, proc, lp_, fl):
+        face = M_.read(lf + 28, 64).decode("utf-16-le", "replace").split("\0", 1)[0] if lf else ""
+        return _enum_fonts(c, h, face, proc, lp_, True, True)
+
+    @reg("EnumFontFamiliesA EnumFontsA", "pppp")
+    def _effa(c, h, face, proc, lp_):
+        return _enum_fonts(c, h, _gstr(M_, face, -1, False) if face else "", proc, lp_, False,
+                           False)
+
+    @reg("EnumFontFamiliesW EnumFontsW", "pppp")
+    def _effw(c, h, face, proc, lp_):
+        return _enum_fonts(c, h, _gstr(M_, face, -1, True) if face else "", proc, lp_, True,
+                           False)
+
+    # ---- DIBs -------------------------------------------------------------------------------
+    def _src_bitmap_rows(bm):
+        if bm.dib is not None:
+            _dib_pull(M_, bm)
+        return bm.surf
+
+    @reg("GetDIBits", "ppuuppu")
+    def _getdibits(c, h, hbm, start, lines, bits, bmi, usage):
+        bm = gdi.get(hbm, "bitmap")
+        if bm is None or not bmi:
+            return 0
+        s = _src_bitmap_rows(bm)
+        w, hh = s.w, s.h
+        size = M_.read32(bmi)
+        bpp = M_.read16(bmi + 14)
+        if bpp == 0 or not bits:
+            # fill in the header only
+            nbpp = bpp or (1 if bm.bpp == 1 else (bm.dib.bpp if bm.dib else 32))
+            M_.write32(bmi + 4, w)
+            M_.write32(bmi + 8, hh)
+            M_.write16(bmi + 12, 1)
+            M_.write16(bmi + 14, nbpp)
+            M_.write32(bmi + 16, 3 if nbpp in (16, 32) and bm.dib and bm.dib.masks and
+                       bm.dib.masks not in ((0xFF0000, 0xFF00, 0xFF), (0x7C00, 0x3E0, 0x1F))
+                       else 0)
+            M_.write32(bmi + 20, ((w * nbpp + 31) // 32) * 4 * hh)
+            if size >= 40:
+                M_.write(bmi + 24, bytes(16))
+            if nbpp <= 8 and bpp:
+                pass
+            return hh if not bits else 0
+        ww, h2, bpp2, top, colors, masks, comp, hsz = _read_bmi(M_, bmi, usage)
+        if bpp2 <= 8:
+            ncol = 1 << bpp2
+            if bm.dib is not None and bm.dib.colors:
+                colors = list(bm.dib.colors[:ncol])
+            elif bpp2 == 1:
+                colors = [b"\0\0\0\0", b"\xff\xff\xff\0"]
+            else:
+                base = [_cr_pix(v) for v in _SYS_PAL16]
+                colors = (base + [bytes(((i * 37) & 255, (i * 91) & 255, (i * 53) & 255, 0))
+                                  for i in range(240)])[:ncol]
+            tab = bmi + hsz
+            for i, col in enumerate(colors):
+                M_.write(tab + 4 * i, col[:3] + b"\0")
+        stride = ((ww * bpp2 + 31) // 32) * 4
+        n = 0
+        out = []
+        for i in range(lines):
+            line = start + i
+            if line >= hh:
+                break
+            y = line if top else hh - 1 - line
+            if not 0 <= y < s.h:
+                break
+            row = s.px[y * w * 4:(y + 1) * w * 4]
+            if ww != w:
+                row = (bytes(row) + bytes(max(0, (ww - w) * 4)))[:ww * 4]
+            out.append(bytes(_bgrx_to_row(row, ww, bpp2, colors, masks))[:stride].ljust(stride, b"\0"))
+            n += 1
+        M_.write(bits, b"".join(out))
+        return n
+
+    @reg("SetDIBits", "ppuuppu")
+    def _setdibits(c, h, hbm, start, lines, bits, bmi, usage):
+        bm = gdi.get(hbm, "bitmap")
+        if bm is None or not bits or not bmi:
+            return 0
+        ww, hh, bpp, top, colors, masks, comp, hsz = _read_bmi(M_, bmi, usage)
+        tmp = _Surf(ww, hh)
+        _dib_rows_to_surf(M_, bits, ww, hh, bpp, top, colors, masks, tmp, comp=comp)
+        if bm.dib is not None:
+            _dib_pull(M_, bm)
+        s = bm.surf
+        for i in range(lines):
+            line = start + i
+            y = line if top else hh - 1 - line
+            if not (0 <= y < tmp.h and 0 <= y < s.h):
+                continue
+            n = min(ww, s.w)
+            s.px[y * s.w * 4:(y * s.w + n) * 4] = tmp.px[y * ww * 4:(y * ww + n) * 4]
+        if bm.bpp == 1:
+            _monoize(s)
+        s.rev += 1
+        if bm.dib is not None:
+            _dib_push(M_, bm)
+        return lines
+
+    def _monoize(s):
+        px = s.px
+        for i in range(0, len(px), 4):
+            v = b"\xff\xff\xff\x00" if (px[i] + px[i + 1] + px[i + 2]) >= 384 else bytes(4)
+            px[i:i + 4] = v
+
+    def _dib_to_dc(dc, xd, yd, wd, hd, xs, ys, ws, hs, bits, bmi, usage, rop, start=0,
+                   lines=None):
+        ww, hh, bpp, top, colors, masks, comp, hsz = _read_bmi(M_, bmi, usage)
+        if ww <= 0 or hh <= 0:
+            return 0
+        src = gdi.new_dc("mem")
+        bm = _GBitmap(ww, hh)
+        gdi.add(bm)
+        src.bitmap_h = bm.h
+        bm.dc = src.h
+        try:
+            if lines is None:
+                _dib_rows_to_surf(M_, bits, ww, hh, bpp, top, colors, masks, bm.surf, comp=comp)
+            else:
+                # SetDIBitsToDevice band: `lines` scanlines starting at `start`
+                stride = ((ww * bpp + 31) // 32) * 4
+                band = _Surf(ww, lines)
+                _dib_rows_to_surf(M_, bits, ww, lines, bpp, top, colors, masks, band, comp=comp)
+                for i in range(lines):
+                    y = (hh - 1 - (start + (lines - 1 - i))) if not top else start + i
+                    if 0 <= y < hh:
+                        bm.surf.px[y * ww * 4:(y + 1) * ww * 4] = band.px[i * ww * 4:(i + 1) * ww * 4]
+            # source coordinates are bottom-up for bottom-up DIBs
+            if not top:
+                ys = hh - ys - hs
+            _blit(dc, xd, yd, wd, hd, src, xs, ys, rop, ws, hs)
+        finally:
+            gdi.objs.pop(bm.h, None)
+            gdi.objs.pop(src.h, None)
+        return hs
+
+    @reg("StretchDIBits", "piiiiiiiippuu")
+    def _sdib(c, h, xd, yd, wd, hd, xs, ys, ws, hs, bits, bmi, usage, rop):
+        dc = DC(h)
+        if dc is None or not bits or not bmi:
+            return 0
+        r = _dib_to_dc(dc, xd, yd, wd, hd, xs, ys, ws, hs, bits, bmi, usage, rop & 0xFFFFFF)
+        return abs(_s32(M_.read32(bmi + 8))) if r else 0
+
+    @reg("SetDIBitsToDevice", "piiuuiiuuppu")
+    def _sdibtd(c, h, xd, yd, w, hh, xs, ys, start, lines, bits, bmi, usage):
+        dc = DC(h)
+        if dc is None or not bits or not bmi:
+            return 0
+        _dib_to_dc(dc, xd, yd, w, hh, xs, ys, w, hh, bits, bmi, usage, 0xCC0020, start, lines)
+        return lines
+
+    @reg("GetDIBColorTable", "puup")
+    def _gdct(c, h, start, n, out):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        bm = gdi.get(dc.bitmap_h, "bitmap")
+        if bm is None or bm.dib is None:
+            return 0
+        cols = bm.dib.colors[start:start + n]
+        for i, col in enumerate(cols):
+            M_.write(out + 4 * i, col[:3] + b"\0")
+        return len(cols)
+
+    @reg("SetDIBColorTable", "puup")
+    def _sdct(c, h, start, n, inp):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        bm = gdi.get(dc.bitmap_h, "bitmap")
+        if bm is None or bm.dib is None:
+            return 0
+        cols = bm.dib.colors
+        for i in range(n):
+            if start + i < len(cols):
+                cols[start + i] = bytes(M_.read(inp + 4 * i, 3)) + b"\0"
+        bm.dib.last = None
+        _dib_pull(M_, bm)
+        return n
+
+    @reg("GetBitmapBits", "pip")
+    def _gbb(c, hbm, n, buf):
+        bm = gdi.get(hbm, "bitmap")
+        if bm is None:
+            return 0
+        s = _src_bitmap_rows(bm)
+        if bm.bpp == 1:
+            stride = ((s.w + 15) // 16) * 2
+            out = bytearray()
+            for y in range(s.h):
+                row = bytearray(stride)
+                for x in range(s.w):
+                    if s.px[(y * s.w + x) * 4]:
+                        row[x >> 3] |= 0x80 >> (x & 7)
+                out += row
+        else:
+            out = bytes(s.px)
+        out = bytes(out[:n])
+        if buf:
+            M_.write(buf, out)
+        return len(out)
+
+    @reg("SetBitmapBits", "pup")
+    def _sbb(c, hbm, n, buf):
+        bm = gdi.get(hbm, "bitmap")
+        if bm is None or not buf:
+            return 0
+        s = bm.surf
+        if bm.bpp == 1:
+            stride = ((s.w + 15) // 16) * 2
+            raw = M_.read(buf, min(n, stride * s.h))
+            cols = [b"\0\0\0\0", b"\xff\xff\xff\0"]
+            tb = _pal_tables(cols)
+            for y in range(min(s.h, len(raw) // max(1, stride))):
+                s.px[y * s.w * 4:(y + 1) * s.w * 4] = _row_to_bgrx(
+                    raw[y * stride:(y + 1) * stride], s.w, 1, cols, None, tb)
+        else:
+            raw = M_.read(buf, min(n, len(s.px)))
+            s.px[:len(raw)] = raw
+        s.rev += 1
+        if bm.dib is not None:
+            _dib_push(M_, bm)
+        return n
+
+    @reg("GetBitmapDimensionEx", "pp")
+    def _gbde(c, h, out):
+        bm = gdi.get(h, "bitmap")
+        if bm is None:
+            return 0
+        _write_pt(out, *bm.dim)
+        return 1
+
+    @reg("SetBitmapDimensionEx", "piip")
+    def _sbde(c, h, x, y, old):
+        bm = gdi.get(h, "bitmap")
+        if bm is None:
+            return 0
+        _write_pt(old, *bm.dim)
+        bm.dim = (x, y)
+        return 1
+
+    # ---- regions ---------------------------------------------------------------------------
+    def RGN(h):
+        return gdi.get(h, "region")
+
+    @reg("CreateRectRgn", "iiii")
+    def _crr(c, l, t, r, b):
+        l, r = min(l, r), max(l, r)
+        t, b = min(t, b), max(t, b)
+        return gdi.add(_GRgn([(l, t, r, b)] if l < r and t < b else []))
+
+    @reg("CreateRectRgnIndirect", "p")
+    def _crri(c, a):
+        return _crr(c, *_rd_rect(M_, a))
+
+    @reg("CreateEllipticRgn", "iiii")
+    def _cer(c, l, t, r, b):
+        return gdi.add(_GRgn(_spans_to_rects(_ellipse_spans(min(l, r), min(t, b),
+                                                              max(l, r), max(t, b)))))
+
+    @reg("CreateEllipticRgnIndirect", "p")
+    def _ceri(c, a):
+        return _cer(c, *_rd_rect(M_, a))
+
+    @reg("CreateRoundRectRgn", "iiiiii")
+    def _crrr(c, l, t, r, b, ew, eh):
+        return gdi.add(_GRgn(_spans_to_rects(_roundrect_spans(l, t, r, b, ew, eh))))
+
+    @reg("CreatePolygonRgn", "pii")
+    def _cpr(c, a, n, mode):
+        pts = _rd_points(M_, a, n)
+        return gdi.add(_GRgn(_spans_to_rects(_poly_spans(pts, mode == 1))))
+
+    @reg("CreatePolyPolygonRgn", "ppii")
+    def _cppr(c, a, counts, n, mode):
+        polys = []
+        off = 0
+        for i in range(n):
+            cnt = M_.read32(counts + 4 * i)
+            polys.append(_rd_points(M_, a + 8 * off, cnt))
+            off += cnt
+        return gdi.add(_GRgn(_spans_to_rects(_polypoly_spans(polys, mode == 1))))
+
+    @reg("CombineRgn", "pppi")
+    def _combine(c, hd, h1, h2, mode):
+        d, a = RGN(hd), RGN(h1)
+        if d is None or a is None:
+            return 0
+        b = RGN(h2)
+        if mode != 5 and b is None:
+            return 0
+        d.rects = _rgn_normalize(_rgn_combine(a.rects, b.rects if b else [], mode))
+        return d.complexity()
+
+    @reg("SetRectRgn", "piiii")
+    def _setrr(c, h, l, t, r, b):
+        g = RGN(h)
+        if g is None:
+            return 0
+        g.rects = [(min(l, r), min(t, b), max(l, r), max(t, b))] if l != r and t != b else []
+        return 1
+
+    @reg("OffsetRgn", "pii")
+    def _offrgn(c, h, x, y):
+        g = RGN(h)
+        if g is None:
+            return 0
+        g.rects = [(l + x, t + y, r + x, b + y) for (l, t, r, b) in g.rects]
+        return g.complexity()
+
+    @reg("GetRgnBox", "pp")
+    def _grb(c, h, out):
+        g = RGN(h)
+        if g is None:
+            return 0
+        _wr_rect(M_, out, g.box())
+        return g.complexity()
+
+    @reg("PtInRegion", "pii")
+    def _pir(c, h, x, y):
+        g = RGN(h)
+        return 1 if g and any(l <= x < r and t <= y < b for (l, t, r, b) in g.rects) else 0
+
+    @reg("RectInRegion", "pp")
+    def _rir(c, h, a):
+        g = RGN(h)
+        if g is None:
+            return 0
+        rc = _rd_rect(M_, a)
+        return 1 if _rects_and(g.rects, [rc]) else 0
+
+    @reg("EqualRgn", "pp")
+    def _eqr(c, a, b):
+        x, y = RGN(a), RGN(b)
+        if x is None or y is None:
+            return 0
+        return 1 if not _rgn_combine(x.rects, y.rects, 3) else 0
+
+    @reg("GetRegionData", "pup")
+    def _grd(c, h, n, buf):
+        g = RGN(h)
+        if g is None:
+            return 0
+        size = 32 + 16 * len(g.rects)
+        if not buf or n < size:
+            return size
+        M_.write(buf, struct.pack("<IIII", 32, 1, len(g.rects), 16 * len(g.rects)) +
+                 struct.pack("<iiii", *g.box()))
+        for i, r in enumerate(g.rects):
+            _wr_rect(M_, buf + 32 + 16 * i, r)
+        return size
+
+    @reg("ExtCreateRegion", "pup")
+    def _ecr(c, xf, n, data):
+        if not data:
+            return 0
+        cnt = M_.read32(data + 8)
+        hs = M_.read32(data)
+        rects = [_rd_rect(M_, data + hs + 16 * i) for i in range(cnt)]
+        return gdi.add(_GRgn(_rgn_normalize(rects)))
+
+    def _rgn_fill(dc, g, br):
+        surf, ox, oy, clip, bm = t = gdi.begin(dc)
+        for (l, tt, r, b) in g.rects:
+            L, T, Rr, B = dc.rect(l, tt, r, b)
+            _fill_brush(dc, surf, clip, L + ox, T + oy, Rr + ox, B + oy, br, 13, ox, oy)
+        gdi.end(dc, t)
+
+    @reg("FillRgn", "ppp")
+    def _fillrgn(c, h, hr, hb):
+        dc, g, br = DC(h), RGN(hr), gdi.brush(hb)
+        if dc is None or g is None or br is None:
+            return 0
+        _rgn_fill(dc, g, br)
+        return 1
+
+    @reg("PaintRgn", "pp")
+    def _paintrgn(c, h, hr):
+        dc, g = DC(h), RGN(hr)
+        if dc is None or g is None:
+            return 0
+        _rgn_fill(dc, g, dc.brush_obj())
+        return 1
+
+    @reg("InvertRgn", "pp")
+    def _invrgn(c, h, hr):
+        dc, g = DC(h), RGN(hr)
+        if dc is None or g is None:
+            return 0
+        for (l, t, r, b) in g.rects:
+            _blit(dc, l, t, r - l, b - t, None, 0, 0, 0x550009)
+        return 1
+
+    @reg("FrameRgn", "pppii")
+    def _framergn(c, h, hr, hb, w, hh):
+        dc, g, br = DC(h), RGN(hr), gdi.brush(hb)
+        if dc is None or g is None or br is None:
+            return 0
+        inner = list(g.rects)
+        shrunk = [(l + w, t + hh, r - w, b - hh) for (l, t, r, b) in g.rects]
+        shrunk = [r for r in shrunk if r[0] < r[2] and r[1] < r[3]]
+        # the frame = region minus the region eroded by (w, h) (approximate for unions)
+        eroded = _rects_and(shrunk, shrunk)
+        frame = _rgn_combine(inner, eroded, 4)
+        _rgn_fill(dc, _GRgn(frame), br)
+        return 1
+
+    # ---- clipping -------------------------------------------------------------------------
+    def _dc_clip_dev(dc):
+        """Current clip in device coordinates (None = whole surface)."""
+        if dc.clip is not None:
+            return list(dc.clip)
+        surf, ox, oy, vis, bm = dc.target()
+        return [(l - ox, t - oy, r - ox, b - oy) for (l, t, r, b) in vis] if False else None
+
+    def _full_dev(dc):
+        surf, ox, oy, vis, bm = dc.target()
+        return [(-ox - 100000, -oy - 100000, 100000, 100000)]
+
+    @reg("SelectClipRgn", "pp")
+    def _scr(c, h, hr):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        g = RGN(hr) if hr else None
+        dc.clip = list(g.rects) if g is not None else None
+        dc.changed()
+        return g.complexity() if g else 2
+
+    @reg("ExtSelectClipRgn", "ppi")
+    def _escr(c, h, hr, mode):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        g = RGN(hr) if hr else None
+        if mode == 5:                                     # RGN_COPY
+            dc.clip = list(g.rects) if g is not None else None
+        else:
+            if g is None:
+                return 0
+            cur = dc.clip if dc.clip is not None else _full_dev(dc)
+            dc.clip = _rgn_normalize(_rgn_combine(cur, g.rects, mode))
+        dc.changed()
+        return 1 if not dc.clip else 2 if len(dc.clip) == 1 else 3
+
+    @reg("IntersectClipRect", "piiii")
+    def _icr(c, h, l, t, r, b):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        rc = dc.rect(l, t, r, b)
+        cur = dc.clip if dc.clip is not None else _full_dev(dc)
+        dc.clip = _rects_and(cur, [rc])
+        dc.changed()
+        return 1 if not dc.clip else 2 if len(dc.clip) == 1 else 3
+
+    @reg("ExcludeClipRect", "piiii")
+    def _ecr2(c, h, l, t, r, b):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        rc = dc.rect(l, t, r, b)
+        cur = dc.clip if dc.clip is not None else _full_dev(dc)
+        dc.clip = _rects_sub(cur, rc)
+        dc.changed()
+        return 1 if not dc.clip else 2 if len(dc.clip) == 1 else 3
+
+    @reg("OffsetClipRgn", "pii")
+    def _ocr(c, h, x, y):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        if dc.clip is not None:
+            dc.clip = [(l + x, t + y, r + x, b + y) for (l, t, r, b) in dc.clip]
+            dc.changed()
+        return 2
+
+    @reg("GetClipBox", "pp")
+    def _gcb(c, h, out):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        surf, ox, oy, vis, bm = dc.target()
+        if not vis:
+            _wr_rect(M_, out, (0, 0, 0, 0))
+            return 1
+        l = min(r[0] for r in vis) - ox
+        t = min(r[1] for r in vis) - oy
+        r_ = max(r[2] for r in vis) - ox
+        b = max(r[3] for r in vis) - oy
+        x0, y0 = dc.dp2lp(l, t)
+        x1, y1 = dc.dp2lp(r_, b)
+        _wr_rect(M_, out, (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)))
+        return 2 if len(vis) == 1 else 3
+
+    @reg("GetClipRgn", "pp")
+    def _gcr(c, h, hr):
+        dc, g = DC(h), RGN(hr)
+        if dc is None or g is None:
+            return -1
+        if dc.clip is None:
+            return 0
+        g.rects = list(dc.clip)
+        return 1
+
+    @reg("GetRandomRgn", "ppi")
+    def _grr(c, h, hr, which):
+        dc, g = DC(h), RGN(hr)
+        if dc is None or g is None:
+            return -1
+        surf, ox, oy, vis, bm = dc.target()
+        if which == 4 and dc.hwnd and gdi.wm is not None:     # SYSRGN: screen coords
+            sx, sy = gdi.wm.dc_screen_origin(dc.hwnd, dc.dckind == "client")
+            g.rects = [(l - ox + sx, t - oy + sy, r - ox + sx, b - oy + sy) for (l, t, r, b) in vis]
+        else:
+            g.rects = [(l - ox, t - oy, r - ox, b - oy) for (l, t, r, b) in vis]
+        return 1
+
+    @reg("GetMetaRgn", "pp")
+    def _gmr(c, h, hr):
+        return 0
+
+    @reg("SetMetaRgn", "p")
+    def _smr(c, h):
+        return 2
+
+    @reg("PtVisible", "pii")
+    def _ptv(c, h, x, y):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        surf, ox, oy, vis, bm = dc.target()
+        X, Y = dc.lp2dp(x, y)
+        X += ox
+        Y += oy
+        return 1 if any(l <= X < r and t <= Y < b for (l, t, r, b) in vis) else 0
+
+    @reg("RectVisible", "pp")
+    def _rectv(c, h, a):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        surf, ox, oy, vis, bm = dc.target()
+        L, T, Rr, B = dc.rect(*_rd_rect(M_, a))
+        return 1 if _rects_and(vis, [(L + ox, T + oy, Rr + ox, B + oy)]) else 0
+
+    # ---- paths -----------------------------------------------------------------------------
+    @reg("BeginPath", "p")
+    def _bpath(c, h):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        dc.path = [[dc.pos]]
+        return 1
+
+    @reg("EndPath", "p")
+    def _epath(c, h):
+        dc = DC(h)
+        if dc is None or dc.path is None:
+            return 0
+        dc.path_done = [f for f in dc.path if len(f) > 1]
+        dc.path = None
+        return 1
+
+    @reg("AbortPath", "p")
+    def _apath(c, h):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        dc.path = dc.path_done = None
+        return 1
+
+    @reg("CloseFigure", "p")
+    def _cfig(c, h):
+        dc = DC(h)
+        if dc is None or dc.path is None:
+            return 0
+        if dc.path and dc.path[-1]:
+            fig = dc.path[-1]
+            fig.append(fig[0])
+            dc.path.append([fig[0]])
+        return 1
+
+    def _path_polys(dc):
+        return [[dc.lp2dp(x, y) for (x, y) in f] for f in (dc.path_done or [])]
+
+    def _path_op(h, fill, stroke):
+        dc = DC(h)
+        if dc is None or not dc.path_done:
+            return 0
+        polys = _path_polys(dc)
+        surf, ox, oy, clip, bm = t = gdi.begin(dc)
+        if fill:
+            spans = _polypoly_spans(polys, dc.poly_fill == 1)
+            sp = {y + oy: [(a + ox, b + ox) for (a, b) in v] for y, v in spans.items()}
+            _fill_spans(dc, surf, clip, sp, dc.brush_obj(), dc.rop2, ox, oy)
+        if stroke:
+            for pts in polys:
+                _pen_stroke(dc, surf, clip, [(x + ox, y + oy) for (x, y) in pts], dc.pen_obj())
+        gdi.end(dc, t)
+        dc.path_done = None
+        return 1
+
+    @reg("StrokePath", "p")
+    def _spath(c, h):
+        return _path_op(h, False, True)
+
+    @reg("FillPath", "p")
+    def _fpath(c, h):
+        return _path_op(h, True, False)
+
+    @reg("StrokeAndFillPath", "p")
+    def _sfpath(c, h):
+        return _path_op(h, True, True)
+
+    @reg("FlattenPath WidenPath", "p")
+    def _flpath(c, h):
+        return 1
+
+    @reg("SelectClipPath", "pi")
+    def _scp(c, h, mode):
+        dc = DC(h)
+        if dc is None or not dc.path_done:
+            return 0
+        polys = _path_polys(dc)
+        rects = _spans_to_rects(_polypoly_spans(polys, dc.poly_fill == 1))
+        cur = dc.clip if dc.clip is not None else _full_dev(dc)
+        dc.clip = _rgn_normalize(_rgn_combine(cur, rects, mode) if mode != 5 else rects)
+        dc.path_done = None
+        dc.changed()
+        return 1
+
+    @reg("PathToRegion", "p")
+    def _p2r(c, h):
+        dc = DC(h)
+        if dc is None or not dc.path_done:
+            return 0
+        rects = _spans_to_rects(_polypoly_spans(_path_polys(dc), dc.poly_fill == 1))
+        dc.path_done = None
+        return gdi.add(_GRgn(_rgn_normalize(rects)))
+
+    @reg("GetPath", "pppi")
+    def _gpath(c, h, pts, types, n):
+        dc = DC(h)
+        if dc is None or not dc.path_done:
+            return -1
+        allp = []
+        for f in dc.path_done:
+            for i, pt in enumerate(f):
+                allp.append((pt, 6 if i == 0 else 2))
+        if n == 0:
+            return len(allp)
+        for i, (pt, t) in enumerate(allp[:n]):
+            M_.write(pts + 8 * i, struct.pack("<ii", *pt))
+            M_.write8(types + i, t)
+        return min(n, len(allp))
+
+    # ---- palettes / color ----------------------------------------------------------------
+    @reg("CreatePalette", "p")
+    def _cpal(c, a):
+        n = M_.read16(a + 2)
+        ents = [bytes(M_.read(a + 4 + 4 * i, 4)) for i in range(n)]
+        return gdi.add(_GPalette(ents))
+
+    @reg("CreateHalftonePalette", "p")
+    def _chpal(c, h):
+        ents = [bytes((r, g, b, 0)) for r in range(0, 256, 51) for g in range(0, 256, 51)
+                for b in range(0, 256, 51)]
+        return gdi.add(_GPalette(ents))
+
+    @reg("SelectPalette", "ppi", dlls=("gdi32.dll", "user32.dll"))
+    def _spal(c, h, hp, bg):
+        dc = DC(h)
+        if dc is None:
+            return 0
+        prev, dc.palette = dc.palette, hp
+        return prev
+
+    @reg("RealizePalette", "p", dlls=("gdi32.dll", "user32.dll"))
+    def _rpal(c, h):
+        return 0
+
+    @reg("GetPaletteEntries", "puup")
+    def _gpe(c, hp, start, n, out):
+        pal = gdi.get(hp, "palette")
+        if pal is None:
+            return 0
+        if not out:
+            return len(pal.entries)
+        ents = pal.entries[start:start + n]
+        for i, e in enumerate(ents):
+            M_.write(out + 4 * i, e)
+        return len(ents)
+
+    @reg("SetPaletteEntries", "puup")
+    def _spe(c, hp, start, n, inp):
+        pal = gdi.get(hp, "palette")
+        if pal is None:
+            return 0
+        for i in range(n):
+            e = bytes(M_.read(inp + 4 * i, 4))
+            if start + i < len(pal.entries):
+                pal.entries[start + i] = e
+            else:
+                pal.entries.append(e)
+        return n
+
+    @reg("AnimatePalette", "puup")
+    def _anp(c, hp, start, n, inp):
+        return _spe(c, hp, start, n, inp)
+
+    @reg("ResizePalette", "pu")
+    def _rsp(c, hp, n):
+        pal = gdi.get(hp, "palette")
+        if pal is None:
+            return 0
+        pal.entries = (pal.entries + [b"\0\0\0\0"] * n)[:n]
+        return 1
+
+    @reg("GetNearestPaletteIndex", "pu")
+    def _gnpi(c, hp, color):
+        pal = gdi.get(hp, "palette")
+        if pal is None or not pal.entries:
+            return _CLR_INVALID
+        cols = [bytes((e[2], e[1], e[0], 0)) for e in pal.entries]
+        return _nearest_index(_cr_pix(color), cols)
+
+    @reg("GetSystemPaletteEntries", "puup")
+    def _gspe(c, h, start, n, out):
+        if out:
+            for i in range(n):
+                cr = _SYS_PAL16[(start + i) % 16]
+                M_.write(out + 4 * i, bytes((cr & 255, (cr >> 8) & 255, (cr >> 16) & 255, 0)))
+        return n
+
+    @reg("GetSystemPaletteUse", "p")
+    def _gspu(c, h):
+        return 1
+
+    @reg("SetSystemPaletteUse", "pu")
+    def _sspu(c, h, u):
+        return 1
+
+    @reg("GetNearestColor", "pu")
+    def _gnc(c, h, color):
+        return color & 0xFFFFFF
+
+    @reg("UpdateColors", "p")
+    def _ucol(c, h):
+        return 1
+
+    @reg("GetColorAdjustment SetColorAdjustment", "pp")
+    def _gca(c, h, a):
+        return 1
+
+    @reg("GetDeviceGammaRamp SetDeviceGammaRamp", "pp")
+    def _gamma(c, h, a):
+        if a:
+            for ch in range(3):
+                for i in range(256):
+                    M_.write16(a + ch * 512 + 2 * i, i * 257)
+        return 1
+
+    @reg("SetICMProfileA SetICMProfileW GetICMProfileA GetICMProfileW", "pp")
+    def _icm(c, h, a):
+        return 0
+
+    @reg("ColorMatchToTarget", "ppu")
+    def _cmt(c, a, b, d):
+        return 1
+
+    # ---- misc / printing / metafiles -------------------------------------------------------
+    @reg("StartDocA StartDocW", "pp")
+    def _startdoc(c, h, d):
+        return 0
+
+    @reg("EndDoc StartPage EndPage AbortDoc", "p")
+    def _enddoc(c, h):
+        return 0
+
+    @reg("SetAbortProc", "pp")
+    def _sap(c, h, pr):
+        return 1
+
+    @reg("Escape", "piipp")
+    def _escape(c, h, n, cnt, i, o):
+        return 0
+
+    @reg("ExtEscape", "piipip")
+    def _extescape(c, h, n, cnt, i, co, o):
+        return 0
+
+    @reg("CreateEnhMetaFileA CreateEnhMetaFileW", "pppp")
+    def _cemf(c, h, f, r, d):
+        dc = gdi.new_dc("mem")
+        bm = _GBitmap(1, 1)
+        gdi.add(bm)
+        dc.bitmap_h = bm.h
+        dc.meta = True
+        return dc.h
+
+    @reg("CloseEnhMetaFile", "p")
+    def _clemf(c, h):
+        return gdi.add(_GMisc("enhmetafile"))
+
+    @reg("DeleteEnhMetaFile DeleteMetaFile", "p")
+    def _demf(c, h):
+        gdi.objs.pop(h & 0xFFFFFFFF, None)
+        return 1
+
+    @reg("PlayEnhMetaFile", "ppp")
+    def _pemf(c, h, m, r):
+        return 1
+
+    @reg("GetEnhMetaFileA GetEnhMetaFileW GetMetaFileA GetMetaFileW", "p")
+    def _gemf(c, a):
+        return 0
+
+    @reg("GetEnhMetaFileHeader", "pup")
+    def _gemfh(c, h, n, b):
+        return 0
+
+    @reg("CopyEnhMetaFileA CopyEnhMetaFileW", "pp")
+    def _cpemf(c, h, f):
+        return 0
+
+    @reg("SetEnhMetaFileBits", "up")
+    def _semfb(c, n, d):
+        return gdi.add(_GMisc("enhmetafile"))
+
+    @reg("GetEnhMetaFileBits", "pup")
+    def _gemfb(c, h, n, d):
+        return 0
+
+    @reg("GdiComment", "pup")
+    def _gcomm(c, h, n, d):
+        return 1
+
+    @reg("SetMetaFileBitsEx", "up")
+    def _smfb(c, n, d):
+        return gdi.add(_GMisc("metafile"))
+
+    @reg("CancelDC", "p")
+    def _canceldc(c, h):
+        return 1
+
+    @reg("GetPixelFormat", "p")
+    def _gpf(c, h):
+        return 1
+
+    @reg("GdiSetBatchLimit", "u")
+    def _gsbl(c, n):
+        return 1
+
+    @reg("GetFontResourceInfoW", "pppu")
+    def _gfri(c, a, b, d, e):
+        return 0
+
+    @reg("TranslateCharsetInfo", "ppu")
+    def _tci(c, src, cs, flags):
+        if cs:
+            M_.write(cs, struct.pack("<II", 0, 1252) + bytes(24))
+        return 1
+
+    @reg("GetCharsetInfo", "p")
+    def _gcsi(c, a):
+        return 0
+
+    @reg("D3DKMTOpenAdapterFromHdc D3DKMTCloseAdapter D3DKMTQueryAdapterInfo", "p")
+    def _d3dkmt(c, a):
+        return 0xC00000BB                                 # STATUS_NOT_SUPPORTED
+
+    return gdi
+
+
+def _polypoly_spans(polys, alternate=True):
+    """Scanline fill of several polygons treated as one edge set."""
+    pts_all = [pt for poly in polys for pt in poly]
+    if not pts_all:
+        return {}
+    edges = []
+    for poly in polys:
+        n = len(poly)
+        for i in range(n):
+            (xa, ya), (xb, yb) = poly[i], poly[(i + 1) % n]
+            if ya != yb:
+                edges.append((xa, ya, xb, yb))
+    ys = [p_[1] for p_ in pts_all]
+    out = {}
+    for y in range(min(ys), max(ys)):
+        yc = y + 0.5
+        xs = []
+        for (xa, ya, xb, yb) in edges:
+            if (ya <= yc < yb) or (yb <= yc < ya):
+                xs.append((xa + (yc - ya) * (xb - xa) / (yb - ya), 1 if yb > ya else -1))
+        if not xs:
+            continue
+        xs.sort()
+        spans = []
+        if alternate:
+            for i in range(0, len(xs) - 1, 2):
+                spans.append((int(xs[i][0] + 0.5), int(xs[i + 1][0] + 0.5)))
+        else:
+            wind = 0
+            for i in range(len(xs) - 1):
+                wind += xs[i][1]
+                if wind:
+                    spans.append((int(xs[i][0] + 0.5), int(xs[i + 1][0] + 0.5)))
+        out[y] = spans
+    return out
+
+
+# ==============================================================================
+# 10l. user32: window manager (window tree, message queues, painting, input)
+# ==============================================================================
+#
+# Windows are real objects with a z-ordered tree, per-thread message queues
+# (posted -> input -> paint -> timer priority), update regions, focus /
+# activation / capture, hooks and A<->W message conversion. Every top-level
+# window owns a pixel surface; children draw into their top-level's surface
+# through a clipped DC exactly like the display driver model.
+
+WS_OVERLAPPED, WS_POPUP, WS_CHILD, WS_MINIMIZE = 0, 0x80000000, 0x40000000, 0x20000000
+WS_VISIBLE, WS_DISABLED, WS_CLIPSIBLINGS, WS_CLIPCHILDREN = 0x10000000, 0x08000000, \
+    0x04000000, 0x02000000
+WS_MAXIMIZE, WS_CAPTION, WS_BORDER, WS_DLGFRAME = 0x01000000, 0x00C00000, 0x00800000, 0x00400000
+WS_VSCROLL, WS_HSCROLL, WS_SYSMENU, WS_THICKFRAME = 0x00200000, 0x00100000, 0x00080000, 0x00040000
+WS_GROUP, WS_TABSTOP, WS_MINIMIZEBOX, WS_MAXIMIZEBOX = 0x00020000, 0x00010000, 0x00020000, 0x00010000
+WS_EX_DLGMODALFRAME, WS_EX_TOPMOST, WS_EX_TOOLWINDOW = 0x1, 0x8, 0x80
+WS_EX_WINDOWEDGE, WS_EX_CLIENTEDGE, WS_EX_STATICEDGE = 0x100, 0x200, 0x20000
+WS_EX_CONTROLPARENT, WS_EX_NOPARENTNOTIFY, WS_EX_LAYERED = 0x10000, 0x4, 0x80000
+WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT = 0x40000, 0x08000000, 0x20
+
+WM_NULL, WM_MOVE, WM_ACTIVATE, WM_SETFOCUS, WM_KILLFOCUS = 0, 3, 6, 7, 8
+WM_ENABLE, WM_SETREDRAW, WM_SETTEXT, WM_GETTEXT, WM_GETTEXTLENGTH = 0xA, 0xB, 0xC, 0xD, 0xE
+WM_QUERYENDSESSION, WM_SHOWWINDOW, WM_ACTIVATEAPP, WM_SETCURSOR = 0x11, 0x18, 0x1C, 0x20
+WM_MOUSEACTIVATE, WM_GETMINMAXINFO, WM_WINDOWPOSCHANGING, WM_WINDOWPOSCHANGED = \
+    0x21, 0x24, 0x46, 0x47
+WM_SETFONT, WM_GETFONT, WM_NOTIFY, WM_CONTEXTMENU, WM_STYLECHANGING, WM_STYLECHANGED = \
+    0x30, 0x31, 0x4E, 0x7B, 0x7C, 0x7D
+WM_GETICON, WM_SETICON, WM_NCCREATE, WM_NCDESTROY, WM_NCCALCSIZE, WM_NCHITTEST = \
+    0x7F, 0x80, 0x81, 0x82, 0x83, 0x84
+WM_NCPAINT, WM_NCACTIVATE, WM_GETDLGCODE, WM_NCMOUSEMOVE, WM_NCLBUTTONDOWN = \
+    0x85, 0x86, 0x87, 0xA0, 0xA1
+WM_NCLBUTTONUP, WM_NCLBUTTONDBLCLK, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP = 0xA2, 0xA3, 0xA4, 0xA5
+WM_KEYUP, WM_CHAR, WM_DEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_SYSCHAR = \
+    0x101, 0x102, 0x103, 0x104, 0x105, 0x106
+WM_INITDIALOG, WM_SYSCOMMAND, WM_HSCROLL, WM_VSCROLL = 0x110, 0x112, 0x114, 0x115
+WM_INITMENU, WM_INITMENUPOPUP, WM_MENUSELECT, WM_MENUCHAR, WM_ENTERIDLE = \
+    0x116, 0x117, 0x11F, 0x120, 0x121
+WM_CTLCOLORMSGBOX, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORBTN = 0x132, 0x133, 0x134, 0x135
+WM_CTLCOLORDLG, WM_CTLCOLORSCROLLBAR, WM_CTLCOLORSTATIC = 0x136, 0x137, 0x138
+WM_LBUTTONUP, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_RBUTTONDBLCLK = 0x202, 0x203, 0x205, 0x206
+WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MBUTTONDBLCLK, WM_MOUSEWHEEL, WM_MOUSEHWHEEL = \
+    0x207, 0x208, 0x209, 0x20A, 0x20E
+WM_PARENTNOTIFY, WM_ENTERMENULOOP, WM_EXITMENULOOP, WM_CAPTURECHANGED = 0x210, 0x211, 0x212, 0x215
+WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_MOUSELEAVE, WM_MOUSEHOVER = 0x231, 0x232, 0x2A3, 0x2A1
+WM_CUT, WM_COPY, WM_PASTE, WM_CLEAR, WM_UNDO = 0x300, 0x301, 0x302, 0x303, 0x304
+WM_PRINT, WM_PRINTCLIENT, WM_APP, WM_USER = 0x317, 0x318, 0x8000, 0x400
+WM_DRAWITEM, WM_MEASUREITEM, WM_DELETEITEM, WM_VKEYTOITEM, WM_CHARTOITEM = \
+    0x2B, 0x2C, 0x2D, 0x2E, 0x2F
+WM_COMPAREITEM, WM_CANCELMODE, WM_CHILDACTIVATE, WM_NEXTDLGCTL = 0x39, 0x1F, 0x22, 0x28
+WM_QUERYUISTATE, WM_CHANGEUISTATE, WM_UPDATEUISTATE, WM_HELP, WM_COMMNOTIFY = \
+    0x129, 0x127, 0x128, 0x53, 0x44
+WM_SYNCPAINT, WM_UNICHAR, WM_INPUTLANGCHANGE, WM_NOTIFYFORMAT = 0x88, 0x109, 0x51, 0x55
+WM_SIZING, WM_MOVING, WM_EXITMENULOOP_ = 0x214, 0x216, 0x212
+
+HTERROR, HTTRANSPARENT, HTNOWHERE, HTCLIENT, HTCAPTION, HTSYSMENU = -2, -1, 0, 1, 2, 3
+HTMENU, HTHSCROLL, HTVSCROLL, HTMINBUTTON, HTMAXBUTTON = 5, 6, 7, 8, 9
+HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT = \
+    10, 11, 12, 13, 14, 15, 16, 17
+HTBORDER, HTCLOSE, HTHELP = 18, 20, 21
+
+SC_SIZE, SC_MOVE, SC_MINIMIZE, SC_MAXIMIZE, SC_NEXTWINDOW = 0xF000, 0xF010, 0xF020, 0xF030, 0xF040
+SC_CLOSE, SC_VSCROLL, SC_HSCROLL, SC_MOUSEMENU, SC_KEYMENU = 0xF060, 0xF070, 0xF080, 0xF090, 0xF100
+SC_RESTORE, SC_TASKLIST, SC_CONTEXTHELP = 0xF120, 0xF130, 0xF180
+
+SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER, SWP_NOREDRAW, SWP_NOACTIVATE = 1, 2, 4, 8, 0x10
+SWP_FRAMECHANGED, SWP_SHOWWINDOW, SWP_HIDEWINDOW, SWP_NOCOPYBITS = 0x20, 0x40, 0x80, 0x100
+SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_DEFERERASE, SWP_ASYNCWINDOWPOS = 0x200, 0x400, \
+    0x2000, 0x4000
+
+_M = {
+    "border": 1, "dlgframe": 3, "frame": 4, "caption": 19, "smcaption": 15, "menu": 19,
+    "vscroll": 16, "hscroll": 16, "edge": 2, "size": 18, "smsize": 12,
+}
+
+_DESKTOP_HWND = 0x00010010
+CW_USEDEFAULT = 0x80000000
+
+
+class _WClass:
+    def __init__(self, name, style=0, proc=0, cls_extra=0, wnd_extra=0, inst=0, icon=0,
+                 cursor=0, brush=0, menu=0, icon_sm=0, unicode=True, system=False):
+        self.name = name
+        self.style, self.proc = style, proc
+        self.cls_extra = bytearray(max(0, cls_extra))
+        self.wnd_extra = max(0, wnd_extra)
+        self.inst, self.icon, self.cursor, self.brush = inst, icon, cursor, brush
+        self.menu, self.icon_sm, self.unicode, self.system = menu, icon_sm, unicode, system
+        self.atom = 0
+        self.dc = 0                  # CS_CLASSDC shared DC
+        self.menu_name = ""
+
+
+class _Wnd:
+    def __init__(self, hwnd):
+        self.hwnd = hwnd
+        self.cls = None
+        self.style = self.exstyle = 0
+        self.parent = None           # _Wnd (None only for the desktop)
+        self.owner = 0
+        self.children = []           # z-order: index 0 = topmost
+        self.x = self.y = self.w = self.h = 0      # window rect (parent client coords)
+        self.cl = (0, 0, 0, 0)       # client rect relative to the window origin
+        self.text = ""
+        self.id = 0
+        self.menu = 0                # menu handle (top-level windows)
+        self.proc = 0
+        self.unicode = True
+        self.userdata = 0
+        self.extra = bytearray()
+        self.props = {}
+        self.tid = 0
+        self.inst = 0
+        self.update = []             # client-coord rects needing WM_PAINT
+        self.erase = False
+        self.ncdirty = False
+        self.surf = None             # top-level pixel surface
+        self.scroll = {0: [0, 100, 0, 0, 0, True], 1: [0, 100, 0, 0, 0, True]}
+        self.sbshow = [False, False]
+        self.dead = False
+        self.destroying = False
+        self.py = {}                 # built-in control state
+        self.font = 0
+        self.icon = self.icon_sm = 0
+        self.min_state = 0           # 0 normal, 1 minimized, 2 maximized
+        self.restore = None          # restore rect
+        self.own_dc = 0
+        self.redraw = True
+        self.help_id = 0
+        self.rgn = None
+        self.layered = None
+        self.last_active = 0
+        self.ctx = 0
+
+
+class _MsgQueue:
+    def __init__(self, tid):
+        self.tid = tid
+        self.posted = []             # [dict(hwnd, msg, w, l, time, pt)]
+        self.input = []
+        self.quit = None             # exit code once PostQuitMessage called
+        self.timers = []
+        self.hooks = {}
+        self.last_msg_time = 0
+        self.last_pos = (0, 0)
+        self.sent = []               # cross-thread SendMessage records
+        self.wake_seq = 0
+
+
+def _lparam_xy(x, y):
+    return ((y & 0xFFFF) << 16) | (x & 0xFFFF)
+
+
+def _xy_lparam(l):
+    x, y = l & 0xFFFF, (l >> 16) & 0xFFFF
+    return (x - 0x10000 if x & 0x8000 else x), (y - 0x10000 if y & 0x8000 else y)
+
+
+class _WM:
+    """The window station: every window, queue, focus and paint state."""
+
+    def __init__(self, p, k):
+        self.p, self.k = p, k
+        self.mem = p.mem
+        self.gdi = p.gdi
+        self.gdi.wm = self
+        self.ps = 8 if p.cpu_mode == 64 else 4
+        self.wins = {}
+        self.classes = {}            # upper name -> _WClass
+        self.atoms = {}              # atom -> _WClass
+        self.next_atom = 0xC100
+        self.next_hwnd = 0x00020000
+        self.queues = {}
+        self.gen = 1                 # geometry generation (DC clip caches)
+        self.focus = 0
+        self.active = 0
+        self.capture = 0
+        self.capture_nc = False
+        self.cursor_pos = (400, 300)
+        self.keys = bytearray(256)   # GetKeyState: 0x80 down, 0x01 toggled
+        self.phys = bytearray(256)   # physical (async) key state at routing time
+        self.async_keys = bytearray(256)
+        self.pyprocs = {}            # wndproc address -> fn(hwnd, msg, w, l, wide)
+        self.raw_input = []          # front-end events not yet routed
+        self.hooks = {}              # hook id -> list of hook records (all threads)
+        self.next_hook = 0x00060000
+        self.caret = {"hwnd": 0, "x": 0, "y": 0, "w": 1, "h": 16, "hidden": 1, "on": False,
+                      "bmp": 0, "blink": 530}
+        self.last_click = (0, 0, 0, 0, 0.0)  # (button msg, x, y, hwnd, time)
+        self.track_leave = {}        # hwnd -> TrackMouseEvent flags
+        self.mouse_over = 0
+        self.dpi = 96
+        self.modal = []              # stack of modal loop owners
+        self.menu_state = None
+        self.msg_names = {}
+        self.next_msg_id = 0xC000
+        self.char_for_key = {}       # (vk, scan) -> char from the front-end
+        self.clip = {"owner": 0, "open": 0, "data": {}, "seq": 1, "viewers": []}
+        self.tick_base = time.monotonic()
+        self.frame_seq = 0
+        self.scratch_base = self.mem.alloc(0x40000, MEM_READ | MEM_WRITE, tag="user32-scratch")
+        self.scratch_top = self.scratch_base
+        self.scratch_end = self.scratch_base + 0x40000
+        self.redraw_all = False
+        self.deferred = {}
+        self.desktop = d = _Wnd(_DESKTOP_HWND)
+        d.style = WS_VISIBLE | WS_CLIPCHILDREN | WS_POPUP
+        d.w, d.h = self.gdi.screen.w, self.gdi.screen.h
+        d.cl = (0, 0, d.w, d.h)
+        d.surf = self.gdi.screen
+        d.text = ""
+        self.wins[_DESKTOP_HWND] = d
+        self.shell = 0
+
+    # -- helpers --------------------------------------------------------------------------
+    def tick(self):
+        return int((time.monotonic() - self.tick_base) * 1000 + 100000) & 0xFFFFFFFF
+
+    def wnd(self, h):
+        if not h:
+            return None
+        w = self.wins.get(h & 0xFFFFFFFF)
+        if w is None or w.dead:
+            return None
+        return w
+
+    def queue(self, tid=None):
+        if tid is None:
+            t = self.p.current_thread
+            tid = t.tid if t is not None else 0
+        q = self.queues.get(tid)
+        if q is None:
+            q = self.queues[tid] = _MsgQueue(tid)
+        return q
+
+    def cur_tid(self):
+        t = self.p.current_thread
+        return t.tid if t is not None else 0
+
+    def scratch(self, data_or_size):
+        """Guest scratch memory for structures passed with sent messages (LIFO)."""
+        n = data_or_size if isinstance(data_or_size, int) else len(data_or_size)
+        a = (self.scratch_top + 15) & ~15
+        if a + n > self.scratch_end:
+            a = self.p.heap_alloc(self.p.process_heap_handle, n)
+        else:
+            self.scratch_top = a + n
+        if not isinstance(data_or_size, int):
+            self.mem.write(a, bytes(data_or_size))
+        else:
+            self.mem.write(a, bytes(n))
+        return a
+
+    def scratch_mark(self):
+        return self.scratch_top
+
+    def scratch_release(self, mark):
+        self.scratch_top = mark
+
+    def rp(self, a):
+        return self.mem.read64(a) if self.ps == 8 else self.mem.read32(a)
+
+    def wp(self, a, v):
+        if self.ps == 8:
+            self.mem.write64(a, v & M64)
+        else:
+            self.mem.write32(a, v & 0xFFFFFFFF)
+
+    def gstr(self, a, wide, n=-1):
+        return _gstr(self.mem, a, n, wide)
+
+    def put_str(self, buf, n, text, wide):
+        """Copy with truncation; returns chars copied (without NUL)."""
+        if not buf or n <= 0:
+            return 0
+        if wide:
+            data = text.encode("utf-16-le")[:2 * (n - 1)]
+            self.mem.write(buf, data + b"\0\0")
+            return len(data) // 2
+        data = text.encode("utf-8", "replace")[:n - 1]
+        self.mem.write(buf, data + b"\0")
+        return len(data)
+
+    def str_len(self, text, wide):
+        return len(text.encode("utf-16-le")) // 2 if wide else len(text.encode("utf-8", "replace"))
+
+    # -- classes ---------------------------------------------------------------------------
+    def find_class(self, key):
+        if isinstance(key, int):
+            return self.atoms.get(key & 0xFFFF)
+        return self.classes.get(key.upper())
+
+    def register_class(self, cls):
+        key = cls.name.upper()
+        if key in self.classes and not self.classes[key].system:
+            return 0
+        cls.atom = self.next_atom
+        self.next_atom += 1
+        self.classes[key] = cls
+        self.atoms[cls.atom] = cls
+        return cls.atom
+
+    def py_class(self, name, fn, style=0, wnd_extra=0, brush=0, cursor=0):
+        """Register a built-in window class implemented in Python."""
+        k = self.k
+        base = re.sub(r"[^A-Za-z0-9]", "_", name)
+        procs = []
+        for wide in (False, True):
+            nm = "__noo_wndproc_%s_%s" % (base, "w" if wide else "a")
+
+            def handler(c, h, m, wp_, lp_, _fn=fn, _wide=wide):
+                return _fn(h & 0xFFFFFFFF, m, wp_, lp_, _wide)
+            k.reg(nm, "pupp", "p", dlls=("user32.dll",))(handler)
+            addr = self.p.api_thunk("user32.dll", nm)
+            self.pyprocs[addr] = fn
+            procs.append(addr)
+        cls = _WClass(name, style, procs[1], 0, wnd_extra, 0, 0, cursor, brush, system=True)
+        cls.proc_a = procs[0]
+        key = name.upper()
+        cls.atom = self.next_atom
+        self.next_atom += 1
+        self.classes[key] = cls
+        self.atoms[cls.atom] = cls
+        return cls
+
+    # -- window tree ------------------------------------------------------------------------
+    def top(self, w):
+        while w is not None and w.parent is not None and w.parent is not self.desktop:
+            w = w.parent
+        return w
+
+    def is_top(self, w):
+        return w.parent is self.desktop
+
+    def visible(self, w):
+        """WS_VISIBLE on the window and every ancestor."""
+        while w is not None and w is not self.desktop:
+            if not (w.style & WS_VISIBLE) or w.dead:
+                return False
+            w = w.parent
+        return True
+
+    def surf_origin(self, w):
+        """Window top-left inside its top-level surface."""
+        x = y = 0
+        while w is not None and w.parent is not None and w.parent is not self.desktop:
+            x += w.x + w.parent.cl[0]
+            y += w.y + w.parent.cl[1]
+            w = w.parent
+        return x, y
+
+    def screen_origin(self, w):
+        """Window top-left in screen coordinates."""
+        x = y = 0
+        while w is not None and w is not self.desktop:
+            x += w.x
+            y += w.y
+            if w.parent is not None and w.parent is not self.desktop:
+                x += w.parent.cl[0]
+                y += w.parent.cl[1]
+            w = w.parent
+        return x, y
+
+    def client_origin(self, w):
+        x, y = self.screen_origin(w)
+        return x + w.cl[0], y + w.cl[1]
+
+    def dc_screen_origin(self, hwnd, client):
+        w = self.wnd(hwnd)
+        if w is None:
+            return 0, 0
+        return self.client_origin(w) if client else self.screen_origin(w)
+
+    def descendants(self, w):
+        out = []
+        for c in w.children:
+            out.append(c)
+            out.extend(self.descendants(c))
+        return out
+
+    def is_child_of(self, w, parent):
+        while w is not None:
+            if w.parent is parent:
+                return True
+            w = w.parent
+        return False
+
+    # -- geometry / visible region --------------------------------------------------------
+    def dc_geometry(self, hwnd, client, dc=None):
+        w = self.wnd(hwnd)
+        if w is None:
+            return _Surf(1, 1), 0, 0, []
+        if w is self.desktop:
+            s = self.gdi.screen
+            return s, 0, 0, [(0, 0, s.w, s.h)]
+        top = self.top(w)
+        if top.surf is None:
+            top.surf = _Surf(max(1, top.w), max(1, top.h), _cr_pix(0xFFFFFF))
+        ox, oy = self.surf_origin(w)
+        if client:
+            area = (ox + w.cl[0], oy + w.cl[1], ox + w.cl[2], oy + w.cl[3])
+            dox, doy = ox + w.cl[0], oy + w.cl[1]
+        else:
+            area = (ox, oy, ox + w.w, oy + w.h)
+            dox, doy = ox, oy
+        vis = [area] if area[0] < area[2] and area[1] < area[3] else []
+        if not self.visible(w) and not (dc is not None and getattr(dc, "print_mode", False)):
+            # drawing into a hidden window still lands in its surface (so a
+            # later ShowWindow reveals it), but stays inside its own area
+            pass
+        # clip to ancestors' client areas and their siblings above
+        a = w
+        while vis and a.parent is not None and a.parent is not self.desktop:
+            par = a.parent
+            px, py = self.surf_origin(par)
+            vis = _rects_and(vis, [(px + par.cl[0], py + par.cl[1], px + par.cl[2],
+                                    py + par.cl[3])])
+            if a is not w or (w.style & WS_CLIPSIBLINGS):
+                for sib in par.children:
+                    if sib is a:
+                        break
+                    if sib.style & WS_VISIBLE and not sib.dead:
+                        sx, sy = self.surf_origin(sib)
+                        vis = _rects_sub(vis, (sx, sy, sx + sib.w, sy + sib.h))
+            a = par
+        if client and (w.style & WS_CLIPCHILDREN):
+            for ch in w.children:
+                if ch.style & WS_VISIBLE and not ch.dead:
+                    cx, cy = self.surf_origin(ch)
+                    vis = _rects_sub(vis, (cx, cy, cx + ch.w, cy + ch.h))
+        s = top.surf
+        vis = _rects_and(vis, [(0, 0, s.w, s.h)])
+        return s, dox, doy, vis
+
+    def surface_dirty(self, hwnd):
+        w = self.wnd(hwnd)
+        if w is not None:
+            t = self.top(w)
+            if t is not None and t.surf is not None:
+                t.surf.rev += 1
+
+    def changed(self):
+        self.gen += 1
+
+    # -- invalidation / painting --------------------------------------------------------------
+    def client_rect(self, w):
+        return (0, 0, w.cl[2] - w.cl[0], w.cl[3] - w.cl[1])
+
+    def invalidate(self, w, rects=None, erase=True, children=None, frame=False):
+        """Add client-coordinate rects (None = all) to the update region."""
+        if w is None or w.dead:
+            return
+        cr = self.client_rect(w)
+        if rects is None:
+            rects = [cr]
+        rects = _rects_and([r for r in rects if r[0] < r[2] and r[1] < r[3]], [cr])
+        if frame:
+            w.ncdirty = True
+        if rects:
+            w.update = _rgn_normalize(w.update + rects) if w.update else _rgn_normalize(rects)
+            if erase:
+                w.erase = True
+        if children is None:
+            children = not (w.style & WS_CLIPCHILDREN)
+        if children:
+            for ch in w.children:
+                if not (ch.style & WS_VISIBLE) or ch.dead:
+                    continue
+                if not rects and not frame:
+                    continue
+                sub = [(l - ch.x, t - ch.y, r - ch.x, b - ch.y) for (l, t, r, b) in rects]
+                sub = _rects_and(sub, [(0, 0, ch.w, ch.h)])
+                if sub:
+                    ch.ncdirty = True
+                    self.invalidate(ch, [(l - ch.cl[0], t - ch.cl[1], r - ch.cl[0], b - ch.cl[1])
+                                         for (l, t, r, b) in sub], erase, True)
+        self.queue(w.tid).wake_seq += 1
+
+    def validate(self, w, rects=None):
+        if w is None:
+            return
+        if rects is None:
+            w.update = []
+            w.erase = False
+        else:
+            for r in rects:
+                w.update = _rects_sub(w.update, r)
+            if not w.update:
+                w.erase = False
+
+    def invalidate_screen_area(self, parent, rect_parent_client):
+        """Something covering rect (parent client coords) went away: repaint below."""
+        if parent is None or parent is self.desktop:
+            return
+        self.invalidate(parent, [rect_parent_client], True, True)
+
+    def paint_candidate(self, tid, hwnd_filter=0):
+        """Next window (pre-order, parents first) needing WM_PAINT for thread tid."""
+        for top in list(self.desktop.children):
+            r = self._paint_walk(top, tid, hwnd_filter)
+            if r is not None:
+                return r
+        return None
+
+    def _paint_walk(self, w, tid, hwnd_filter):
+        if w.dead or not (w.style & WS_VISIBLE):
+            return None
+        if w.tid == tid and (w.update or w.ncdirty) and \
+                (not hwnd_filter or w.hwnd == hwnd_filter or
+                 self.is_child_of(w, self.wnd(hwnd_filter))):
+            if w.min_state != 1:
+                return w
+            w.update = []
+            w.ncdirty = False
+        for ch in reversed(w.children):
+            r = self._paint_walk(ch, tid, hwnd_filter)
+            if r is not None:
+                return r
+        return None
+
+    def has_paint(self, tid):
+        return self.paint_candidate(tid) is not None
+
+    # -- messages: send ---------------------------------------------------------------------------
+    def call_proc(self, proc, hwnd, msg, wp, lp, wide, target_wide=None):
+        if not proc:
+            return 0
+        fn = self.pyprocs.get(proc)
+        if fn is not None:
+            return fn(hwnd, msg, wp, lp, wide)
+        if target_wide is None:
+            w = self.wnd(hwnd)
+            target_wide = w.unicode if w is not None else wide
+        mask = M64 if self.ps == 8 else 0xFFFFFFFF
+        if target_wide != wide:
+            conv = self._convert_msg(msg, wp, lp, wide, target_wide)
+            if conv is not None:
+                mark = self.scratch_mark()
+                try:
+                    return conv(lambda w2, l2: self.p.call_guest(
+                        proc, [hwnd, msg & 0xFFFFFFFF, w2 & mask, l2 & mask]))
+                finally:
+                    self.scratch_release(mark)
+        return self.p.call_guest(proc, [hwnd, msg & 0xFFFFFFFF, wp & mask, lp & mask])
+
+    _TEXT_IN = {WM_SETTEXT: 0, 0x0143: 0, 0x0180: 0, 0x0181: 0, 0x014A: 0, 0x018F: 0,
+                0x00C2: 0, 0x014C: 0, 0x018C: 0, 0x01A2: 0, 0x014D: 0, 0x018B: 0}
+
+    def _convert_msg(self, msg, wp, lp, from_wide, to_wide):
+        """A<->W marshalling for the messages that carry text."""
+        mem = self.mem
+        if msg in (WM_SETTEXT, 0x00C2, 0x0143, 0x0180, 0x014A, 0x0181, 0x014C, 0x018F,
+                   0x014D, 0x018B, 0x018C, 0x01A2) and lp:
+            # string input (WM_SETTEXT, EM_REPLACESEL, CB_/LB_ ADD/INSERT/FIND/SELECT)
+            s = self.gstr(lp, from_wide)
+            data = s.encode("utf-16-le") + b"\0\0" if to_wide else s.encode("utf-8") + b"\0"
+            buf = self.scratch(data)
+            return lambda call: call(wp, buf)
+        if msg == WM_GETTEXT and lp and wp:
+            n = wp
+            buf = self.scratch(n * 4 + 4)
+
+            def run(call):
+                r = call(n * (1 if to_wide else 3), buf)
+                s = self.gstr(buf, to_wide)
+                return self.put_str(lp, n, s, from_wide)
+            return run
+        if msg in (0x0148, 0x0189) and lp:                  # CB_GETLBTEXT / LB_GETTEXT
+            buf = self.scratch(4096)
+
+            def run(call):
+                r = call(wp, buf)
+                if _s32(r & 0xFFFFFFFF) < 0:
+                    return r
+                s = self.gstr(buf, to_wide)
+                data = s.encode("utf-16-le") + b"\0\0" if from_wide else s.encode("utf-8") + b"\0"
+                mem.write(lp, data)
+                return self.str_len(s, from_wide)
+            return run
+        if msg in (WM_NCCREATE, WM_CREATE) and lp:
+            ps = self.ps
+            size = 80 if ps == 8 else 48
+            raw = bytearray(mem.read(lp, size))
+            off_name, off_cls = (56, 64) if ps == 8 else (36, 40)
+            copy = self.scratch(raw)
+            for off in (off_name, off_cls):
+                ptr = self.rp(lp + off)
+                if ptr and ptr >= 0x10000:
+                    s = self.gstr(ptr, from_wide)
+                    data = s.encode("utf-16-le") + b"\0\0" if to_wide else \
+                        s.encode("utf-8") + b"\0"
+                    self.wp(copy + off, self.scratch(data))
+            return lambda call: call(wp, copy)
+        if msg in (WM_CHAR, WM_SYSCHAR, WM_DEADCHAR) and wp > 0x7F:
+            if to_wide:
+                try:
+                    ch = bytes([wp & 0xFF]).decode("cp1252")
+                    return lambda call: call(ord(ch), lp)
+                except Exception:
+                    return None
+            try:
+                b = chr(wp).encode("cp1252")
+                return lambda call: call(b[0], lp)
+            except Exception:
+                return lambda call: call(0x3F, lp)
+        return None
+
+    def send(self, hwnd, msg, wp=0, lp=0, wide=True):
+        w = self.wnd(hwnd)
+        if w is None:
+            return 0
+        if self.hooks.get(4):                               # WH_CALLWNDPROC
+            self._call_wndproc_hook(4, hwnd, msg, wp, lp, wide)
+        r = self.call_proc(w.proc, hwnd, msg, wp, lp, wide)
+        if self.hooks.get(12):                              # WH_CALLWNDPROCRET
+            self._call_wndproc_hook(12, hwnd, msg, wp, lp, wide, r)
+        return r
+
+    def send_notify_parent(self, w, msg, wp, lp, wide=True):
+        par = w.parent if (w.style & WS_CHILD) else self.wnd(w.owner)
+        if par is None or par is self.desktop:
+            return 0
+        return self.send(par.hwnd, msg, wp, lp, wide)
+
+    # -- messages: post / queue ---------------------------------------------------------------------
+    def post(self, hwnd, msg, wp=0, lp=0, tid=None):
+        if tid is None:
+            w = self.wnd(hwnd)
+            if hwnd and w is None and hwnd not in (0xFFFF, 0xFFFFFFFF):
+                return False
+            tid = w.tid if w is not None else self.cur_tid()
+        q = self.queue(tid)
+        q.posted.append({"hwnd": hwnd, "msg": msg & 0xFFFFFFFF, "w": wp, "l": lp,
+                         "time": self.tick(), "pt": self.cursor_pos})
+        q.wake_seq += 1
+        return True
+
+    def post_quit(self, code):
+        q = self.queue()
+        q.quit = code
+        q.wake_seq += 1
+
+    def _match(self, m, hwnd_f, lo, hi):
+        if hwnd_f:
+            if hwnd_f == 0xFFFFFFFF or hwnd_f == M64 or hwnd_f == -1:
+                if m["hwnd"]:
+                    return False
+            elif m["hwnd"] != hwnd_f:
+                w = self.wnd(m["hwnd"])
+                if w is None or not self.is_child_of(w, self.wnd(hwnd_f)):
+                    return False
+        if lo == 0 and hi == 0:
+            return True
+        return lo <= m["msg"] <= hi
+
+    def peek(self, hwnd_f=0, lo=0, hi=0, remove=True, flags=0):
+        """Try to retrieve one message for the current thread (no blocking)."""
+        tid = self.cur_tid()
+        q = self.queue(tid)
+        if self.raw_input and not q.input:
+            self.process_raw_input(one=True)
+        want = flags >> 16 if flags & 0xFFFF0000 else 0     # PM_QS_* filters
+        # 1. posted
+        if not want or want & 0x80:                         # QS_POSTMESSAGE
+            for i, m in enumerate(q.posted):
+                if self._match(m, hwnd_f, lo, hi):
+                    if remove:
+                        q.posted.pop(i)
+                    return m
+        # 2. quit
+        if q.quit is not None and not hwnd_f and (lo == 0 and hi == 0 or lo <= 0x12 <= hi):
+            m = {"hwnd": 0, "msg": 0x12, "w": q.quit, "l": 0, "time": self.tick(),
+                 "pt": self.cursor_pos}
+            if remove:
+                q.quit = None
+            return m
+        # 3. input
+        if not want or want & 0x7:
+            for i, m in enumerate(q.input):
+                if self._match(m, hwnd_f, lo, hi):
+                    if remove:
+                        q.input.pop(i)
+                        self._track_input_state(m)
+                    return m
+        # 4. paint
+        if (not want or want & 0x20) and (lo == 0 and hi == 0 or lo <= 0xF <= hi):
+            w = self.paint_candidate(tid, hwnd_f if hwnd_f not in (0xFFFFFFFF, M64) else 0)
+            if w is not None:
+                return {"hwnd": w.hwnd, "msg": 0xF, "w": 0, "l": 0, "time": self.tick(),
+                        "pt": self.cursor_pos}
+        # 5. timers
+        if (not want or want & 0x10) and (lo == 0 and hi == 0 or lo <= 0x113 <= hi):
+            now = time.monotonic()
+            for t in q.timers:
+                if t["next"] <= now and (not hwnd_f or t["hwnd"] == hwnd_f):
+                    if remove:
+                        t["next"] = now + t["interval"]
+                    return {"hwnd": t["hwnd"], "msg": 0x113 if not t.get("sys") else 0x118,
+                            "w": t["id"], "l": t["proc"], "time": self.tick(),
+                            "pt": self.cursor_pos}
+        return None
+
+    def next_timer(self, tid):
+        q = self.queue(tid)
+        if not q.timers:
+            return None
+        return min(t["next"] for t in q.timers)
+
+    def _track_input_state(self, m):
+        msg = m["msg"]
+        if 0x100 <= msg <= 0x109:
+            vk = m["w"] & 0xFF
+            if msg in (0x100, 0x104):
+                if not self.keys[vk] & 0x80:
+                    self.keys[vk] ^= 1
+                self.keys[vk] |= 0x80
+                for gen, l_, r_ in ((0x10, 0xA0, 0xA1), (0x11, 0xA2, 0xA3), (0x12, 0xA4, 0xA5)):
+                    if vk in (l_, r_):
+                        self.keys[gen] |= 0x80
+            elif msg in (0x101, 0x105):
+                self.keys[vk] &= 0x7F
+                for gen, l_, r_ in ((0x10, 0xA0, 0xA1), (0x11, 0xA2, 0xA3), (0x12, 0xA4, 0xA5)):
+                    if vk in (l_, r_) or vk == gen:
+                        self.keys[gen] &= 0x7F
+                        self.keys[l_] &= 0x7F
+                        self.keys[r_] &= 0x7F
+        q = self.queue()
+        q.last_msg_time = m.get("time", 0)
+        q.last_pos = m.get("pt", self.cursor_pos)
+
+    # -- raw input from the display --------------------------------------------------------------
+    def inject(self, ev):
+        """Front-end event (dict) -> raw input queue."""
+        self.raw_input.append(ev)
+        for q in self.queues.values():
+            q.wake_seq += 1
+
+    def process_raw_input(self, one=False):
+        """Route queued front-end events. With one=True only until one input
+        message was queued, so hardware input is serialized like Windows does."""
+        while self.raw_input:
+            if one:
+                tid = self.cur_tid()
+                if self.queue(tid).input:
+                    return
+            ev = self.raw_input.pop(0)
+            try:
+                self._route(ev)
+            except NOOError:
+                raise
+            except Exception as e:                           # never let a UI event kill the app
+                self.p.log.warn("GUI input event %r failed: %s" % (ev.get("type"), e))
+
+    def _route(self, ev):
+        t = ev.get("type")
+        if t == "mouse":
+            self._route_mouse(ev)
+        elif t == "key":
+            self._route_key(ev)
+        elif t == "close":
+            w = self.wnd(int(ev.get("hwnd", 0)))
+            if w is not None:
+                self.post(w.hwnd, WM_SYSCOMMAND, SC_CLOSE, 0)
+        elif t == "move":
+            w = self.wnd(int(ev.get("hwnd", 0)))
+            if w is not None and self.is_top(w):
+                self.set_pos(w, 0, int(ev.get("x", w.x)), int(ev.get("y", w.y)), 0, 0,
+                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+        elif t == "resize":
+            w = self.wnd(int(ev.get("hwnd", 0)))
+            if w is not None and self.is_top(w):
+                cw, ch = int(ev.get("w", 0)), int(ev.get("h", 0))
+                if ev.get("client"):
+                    fx = w.w - (w.cl[2] - w.cl[0])
+                    fy = w.h - (w.cl[3] - w.cl[1])
+                    cw, ch = cw + fx, ch + fy
+                self.set_pos(w, 0, 0, 0, max(1, cw), max(1, ch),
+                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)
+        elif t == "activate":
+            w = self.wnd(int(ev.get("hwnd", 0)))
+            if w is not None:
+                self.set_active(w.hwnd, True)
+        elif t == "command":
+            # legacy front-ends: WM_COMMAND to a parent
+            hwnd = int(ev.get("parent", ev.get("hwnd", 0)) or 0)
+            self.post(hwnd, 0x111, int(ev.get("ctrl_id", 0)) & 0xFFFF, int(ev.get("hwnd", 0)))
+
+    def window_from_point(self, x, y, include_disabled=True, skip=None):
+        """Deepest visible window at screen point (child windows included)."""
+        for top in self.desktop.children:
+            if top.dead or not (top.style & WS_VISIBLE) or top is skip:
+                continue
+            if top.x <= x < top.x + top.w and top.y <= y < top.y + top.h:
+                return self._child_at(top, x - top.x, y - top.y, include_disabled, skip)
+        return self.desktop
+
+    def _child_at(self, w, x, y, include_disabled, skip=None):
+        """x, y relative to w's window origin."""
+        cx, cy = x - w.cl[0], y - w.cl[1]
+        if w.cl[0] <= x < w.cl[2] and w.cl[1] <= y < w.cl[3]:
+            for ch in w.children:
+                if ch.dead or not (ch.style & WS_VISIBLE) or ch is skip:
+                    continue
+                if (ch.exstyle & WS_EX_TRANSPARENT) and False:
+                    continue
+                if ch.x <= cx < ch.x + ch.w and ch.y <= cy < ch.y + ch.h:
+                    if not include_disabled and ch.style & WS_DISABLED:
+                        return w
+                    return self._child_at(ch, cx - ch.x, cy - ch.y, include_disabled, skip)
+        return w
+
+    def enabled_chain(self, w):
+        while w is not None and w is not self.desktop:
+            if w.style & WS_DISABLED:
+                return False
+            if not (w.style & WS_CHILD):
+                return True
+            w = w.parent
+        return True
+
+    def _mouse_keys(self):
+        k = 0
+        if self.keys[1] & 0x80:
+            k |= 1
+        if self.keys[2] & 0x80:
+            k |= 2
+        if self.keys[0x10] & 0x80:
+            k |= 4
+        if self.keys[0x11] & 0x80:
+            k |= 8
+        if self.keys[4] & 0x80:
+            k |= 0x10
+        return k
+
+    def _route_mouse(self, ev):
+        act = ev.get("action", "move")
+        btn = int(ev.get("button", 0) or 0)          # 0 left, 1 middle, 2 right
+        top = self.wnd(int(ev.get("hwnd", 0) or 0))
+        x, y = int(ev.get("x", 0)), int(ev.get("y", 0))
+        if top is not None:
+            sx, sy = self.screen_origin(top)
+            if ev.get("client"):
+                sx += top.cl[0]
+                sy += top.cl[1]
+            X, Y = sx + x, sy + y
+        else:
+            X, Y = x, y
+        self.cursor_pos = (X, Y)
+        vk = {0: 1, 1: 4, 2: 2}.get(btn, 1)
+        if act == "down":
+            self.keys[vk] |= 0x80
+            self.phys[vk] |= 0x80
+            self.async_keys[vk] = 0x81
+        elif act == "up":
+            self.keys[vk] &= 0x7F
+            self.phys[vk] &= 0x7F
+        self.deliver_mouse(act, btn, X, Y, int(ev.get("delta", 0) or 0))
+
+    def deliver_mouse(self, act, btn, X, Y, delta=0):
+        """Hit-test and queue a mouse message at screen point (X, Y)."""
+        if self.menu_state is not None and self.menu_state.get("mouse"):
+            self.menu_state["mouse"](act, btn, X, Y)
+            return
+        if act == "wheel":
+            w = self.wnd(self.focus) or self.wnd(self.active)
+            if w is None:
+                return
+            self._queue_input(w, WM_MOUSEWHEEL if not btn else WM_MOUSEHWHEEL,
+                              ((delta & 0xFFFF) << 16) | self._mouse_keys(), _lparam_xy(X, Y))
+            return
+        cap = self.wnd(self.capture)
+        if cap is not None:
+            w = cap
+            hit = HTCLIENT
+        else:
+            w = self.window_from_point(X, Y)
+            hit = HTCLIENT
+            if w is self.desktop:
+                return
+            # WM_NCHITTEST, skipping HTTRANSPARENT windows
+            while w is not None and w is not self.desktop:
+                hit = _s32(self.send(w.hwnd, WM_NCHITTEST, 0, _lparam_xy(X, Y)) & 0xFFFFFFFF)
+                if hit != HTTRANSPARENT:
+                    break
+                par = w.parent
+                w = par if par is not None and par is not self.desktop else None
+            if w is None:
+                return
+            if not self.enabled_chain(w):
+                if act == "down":
+                    t = self.top(w)
+                    popup = self._last_enabled_popup(t)
+                    if popup is not None and popup is not t:
+                        self.set_active(popup.hwnd, True)
+                        self.flash(popup)
+                return
+        top = self.top(w)
+        if act == "down" and top is not None and top.hwnd != self.active and \
+                not (top.exstyle & WS_EX_NOACTIVATE) and cap is None:
+            ma = self.send(w.hwnd, WM_MOUSEACTIVATE, top.hwnd,
+                           ((({0: 0x201, 1: 0x207, 2: 0x204}[btn]) << 16) | (hit & 0xFFFF)))
+            ma &= 0xFFFFFFFF
+            if ma in (1, 2):                                # MA_ACTIVATE(ANDEAT)
+                self.set_active(top.hwnd, True)
+            if ma in (2, 4):                                # ...ANDEAT
+                return
+        if self.hooks.get(7):                               # WH_MOUSE
+            pass
+        base = {0: WM_LBUTTONDOWN - 1, 1: WM_MBUTTONDOWN - 1, 2: 0x204 - 1}[btn]
+        if act == "move":
+            if hit == HTCLIENT:
+                msg = 0x200
+            else:
+                msg = WM_NCMOUSEMOVE
+        else:
+            off = {"down": 1, "up": 2, "dbl": 3}[act]
+            if act == "down":
+                now = time.monotonic()
+                lc = self.last_click
+                if lc[0] == base + 1 and lc[3] == w.hwnd and now - lc[4] < 0.5 and \
+                        abs(lc[1] - X) <= 4 and abs(lc[2] - Y) <= 4 and \
+                        (w.cls is not None and w.cls.style & 8 or hit != HTCLIENT):
+                    off = 3
+                    self.last_click = (0, 0, 0, 0, 0.0)
+                else:
+                    self.last_click = (base + 1, X, Y, w.hwnd, now)
+            msg = base + off
+            if hit != HTCLIENT:
+                msg = msg - 0x201 + WM_NCLBUTTONDOWN
+        if hit == HTCLIENT:
+            cx, cy = self.client_origin(w)
+            lp = _lparam_xy(X - cx, Y - cy)
+            wp = self._mouse_keys()
+        else:
+            lp = _lparam_xy(X, Y)
+            wp = hit & 0xFFFFFFFF
+        if msg == 0x200:
+            if self.mouse_over != w.hwnd:
+                old = self.mouse_over
+                if old in self.track_leave:
+                    fl = self.track_leave.pop(old)
+                    if fl & 2:
+                        self._queue_input(self.wnd(old), WM_MOUSELEAVE, 0, 0)
+                self.mouse_over = w.hwnd
+        self._queue_input(w, msg, wp, lp)
+        if act == "down" and hit == HTCLIENT and w.style & WS_CHILD and \
+                not (w.exstyle & WS_EX_NOPARENTNOTIFY):
+            par = w.parent
+            cxp, cyp = self.client_origin(par)
+            while par is not None and par is not self.desktop:
+                self.send(par.hwnd, WM_PARENTNOTIFY, msg & 0xFFFF, _lparam_xy(X - cxp, Y - cyp))
+                if not (par.style & WS_CHILD) or par.exstyle & WS_EX_NOPARENTNOTIFY:
+                    break
+                par = par.parent
+                cxp, cyp = self.client_origin(par)
+
+    def _queue_input(self, w, msg, wp, lp):
+        if w is None:
+            return
+        q = self.queue(w.tid)
+        m = {"hwnd": w.hwnd, "msg": msg, "w": wp, "l": lp, "time": self.tick(),
+             "pt": self.cursor_pos}
+        if msg in (0x200, WM_NCMOUSEMOVE) and q.input and q.input[-1]["msg"] == msg and \
+                q.input[-1]["hwnd"] == w.hwnd:
+            q.input[-1] = m
+        else:
+            q.input.append(m)
+        q.wake_seq += 1
+
+    def _route_key(self, ev):
+        act = ev.get("action", "down")
+        vk = int(ev.get("vk", 0) or 0) & 0xFF
+        ch = ev.get("char")
+        scan = int(ev.get("scan", 0) or 0) & 0xFF
+        if not scan:
+            scan = _VK_SCAN.get(vk, 0)
+        if ch:
+            self.char_for_key[vk] = ch
+        if act == "char":
+            # a composed character without a key event (IME / paste)
+            w = self.wnd(self.focus) or self.wnd(self.active)
+            if w is not None:
+                for c in str(ch or ""):
+                    self._queue_input(w, WM_CHAR, ord(c), 1)
+            return
+        if ev.get("shift") is not None and vk not in (0x10, 0xA0, 0xA1):
+            self._set_mod(0x10, bool(ev.get("shift")))
+        if ev.get("ctrl") is not None and vk not in (0x11, 0xA2, 0xA3):
+            self._set_mod(0x11, bool(ev.get("ctrl")))
+        if ev.get("alt") is not None and vk not in (0x12, 0xA4, 0xA5):
+            self._set_mod(0x12, bool(ev.get("alt")))
+        gen = {0xA0: 0x10, 0xA1: 0x10, 0xA2: 0x11, 0xA3: 0x11, 0xA4: 0x12, 0xA5: 0x12}.get(vk)
+        for k_ in (vk, gen):
+            if k_:
+                if act == "down":
+                    self.phys[k_] |= 0x80
+                    self.async_keys[k_] = 0x81
+                else:
+                    self.phys[k_] &= 0x7F
+        alt = bool(self.phys[0x12] & 0x80) and vk not in (0x12, 0xA4, 0xA5)
+        self.inject_key(vk, act == "down", scan, alt, bool(ev.get("repeat")))
+
+    def _set_mod(self, vk, down):
+        """A modifier state reported with an event: keep both key tables in sync."""
+        if down:
+            self.keys[vk] |= 0x80
+            self.phys[vk] |= 0x80
+        else:
+            self.keys[vk] &= 0x7F
+            self.phys[vk] &= 0x7F
+
+    def inject_key(self, vk, down, scan=0, alt=False, repeat=False):
+        if self.menu_state is not None and self.menu_state.get("key"):
+            if self.menu_state["key"](vk, down):
+                return
+        w = self.wnd(self.focus)
+        sysk = alt or vk == 0x79 or (vk == 0x12)
+        if w is None:
+            w = self.wnd(self.active)
+            sysk = True
+        if w is None:
+            return
+        lp = 1 | (scan << 16)
+        if vk in (0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E, 0x5B, 0x5C,
+                  0x5D, 0xA3, 0xA5):
+            lp |= 1 << 24                                    # extended key
+        if alt and vk != 0x12:
+            lp |= 1 << 29
+        if not down:
+            lp |= (1 << 30) | (1 << 31)
+        elif repeat:
+            lp |= 1 << 30
+        if sysk and not (self.phys[0x11] & 0x80 and vk != 0x12):
+            msg = WM_SYSKEYDOWN if down else WM_SYSKEYUP
+        else:
+            msg = 0x100 if down else WM_KEYUP
+        if vk == 0x79 and not alt:                           # F10: system key
+            msg = WM_SYSKEYDOWN if down else WM_SYSKEYUP
+        self._queue_input(w, msg, vk, lp)
+
+    def flash(self, w):
+        pass
+
+    def _last_enabled_popup(self, top):
+        """The enabled owned popup (e.g. a modal dialog) of a disabled window."""
+        for w in self.desktop.children:
+            if w.dead or not (w.style & WS_VISIBLE):
+                continue
+            o = self.wnd(w.owner)
+            while o is not None:
+                if o is top:
+                    if not (w.style & WS_DISABLED):
+                        return w
+                    break
+                o = self.wnd(o.owner)
+        return None
+
+    # -- focus / activation / capture --------------------------------------------------------------
+    def set_focus(self, hwnd):
+        old = self.focus
+        w = self.wnd(hwnd)
+        if hwnd and w is None:
+            return 0
+        if w is not None:
+            if w.style & WS_DISABLED or not self.enabled_chain(w):
+                return 0
+            if self._cbt(9, hwnd, old):                      # HCBT_SETFOCUS
+                return 0
+            top = self.top(w)
+            if top is not None and top.hwnd != self.active:
+                self.set_active(top.hwnd, False)
+                if self.focus == hwnd:
+                    return old
+        if old == hwnd:
+            return old
+        self.focus = hwnd
+        if old and self.wnd(old) is not None:
+            self.send(old, WM_KILLFOCUS, hwnd, 0)
+        if hwnd and self.focus == hwnd:
+            self.send(hwnd, WM_SETFOCUS, old, 0)
+        return old
+
+    def set_active(self, hwnd, mouse=False):
+        w = self.wnd(hwnd)
+        old = self.active
+        if w is not None:
+            w = self.top(w)
+            hwnd = w.hwnd
+        if hwnd == old:
+            return old
+        if self._cbt(5, hwnd, 0):                            # HCBT_ACTIVATE
+            return old
+        ow = self.wnd(old)
+        if ow is not None:
+            self.send(old, WM_NCACTIVATE, 0, 0)
+            self.send(old, WM_ACTIVATE, 0, hwnd)
+        self.active = hwnd
+        if w is None:
+            if self.focus:
+                f = self.focus
+                self.focus = 0
+                if self.wnd(f) is not None:
+                    self.send(f, WM_KILLFOCUS, 0, 0)
+            return old
+        if w is not self.desktop:
+            self.bring_to_top(w)
+        if ow is None:
+            self.send(hwnd, WM_ACTIVATEAPP, 1, 0)
+        self.send(hwnd, WM_NCACTIVATE, 1, 0)
+        self.send(hwnd, WM_ACTIVATE, 2 if mouse else 1, old)
+        return old
+
+    def set_capture(self, hwnd, nc=False):
+        old = self.capture
+        self.capture = hwnd
+        self.capture_nc = nc
+        if old and old != hwnd and self.wnd(old) is not None:
+            self.send(old, WM_CAPTURECHANGED, 0, hwnd)
+        return old
+
+    def bring_to_top(self, w):
+        par = w.parent
+        if par is None:
+            return
+        if w in par.children:
+            if par.children[0] is w:
+                return
+            par.children.remove(w)
+        # topmost windows stay above normal ones
+        idx = 0
+        if not (w.exstyle & WS_EX_TOPMOST):
+            while idx < len(par.children) and par.children[idx].exstyle & WS_EX_TOPMOST:
+                idx += 1
+        par.children.insert(idx, w)
+        self.changed()
+        # owned popups ride above their owner
+        if par is self.desktop:
+            for o in list(par.children):
+                if o is not w and o.owner == w.hwnd and o.style & WS_VISIBLE:
+                    par.children.remove(o)
+                    par.children.insert(par.children.index(w), o)
+
+    # -- hooks ------------------------------------------------------------------------------------
+    def _cbt(self, code, wp, lp):
+        hs = self.hooks.get(5)
+        if not hs:
+            return 0
+        tid = self.cur_tid()
+        for hk in list(hs):
+            if hk["tid"] in (0, tid):
+                r = self.p.call_guest(hk["proc"], [code, wp, lp])
+                if r & 0xFFFFFFFF:
+                    return 1
+        return 0
+
+    def _call_wndproc_hook(self, hid, hwnd, msg, wp, lp, wide, result=None):
+        hs = self.hooks.get(hid)
+        if not hs:
+            return
+        tid = self.cur_tid()
+        mark = self.scratch_mark()
+        try:
+            ps = self.ps
+            if hid == 4:        # CWPSTRUCT {lParam, wParam, message, hwnd}
+                data = struct.pack("<QQIIQ" if ps == 8 else "<IIII",
+                                   *((lp & M64, wp & M64, msg, 0, hwnd) if ps == 8
+                                     else (lp & 0xFFFFFFFF, wp & 0xFFFFFFFF, msg, hwnd)))
+            else:               # CWPRETSTRUCT {lResult, lParam, wParam, message, hwnd}
+                r = (result or 0)
+                data = struct.pack("<QQQIIQ" if ps == 8 else "<IIIII",
+                                   *((r & M64, lp & M64, wp & M64, msg, 0, hwnd) if ps == 8
+                                     else (r & 0xFFFFFFFF, lp & 0xFFFFFFFF, wp & 0xFFFFFFFF,
+                                           msg, hwnd)))
+            a = self.scratch(data)
+            for hk in list(hs):
+                if hk["tid"] in (0, tid):
+                    self.p.call_guest(hk["proc"], [0, 0, a])
+        finally:
+            self.scratch_release(mark)
+
+    def call_msg_hooks(self, hid, code, msg_addr):
+        hs = self.hooks.get(hid)
+        if not hs:
+            return 0
+        tid = self.cur_tid()
+        for hk in list(hs):
+            if hk["tid"] in (0, tid):
+                r = self.p.call_guest(hk["proc"], [code, 1 if hid == 3 else 0, msg_addr])
+                if r & 0xFFFFFFFF and hid in (2, 7, -1, 14):
+                    return 1
+        return 0
+
+    # -- window positioning -------------------------------------------------------------------------
+    def nc_calc(self, w):
+        """Ask the window for its client rect (WM_NCCALCSIZE)."""
+        ps = self.ps
+        mark = self.scratch_mark()
+        try:
+            size = 56 if ps == 8 else 52
+            a = self.scratch(size)
+            _wr_rect(self.mem, a, (w.x, w.y, w.x + w.w, w.y + w.h))
+            self.send(w.hwnd, WM_NCCALCSIZE, 0, a)
+            l, t, r, b = _rd_rect(self.mem, a)
+        finally:
+            self.scratch_release(mark)
+        l, t = l - w.x, t - w.y
+        r, b = r - w.x, b - w.y
+        r, b = max(l, r), max(t, b)
+        w.cl = (l, t, r, b)
+
+    def set_pos(self, w, after, x, y, cx, cy, flags):
+        """SetWindowPos core."""
+        if w is None or w is self.desktop:
+            return False
+        ps = self.ps
+        if not (flags & SWP_NOSENDCHANGING):
+            mark = self.scratch_mark()
+            try:
+                a = self.scratch(40 if ps == 8 else 28)
+                if ps == 8:
+                    self.mem.write(a, struct.pack("<QQiiiiI", w.hwnd, after & M64, x, y, cx, cy,
+                                                  flags))
+                else:
+                    self.mem.write(a, struct.pack("<IIiiiiI", w.hwnd, after & 0xFFFFFFFF, x, y,
+                                                  cx, cy, flags))
+                if not (flags & SWP_NOSIZE) or flags & SWP_SHOWWINDOW or True:
+                    if not (flags & SWP_NOSIZE) and self.is_top(w) or \
+                            (not (flags & SWP_NOSIZE) and w.style & WS_THICKFRAME):
+                        mmi = self.minmax(w)
+                        if not (flags & SWP_NOSIZE):
+                            cx = max(mmi[3][0], min(cx, mmi[4][0])) if self.is_top(w) else cx
+                            cy = max(mmi[3][1], min(cy, mmi[4][1])) if self.is_top(w) else cy
+                    if ps == 8:
+                        self.mem.write(a + 16, struct.pack("<iiii", x, y, cx, cy))
+                    else:
+                        self.mem.write(a + 8, struct.pack("<iiii", x, y, cx, cy))
+                    self.send(w.hwnd, WM_WINDOWPOSCHANGING, 0, a)
+                    off = 16 if ps == 8 else 8
+                    x, y, cx, cy, flags = struct.unpack("<iiiiI", self.mem.read(a + off, 20))
+            finally:
+                self.scratch_release(mark)
+        old = (w.x, w.y, w.w, w.h)
+        oldcl = w.cl
+        moved = not (flags & SWP_NOMOVE) and (x, y) != (w.x, w.y)
+        sized = not (flags & SWP_NOSIZE) and (cx, cy) != (w.w, w.h)
+        if not (flags & SWP_NOMOVE):
+            w.x, w.y = x, y
+        if not (flags & SWP_NOSIZE):
+            w.w, w.h = max(0, cx), max(0, cy)
+        if not (flags & SWP_NOZORDER) and w.parent is not None:
+            self._zorder(w, after)
+        showing = flags & SWP_SHOWWINDOW and not (w.style & WS_VISIBLE)
+        hiding = flags & SWP_HIDEWINDOW and w.style & WS_VISIBLE
+        if showing:
+            w.style |= WS_VISIBLE
+        if hiding:
+            w.style &= ~WS_VISIBLE
+        if moved or sized or flags & SWP_FRAMECHANGED or showing:
+            self.nc_calc(w)
+        self.changed()
+        if self.is_top(w):
+            if w.surf is None:
+                w.surf = _Surf(max(1, w.w), max(1, w.h), _cr_pix(0xFFFFFF))
+            elif sized:
+                w.surf.resize(max(1, w.w), max(1, w.h))
+        par = w.parent
+        vis_now = self.visible(w)
+        if not self.is_top(w) and par is not None:
+            # uncovered / covered areas of the parent
+            if (moved or sized or hiding) and not (flags & SWP_NOREDRAW):
+                self.invalidate_screen_area(par, (old[0], old[1], old[0] + old[2], old[1] + old[3]))
+        if vis_now and not (flags & SWP_NOREDRAW):
+            if sized or showing or flags & SWP_FRAMECHANGED or (moved and not self.is_top(w)):
+                w.ncdirty = True
+                self.invalidate(w, None, True, True)
+                for d in self.descendants(w):
+                    d.ncdirty = True
+            elif moved and not self.is_top(w):
+                self.invalidate(w, None, True, True)
+        if not (flags & SWP_NOSENDCHANGING) or True:
+            mark = self.scratch_mark()
+            try:
+                a = self.scratch(40 if ps == 8 else 28)
+                fl = flags | (0 if moved else SWP_NOMOVE) | (0 if sized else SWP_NOSIZE)
+                if ps == 8:
+                    self.mem.write(a, struct.pack("<QQiiiiI", w.hwnd, after & M64, w.x, w.y, w.w,
+                                                  w.h, fl))
+                else:
+                    self.mem.write(a, struct.pack("<IIiiiiI", w.hwnd, after & 0xFFFFFFFF, w.x,
+                                                  w.y, w.w, w.h, fl))
+                if moved or sized or showing or hiding or flags & SWP_FRAMECHANGED or \
+                        not (flags & SWP_NOZORDER):
+                    self.send(w.hwnd, WM_WINDOWPOSCHANGED, 0, a)
+            finally:
+                self.scratch_release(mark)
+        if showing:
+            w.ncdirty = True
+            self.invalidate(w, None, True, True)
+        if hiding:
+            if self.focus and (self.focus == w.hwnd or self.is_child_of(self.wnd(self.focus), w)):
+                self.set_focus(w.parent.hwnd if w.style & WS_CHILD and w.parent is not
+                               self.desktop else 0)
+            if self.active == w.hwnd:
+                nxt = self._next_active(w)
+                self.set_active(nxt.hwnd if nxt else 0)
+            if self.capture == w.hwnd:
+                self.set_capture(0)
+        return True
+
+    def _zorder(self, w, after):
+        par = w.parent
+        after &= 0xFFFFFFFF
+        if after in (0, 0xFFFFFFFF):             # HWND_TOP / HWND_TOPMOST
+            if after == 0xFFFFFFFF:
+                w.exstyle |= WS_EX_TOPMOST
+            self.bring_to_top(w)
+            return
+        if w in par.children:
+            par.children.remove(w)
+        if after == 1:                           # HWND_BOTTOM
+            par.children.append(w)
+        elif after == 0xFFFFFFFE:                # HWND_NOTOPMOST
+            w.exstyle &= ~WS_EX_TOPMOST
+            idx = 0
+            while idx < len(par.children) and par.children[idx].exstyle & WS_EX_TOPMOST:
+                idx += 1
+            par.children.insert(idx, w)
+        else:
+            a = self.wnd(after)
+            if a is not None and a in par.children:
+                par.children.insert(par.children.index(a) + 1, w)
+            else:
+                par.children.insert(0, w)
+        self.changed()
+
+    def _next_active(self, w):
+        o = self.wnd(w.owner)
+        if o is not None and o.style & WS_VISIBLE and not (o.style & WS_DISABLED):
+            return o
+        for c in self.desktop.children:
+            if c is not w and not c.dead and c.style & WS_VISIBLE and \
+                    not (c.style & WS_DISABLED) and not (c.exstyle & WS_EX_TOOLWINDOW and
+                                                          c.style & WS_POPUP and not c.style &
+                                                          WS_CAPTION):
+                return c
+        return None
+
+    def minmax(self, w):
+        """WM_GETMINMAXINFO -> [reserved, maxsize, maxpos, mintrack, maxtrack]."""
+        sw, sh = self.gdi.screen.w, self.gdi.screen.h
+        fx = _M["frame"] if w.style & WS_THICKFRAME else _M["dlgframe"]
+        info = [(0, 0), (sw + 2 * fx, sh - 30 + 2 * fx), (-fx, -fx), (112, 27),
+                (sw + 2 * fx + 12, sh + 2 * fx + 12)]
+        mark = self.scratch_mark()
+        try:
+            a = self.scratch(struct.pack("<10i", *[v for pt in info for v in pt]))
+            self.send(w.hwnd, WM_GETMINMAXINFO, 0, a)
+            v = struct.unpack("<10i", self.mem.read(a, 40))
+            info = [(v[i], v[i + 1]) for i in range(0, 10, 2)]
+        finally:
+            self.scratch_release(mark)
+        return info
+
+    def show(self, w, cmd):
+        was = bool(w.style & WS_VISIBLE)
+        SW_HIDE, SW_SHOWNORMAL, SW_SHOWMINIMIZED, SW_MAXIMIZE, SW_SHOWNOACTIVATE = 0, 1, 2, 3, 4
+        if cmd == SW_HIDE:
+            if not was:
+                return 0
+            self.send(w.hwnd, WM_SHOWWINDOW, 0, 0)
+            self.set_pos(w, 0, 0, 0, 0, 0, SWP_HIDEWINDOW | SWP_NOSIZE | SWP_NOMOVE |
+                         SWP_NOZORDER | SWP_NOACTIVATE)
+            return 1
+        if cmd in (3,) and self.is_top(w):
+            self.maximize(w)
+        elif cmd in (2, 6, 7, 11):
+            self.minimize(w)
+        elif cmd in (1, 9) and w.min_state:
+            self.restore_(w)
+        if not was:
+            self.send(w.hwnd, WM_SHOWWINDOW, 1, 0)
+            self.set_pos(w, 0, 0, 0, 0, 0, SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE |
+                         (0 if cmd not in (4, 7, 8) else SWP_NOACTIVATE) | SWP_NOZORDER)
+            if not (w.style & WS_CHILD) and cmd not in (4, 7, 8, 2, 6, 11) and \
+                    not (w.exstyle & WS_EX_NOACTIVATE):
+                self.set_active(w.hwnd)
+                if self.active == w.hwnd and not self.focus:
+                    self.set_focus(w.hwnd)
+            if w.min_state == 0 and self.is_top(w):
+                self.send(w.hwnd, 0x0005, 0, _lparam_xy(w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]))
+                self.send(w.hwnd, WM_MOVE, 0, _lparam_xy(w.x + w.cl[0], w.y + w.cl[1]))
+        elif cmd in (5, 1, 9, 10) and not (w.style & WS_CHILD):
+            self.set_active(w.hwnd)
+        return 1 if was else 0
+
+    def maximize(self, w):
+        if w.min_state == 2:
+            return
+        if w.min_state == 0:
+            w.restore = (w.x, w.y, w.w, w.h)
+        mmi = self.minmax(w)
+        w.style |= WS_MAXIMIZE
+        w.style &= ~WS_MINIMIZE
+        w.min_state = 2
+        self.set_pos(w, 0, mmi[2][0], mmi[2][1], mmi[1][0], mmi[1][1],
+                     SWP_NOZORDER | SWP_FRAMECHANGED)
+        self.send(w.hwnd, 0x0005, 2, _lparam_xy(w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]))
+
+    def minimize(self, w):
+        if w.min_state == 1:
+            return
+        if w.min_state == 0:
+            w.restore = (w.x, w.y, w.w, w.h)
+        w.style |= WS_MINIMIZE
+        w.style &= ~WS_MAXIMIZE
+        w.min_state = 1
+        self.changed()
+        self.send(w.hwnd, 0x0005, 1, 0)
+        if self.active == w.hwnd:
+            nxt = self._next_active(w)
+            self.set_active(nxt.hwnd if nxt else 0)
+
+    def restore_(self, w):
+        prev = w.min_state
+        w.style &= ~(WS_MINIMIZE | WS_MAXIMIZE)
+        w.min_state = 0
+        if w.restore:
+            x, y, cx, cy = w.restore
+            self.set_pos(w, 0, x, y, cx, cy, SWP_NOZORDER | SWP_FRAMECHANGED)
+        else:
+            self.set_pos(w, 0, 0, 0, 0, 0, SWP_NOZORDER | SWP_NOMOVE | SWP_NOSIZE |
+                         SWP_FRAMECHANGED)
+        self.send(w.hwnd, 0x0005, 0, _lparam_xy(w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]))
+        if prev == 1:
+            self.set_active(w.hwnd)
+
+    # -- create / destroy -------------------------------------------------------------------------
+    def create(self, exstyle, cls, name, style, x, y, cx, cy, parent, menu, inst, param, wide,
+               cls_arg=0, name_arg=0):
+        p = self.p
+        par = self.wnd(parent)
+        if parent and par is None and parent not in (0xFFFFFFFD,):      # HWND_MESSAGE
+            p.last_error = 1400                                          # invalid hwnd
+            return 0
+        style &= 0xFFFFFFFF
+        exstyle &= 0xFFFFFFFF
+        owner = 0
+        msg_only = parent == 0xFFFFFFFD
+        if style & WS_CHILD and par is None and not msg_only:
+            p.last_error = 1406                                          # no parent for child
+            return 0
+        if not (style & WS_CHILD):
+            if par is not None:
+                owner = self.top(par).hwnd if par is not self.desktop else 0
+            par = self.desktop
+        if msg_only:
+            par = self.desktop
+            style &= ~WS_VISIBLE
+        h = self.next_hwnd
+        self.next_hwnd += 4
+        w = _Wnd(h)
+        w.cls = cls
+        w.style, w.exstyle = style, exstyle
+        w.msg_only = msg_only
+        if not (style & WS_CHILD):
+            if (style & WS_CAPTION) == WS_CAPTION or not (style & WS_POPUP):
+                w.style |= WS_CLIPSIBLINGS
+                if not (style & WS_POPUP):
+                    w.style |= WS_CAPTION
+            if exstyle & WS_EX_DLGMODALFRAME or (style & WS_CAPTION) == WS_CAPTION or \
+                    style & WS_THICKFRAME:
+                w.exstyle |= WS_EX_WINDOWEDGE
+        w.parent = par
+        w.owner = owner
+        w.text = name
+        w.proc = cls.proc if (wide or not hasattr(cls, "proc_a")) else cls.proc_a
+        w.unicode = cls.unicode if not cls.system else wide
+        w.extra = bytearray(cls.wnd_extra)
+        w.tid = self.cur_tid()
+        w.inst = inst
+        if style & WS_CHILD:
+            w.id = menu & 0xFFFFFFFF if self.ps == 4 else menu
+        else:
+            w.menu = menu
+            if not menu and cls.menu:
+                w.menu = cls.menu
+        # geometry defaults
+        sw, sh = self.gdi.screen.w, self.gdi.screen.h
+        x, y, cx, cy = (_s32(v & 0xFFFFFFFF) if (v & 0xFFFFFFFF) != CW_USEDEFAULT
+                        else None for v in (x, y, cx, cy))
+        if not (style & WS_CHILD):
+            if x is None:
+                n = len([c for c in self.desktop.children if c.style & WS_CAPTION]) % 8
+                x, y = 40 + 26 * n, 30 + 26 * n
+                if style & WS_POPUP and not (style & WS_CAPTION):
+                    x, y = 0, 0
+            if cx is None:
+                if style & WS_POPUP:
+                    cx, cy = 0, 0
+                else:
+                    cx, cy = min(640, sw * 3 // 4), min(480, sh * 3 // 4)
+            elif cy is None:
+                cy = min(480, sh * 3 // 4)
+        x, y = x or 0, y or 0
+        cx, cy = cx or 0, cy or 0
+        if cy is None:
+            cy = 0
+        w.x, w.y, w.w, w.h = x, y, max(0, cx), max(0, cy)
+        self.wins[h] = w
+        if par is self.desktop and not msg_only:
+            self.ensure_display()
+        visible = style & WS_VISIBLE
+        w.style &= ~WS_VISIBLE
+        # link into the tree (children go on top)
+        if style & WS_CHILD:
+            par.children.append(w)              # children link at the bottom (tab order)
+        else:
+            idx = 0
+            if not (exstyle & WS_EX_TOPMOST):
+                while idx < len(par.children) and par.children[idx].exstyle & WS_EX_TOPMOST:
+                    idx += 1
+            par.children.insert(idx, w)
+        self.changed()
+        if self.is_top(w):
+            w.surf = _Surf(max(1, w.w), max(1, w.h), _cr_pix(0xFFFFFF))
+        if w.style & WS_CHILD and cls.style & 0x20:           # CS_OWNDC
+            pass
+        # CREATESTRUCT (strings in the caller's charset)
+        ps = self.ps
+        mark = self.scratch_mark()
+        try:
+            nm = self.scratch((name.encode("utf-16-le") + b"\0\0") if wide
+                              else (name.encode("utf-8") + b"\0"))
+            cn = cls_arg if cls_arg and cls_arg < 0x10000 else self.scratch(
+                (cls.name.encode("utf-16-le") + b"\0\0") if wide else (cls.name.encode() + b"\0"))
+            if ps == 8:
+                cs = struct.pack("<QQQQiiiiIIQQI4x", param & M64, inst & M64, menu & M64,
+                                 (par.hwnd if par is not self.desktop else owner) & M64,
+                                 w.h, w.w, w.y, w.x, style, 0, nm, cn, exstyle)
+            else:
+                cs = struct.pack("<IIIIiiiiIIII", param & 0xFFFFFFFF, inst & 0xFFFFFFFF,
+                                 menu & 0xFFFFFFFF,
+                                 (par.hwnd if par is not self.desktop else owner),
+                                 w.h, w.w, w.y, w.x, style, nm, cn, exstyle)
+            csa = self.scratch(cs)
+            if self.hooks.get(5):
+                cbt = self.scratch(struct.pack("<QQ" if ps == 8 else "<II", csa, 0))
+                if self._cbt(3, h, cbt):                           # HCBT_CREATEWND
+                    self._unlink(w)
+                    return 0
+                # a CBT hook may have changed the geometry / subclassed the window
+                if ps == 8:
+                    cy_, cx_, y_, x_ = struct.unpack("<iiii", self.mem.read(csa + 32, 16))
+                else:
+                    cy_, cx_, y_, x_ = struct.unpack("<iiii", self.mem.read(csa + 16, 16))
+                w.x, w.y, w.w, w.h = x_, y_, max(0, cx_), max(0, cy_)
+            if not self.send(h, WM_NCCREATE, 0, csa, wide):
+                self._destroy_now(w, send=False)
+                return 0
+            if w.dead:
+                return 0
+            self.nc_calc(w)
+            r = self.send(h, 0x0001, 0, csa, wide)                   # WM_CREATE
+            if _s32(r & 0xFFFFFFFF) == -1 or w.dead:
+                self.destroy(w)
+                p.last_error = 1400
+                return 0
+        finally:
+            self.scratch_release(mark)
+        if w.style & WS_CHILD and not (w.exstyle & WS_EX_NOPARENTNOTIFY):
+            wp_ = (0x0001) | ((w.id & 0xFFFF) << 16)
+            pp = w.parent
+            while pp is not None and pp is not self.desktop:
+                self.send(pp.hwnd, WM_PARENTNOTIFY, wp_, h)
+                if not (pp.style & WS_CHILD) or pp.exstyle & WS_EX_NOPARENTNOTIFY:
+                    break
+                pp = pp.parent
+        # WM_SIZE / WM_MOVE after creation
+        self.send(h, 0x0005, 0, _lparam_xy(w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]))
+        self.send(h, WM_MOVE, 0, _lparam_xy(w.x + w.cl[0], w.y + w.cl[1]))
+        if w.dead:
+            return 0
+        if visible:
+            if style & WS_MAXIMIZE:
+                self.show(w, 3)
+            elif style & WS_MINIMIZE:
+                self.show(w, 2)
+            else:
+                self.show(w, 1 if not (style & WS_CHILD) else 5)
+        return h
+
+    def _unlink(self, w):
+        par = w.parent
+        if par is not None and w in par.children:
+            par.children.remove(w)
+        self.changed()
+
+    def destroy(self, w):
+        if w is None or w is self.desktop or w.destroying:
+            return False
+        if self._cbt(4, w.hwnd, 0):                                   # HCBT_DESTROYWND
+            return False
+        w.destroying = True
+        # owned windows first
+        for o in list(self.desktop.children):
+            if o.owner == w.hwnd and not o.destroying:
+                self.destroy(o)
+        if w.style & WS_VISIBLE:
+            self.set_pos(w, 0, 0, 0, 0, 0, SWP_HIDEWINDOW | SWP_NOSIZE | SWP_NOMOVE |
+                         SWP_NOZORDER | SWP_NOACTIVATE)
+        if w.style & WS_CHILD and not (w.exstyle & WS_EX_NOPARENTNOTIFY):
+            pp = w.parent
+            if pp is not None and pp is not self.desktop:
+                self.send(pp.hwnd, WM_PARENTNOTIFY, 0x0002 | ((w.id & 0xFFFF) << 16), w.hwnd)
+        self._destroy_now(w)
+        return True
+
+    def _destroy_now(self, w, send=True):
+        if send:
+            self.send(w.hwnd, 0x0002, 0, 0)                           # WM_DESTROY
+        for ch in list(w.children):
+            ch.destroying = True
+            self._destroy_now(ch, send)
+        if send:
+            self.send(w.hwnd, WM_NCDESTROY, 0, 0)
+        w.dead = True
+        self._unlink(w)
+        if self.focus == w.hwnd:
+            self.focus = 0
+        if self.capture == w.hwnd:
+            self.capture = 0
+        if self.active == w.hwnd:
+            self.active = 0
+            nxt = self._next_active(w)
+            if nxt is not None:
+                self.set_active(nxt.hwnd)
+        if self.caret["hwnd"] == w.hwnd:
+            self.caret["hwnd"] = 0
+        for q in self.queues.values():
+            q.timers = [t for t in q.timers if t["hwnd"] != w.hwnd]
+            q.posted = [m for m in q.posted if m["hwnd"] != w.hwnd]
+            q.input = [m for m in q.input if m["hwnd"] != w.hwnd]
+        self.wins.pop(w.hwnd, None)
+        self.track_leave.pop(w.hwnd, None)
+        if self.mouse_over == w.hwnd:
+            self.mouse_over = 0
+        w.surf = None if not self.is_top(w) else w.surf
+        self.changed()
+
+    # -- idle / waiting ------------------------------------------------------------------------------
+    def wait_ready(self, tid, filt):
+        """Anything retrievable for thread tid under filter (hwnd, lo, hi, qsmask)?"""
+        q = self.queue(tid)
+        if self.raw_input:
+            return True
+        hwnd_f, lo, hi = filt[:3]
+        mask = filt[3] if len(filt) > 3 else 0xFFFF
+        if mask & 0x88 and any(self._match(m, hwnd_f, lo, hi) for m in q.posted):
+            return True
+        if q.quit is not None:
+            return True
+        if mask & 0x7 and any(self._match(m, hwnd_f, lo, hi) for m in q.input):
+            return True
+        if mask & 0x20 and self.paint_candidate(tid, hwnd_f if hwnd_f not in
+                                                (0xFFFFFFFF, M64) else 0) is not None:
+            return True
+        if mask & 0x10:
+            now = time.monotonic()
+            if any(t["next"] <= now for t in q.timers):
+                return True
+        return False
+
+
+_VK_SCAN = {0x08: 0x0E, 0x09: 0x0F, 0x0D: 0x1C, 0x10: 0x2A, 0x11: 0x1D, 0x12: 0x38, 0x13: 0x45,
+            0x14: 0x3A, 0x1B: 0x01, 0x20: 0x39, 0x21: 0x49, 0x22: 0x51, 0x23: 0x4F, 0x24: 0x47,
+            0x25: 0x4B, 0x26: 0x48, 0x27: 0x4D, 0x28: 0x50, 0x2D: 0x52, 0x2E: 0x53, 0x70: 0x3B,
+            0x71: 0x3C, 0x72: 0x3D, 0x73: 0x3E, 0x74: 0x3F, 0x75: 0x40, 0x76: 0x41, 0x77: 0x42,
+            0x78: 0x43, 0x79: 0x44, 0x7A: 0x57, 0x7B: 0x58}
+for _i, _c in enumerate("1234567890"):
+    _VK_SCAN[ord(_c)] = 0x02 + _i
+for _c, _s in zip("QWERTYUIOP", range(0x10, 0x1A)):
+    _VK_SCAN[ord(_c)] = _s
+for _c, _s in zip("ASDFGHJKL", range(0x1E, 0x27)):
+    _VK_SCAN[ord(_c)] = _s
+for _c, _s in zip("ZXCVBNM", range(0x2C, 0x33)):
+    _VK_SCAN[ord(_c)] = _s
+
+
+# -- user32 drawing: painter, edges, frame controls, icons, resources ----------------------
+
+COLOR_SCROLLBAR, COLOR_BACKGROUND, COLOR_ACTIVECAPTION, COLOR_INACTIVECAPTION = 0, 1, 2, 3
+COLOR_MENU, COLOR_WINDOW, COLOR_WINDOWFRAME, COLOR_MENUTEXT, COLOR_WINDOWTEXT = 4, 5, 6, 7, 8
+COLOR_CAPTIONTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_BTNFACE = 9, 13, 14, 15
+COLOR_BTNSHADOW, COLOR_GRAYTEXT, COLOR_BTNTEXT, COLOR_INACTIVECAPTIONTEXT = 16, 17, 18, 19
+COLOR_BTNHIGHLIGHT, COLOR_3DDKSHADOW, COLOR_3DLIGHT, COLOR_INFOTEXT, COLOR_INFOBK = \
+    20, 21, 22, 23, 24
+COLOR_GRADIENTACTIVECAPTION, COLOR_GRADIENTINACTIVECAPTION = 27, 28
+
+_LT_IN = (-1, -1, -1, -1, -1, 20, 20, -1, -1, 21, 21, -1, -1, -1, -1, -1)
+_LT_OUT = (-1, 22, 16, -1, 20, 22, 16, -1, 21, 22, 16, -1, -1, 22, 16, -1)
+_RB_IN = (-1, -1, -1, -1, -1, 16, 16, -1, -1, 22, 22, -1, -1, -1, -1, -1)
+_RB_OUT = (-1, 21, 20, -1, 16, 21, 20, -1, 22, 21, 20, -1, -1, 21, 20, -1)
+_LT_IN_SOFT = (-1, -1, -1, -1, -1, 22, 22, -1, -1, 16, 16, -1, -1, -1, -1, -1)
+_LT_OUT_SOFT = (-1, 20, 21, -1, 22, 20, 21, -1, 16, 20, 21, -1, -1, 20, 21, -1)
+
+
+class _Painter:
+    """Python-side drawing on a window (client or whole window) or an existing DC."""
+
+    def __init__(self, wm, w=None, client=True, dc=None):
+        self.wm = wm
+        self.gdi = wm.gdi
+        if dc is None:
+            dc = _DC(self.gdi, "client" if client else "window", w.hwnd if w else 0)
+            if w is None:
+                dc.dckind = "screen"
+        self.dc = dc
+        self.t = self.gdi.begin(dc)
+        self.surf, self.ox, self.oy, self.clip, _bm = self.t
+        self.sys = self.gdi.sys_color
+
+    def done(self):
+        self.gdi.end(self.dc, self.t)
+
+    def xy(self, x, y):
+        X, Y = self.dc.lp2dp(x, y)
+        return X + self.ox, Y + self.oy
+
+    def pix(self, color):
+        return self.dc.pix(color)
+
+    def fill(self, l, t, r, b, color):
+        if l >= r or t >= b:
+            return
+        X0, Y0 = self.xy(l, t)
+        X1, Y1 = self.xy(r, b)
+        _fill(self.surf, self.clip, X0, Y0, X1, Y1, self.pix(color))
+
+    def fill_brush(self, l, t, r, b, hbr):
+        br = self.gdi.brush(hbr) if isinstance(hbr, int) else hbr
+        if br is None:
+            return
+        X0, Y0 = self.xy(l, t)
+        X1, Y1 = self.xy(r, b)
+        _fill_brush(self.dc, self.surf, self.clip, X0, Y0, X1, Y1, br, 13, self.ox, self.oy)
+
+    def hline(self, x0, x1, y, color):
+        self.fill(x0, y, x1, y + 1, color)
+
+    def vline(self, x, y0, y1, color):
+        self.fill(x, y0, x + 1, y1, color)
+
+    def frame(self, l, t, r, b, color, n=1):
+        for i in range(n):
+            self.hline(l + i, r - i, t + i, color)
+            self.hline(l + i, r - i, b - 1 - i, color)
+            self.vline(l + i, t + i, b - i, color)
+            self.vline(r - 1 - i, t + i, b - i, color)
+
+    def plot(self, x, y, color):
+        X, Y = self.xy(x, y)
+        _plot(self.surf, self.clip, X, Y, self.pix(color))
+
+    def line(self, x0, y0, x1, y1, color, last=True):
+        X0, Y0 = self.xy(x0, y0)
+        X1, Y1 = self.xy(x1, y1)
+        _line(self.surf, self.clip, X0, Y0, X1, Y1, self.pix(color), 1, 13, 0, last)
+
+    def poly(self, pts, color):
+        dev = [self.xy(x, y) for (x, y) in pts]
+        spans = _poly_spans(dev, True)
+        pix = self.pix(color)
+        for y, row in spans.items():
+            for (a, b) in row:
+                _span(self.surf, self.clip, y, a, b, pix)
+        _pen_stroke_pix(self.surf, self.clip, dev, pix)
+
+    def dither(self, l, t, r, b, c1, c2):
+        """50% checkerboard (scroll bar tracks, disabled text)."""
+        p1, p2 = self.pix(c1), self.pix(c2)
+        for y in range(t, b):
+            X0, Y = self.xy(l, y)
+            X1, _ = self.xy(r, y)
+            n = X1 - X0
+            if n <= 0:
+                continue
+            first = p1 if (X0 + Y) % 2 == 0 else p2
+            second = p2 if first is p1 else p1
+            row = (first + second) * (n // 2 + 1)
+            for (cl, ct, cr, cb) in self.clip:
+                if ct <= Y < cb:
+                    a, bb = max(X0, cl, 0), min(X1, cr, self.surf.w)
+                    if a < bb and 0 <= Y < self.surf.h:
+                        o = (Y * self.surf.w + a) * 4
+                        self.surf.px[o:o + (bb - a) * 4] = row[(a - X0) * 4:(bb - X0) * 4]
+
+    def edge(self, rect, edge, flags):
+        return _draw_edge(self, rect, edge, flags)
+
+    def text(self, x, y, s, font, color, clip_rect=None):
+        """Plain text at logical (x, y) top-left (no background)."""
+        X, Y = self.xy(x, y)
+        clip = self.clip
+        if clip_rect is not None:
+            a = self.xy(clip_rect[0], clip_rect[1])
+            b = self.xy(clip_rect[2], clip_rect[3])
+            clip = _rects_and(clip, [(a[0], a[1], b[0], b[1])])
+        widths = [font.advance(c) for c in s]
+        _draw_glyphs(self.dc, self.surf, clip, X, Y, s, font, widths, self.pix(color))
+        return sum(widths)
+
+    def draw_text(self, rect, s, fmt, hfont, color, bk=None):
+        dc = self.dc
+        saved = (dc.font, dc.text_color, dc.bk_mode, dc.bk_color)
+        dc.font = hfont
+        dc.text_color = color
+        dc.bk_mode = 1 if bk is None else 2
+        if bk is not None:
+            dc.bk_color = bk
+        try:
+            return _draw_text_fmt(dc, s, rect, fmt)
+        finally:
+            dc.font, dc.text_color, dc.bk_mode, dc.bk_color = saved
+
+    def icon(self, x, y, hicon, cx=0, cy=0):
+        ic = self.gdi.get(hicon)
+        if ic is None or ic.kind not in ("icon", "cursor"):
+            return
+        _draw_icon(self.dc, self.surf, self.clip, self.xy(x, y), ic, cx or ic.w, cy or ic.ht, 3)
+
+
+def _pen_stroke_pix(surf, clip, pts, pix):
+    for i in range(len(pts)):
+        (x0, y0), (x1, y1) = pts[i], pts[(i + 1) % len(pts)]
+        _line(surf, clip, x0, y0, x1, y1, pix, 1, 13, 0, True)
+
+
+def _draw_edge(pt, rect, edge, flags):
+    """DrawEdge (classic 3-D borders). Returns the interior rect."""
+    l, t, r, b = rect
+    sysc = pt.gdi.sys_color
+    idx = edge & 0xF
+    soft = flags & 0x1000
+    lt_in = (_LT_IN_SOFT if soft else _LT_IN)[idx]
+    lt_out = (_LT_OUT_SOFT if soft else _LT_OUT)[idx]
+    rb_in, rb_out = _RB_IN[idx], _RB_OUT[idx]
+    if flags & 0x8000:                                     # BF_MONO
+        lt_in = rb_in = -1
+        lt_out = rb_out = COLOR_WINDOWFRAME
+    elif flags & 0x4000:                                   # BF_FLAT
+        lt_out = rb_out = COLOR_BTNSHADOW
+        lt_in = rb_in = COLOR_BTNFACE if lt_in != -1 else -1
+    if flags & 0x10:                                       # BF_DIAGONAL (simplified)
+        c = rb_out if rb_out != -1 else lt_out
+        if c != -1:
+            pt.line(l, b - 1, r - 1, t, sysc(c))
+        return rect
+    for (c_lt, c_rb) in ((lt_out, rb_out), (lt_in, rb_in)):
+        if c_lt == -1 and c_rb == -1:
+            continue
+        if c_lt != -1:
+            if flags & 2:
+                pt.hline(l, r, t, sysc(c_lt))
+            if flags & 1:
+                pt.vline(l, t, b, sysc(c_lt))
+        if c_rb != -1:
+            if flags & 8:
+                pt.hline(l, r, b - 1, sysc(c_rb))
+            if flags & 4:
+                pt.vline(r - 1, t, b, sysc(c_rb))
+        if flags & 1:
+            l += 1
+        if flags & 2:
+            t += 1
+        if flags & 4:
+            r -= 1
+        if flags & 8:
+            b -= 1
+    if flags & 0x800:                                      # BF_MIDDLE
+        pt.fill(l, t, r, b, sysc(COLOR_BTNFACE if not flags & 0x8000 else COLOR_WINDOW))
+    return (l, t, r, b)
+
+
+def _glyph_arrow(pt, rect, direction, color, size=None):
+    """Solid triangle arrow centred in rect: 0 up, 1 down, 2 left, 3 right."""
+    l, t, r, b = rect
+    w, h = r - l, b - t
+    n = size or max(2, (min(w, h) - 4) // 3 + 1)
+    cx, cy = l + w // 2, t + h // 2
+    for i in range(n):
+        if direction == 0:
+            pt.hline(cx - i, cx + i + 1, cy - n // 2 + i, color)
+        elif direction == 1:
+            pt.hline(cx - (n - 1 - i), cx + (n - 1 - i) + 1, cy - n // 2 + i, color)
+        elif direction == 2:
+            pt.vline(cx - n // 2 + i, cy - i, cy + i + 1, color)
+        else:
+            pt.vline(cx - n // 2 + i, cy - (n - 1 - i), cy + (n - 1 - i) + 1, color)
+
+
+def _draw_check(pt, l, t, color):
+    """7x7 check mark with its top-left at (l, t)."""
+    for i, (x, y0) in enumerate(((0, 2), (1, 3), (2, 4), (3, 3), (4, 2), (5, 1), (6, 0))):
+        pt.vline(l + x, t + y0, t + y0 + 3, color)
+
+
+def _draw_frame_control(pt, rect, typ, state):
+    sysc = pt.gdi.sys_color
+    l, t, r, b = rect
+    pushed = state & 0x200
+    inactive = state & 0x100
+    checked = state & 0x400
+    flat = state & 0x4000
+    if typ == 4:                                           # DFC_BUTTON
+        kind = state & 0xFF
+        if kind & 0x10 or kind == 0x10:                    # DFCS_BUTTONPUSH
+            if pushed or checked:
+                if flat:
+                    pt.frame(l, t, r, b, sysc(COLOR_BTNSHADOW))
+                else:
+                    _draw_edge(pt, rect, 10, 15 | 0x800)
+            else:
+                _draw_edge(pt, rect, 5, 15 | 0x800 | 0x1000 if not flat else 15 | 0x4000 | 0x800)
+            return
+        if kind & 4 or kind in (1, 2):                     # radio
+            sz = min(r - l, b - t, 12)
+            ox, oy = l + (r - l - sz) // 2, t + (b - t - sz) // 2
+            _draw_radio(pt, ox, oy, sz, checked, pushed, inactive, flat)
+            return
+        # check box (DFCS_BUTTONCHECK / 3STATE)
+        sz = min(r - l, b - t, 13)
+        ox, oy = l + (r - l - sz) // 2, t + (b - t - sz) // 2
+        if flat:
+            pt.frame(ox, oy, ox + sz, oy + sz, sysc(COLOR_BTNSHADOW))
+        else:
+            _draw_edge(pt, (ox, oy, ox + sz, oy + sz), 10, 15)
+        inner = sysc(COLOR_BTNFACE) if (pushed or inactive or (kind & 8 and checked)) \
+            else sysc(COLOR_WINDOW)
+        pt.fill(ox + 2, oy + 2, ox + sz - 2, oy + sz - 2, inner)
+        if checked:
+            col = sysc(COLOR_BTNSHADOW) if inactive or kind & 8 else sysc(COLOR_WINDOWTEXT)
+            _draw_check(pt, ox + 3, oy + 3, col)
+        return
+    if typ == 1:                                           # DFC_CAPTION
+        _draw_edge(pt, rect, 10 if pushed else 5, 15 | 0x800 | (0 if pushed else 0x1000))
+        kind = state & 0xFF
+        col = sysc(COLOR_BTNTEXT) if not inactive else sysc(COLOR_GRAYTEXT)
+        w, h = r - l, b - t
+        off = 1 if pushed else 0
+        cx, cy = l + w // 2 + off - 1, t + h // 2 + off
+        if kind == 0:                                      # close X
+            s = max(2, min(w, h) // 2 - 3)
+            for i in range(-s, s + 1):
+                pt.hline(cx + i, cx + i + 2, cy + i, col)
+                pt.hline(cx - i, cx - i + 2, cy + i, col)
+        elif kind == 1:                                    # minimize
+            pt.fill(cx - 3, cy + 2, cx + 3, cy + 4, col)
+        elif kind == 2:                                    # maximize
+            pt.frame(cx - 4, cy - 4, cx + 5, cy + 4, col)
+            pt.hline(cx - 4, cx + 5, cy - 3, col)
+        elif kind == 3:                                    # restore
+            pt.frame(cx - 2, cy - 5, cx + 5, cy + 1, col)
+            pt.hline(cx - 2, cx + 5, cy - 4, col)
+            pt.fill(cx - 4, cy - 2, cx + 3, cy + 4, sysc(COLOR_BTNFACE))
+            pt.frame(cx - 4, cy - 2, cx + 3, cy + 4, col)
+            pt.hline(cx - 4, cx + 3, cy - 1, col)
+        elif kind == 4:                                    # help ?
+            f = _GFont("sansb", 10)
+            pt.text(cx - 2, cy - 6, "?", f, col)
+        return
+    if typ == 3:                                           # DFC_SCROLL
+        kind = state & 0xFF
+        if kind == 8:                                      # size grip
+            for i in range(3):
+                o = 4 * i
+                pt.line(r - 2 - o, b - 1, r - 1, b - 2 - o, sysc(COLOR_BTNHIGHLIGHT))
+                pt.line(r - 3 - o, b - 1, r - 1, b - 3 - o, sysc(COLOR_BTNSHADOW))
+                pt.line(r - 4 - o, b - 1, r - 1, b - 4 - o, sysc(COLOR_BTNSHADOW))
+            return
+        if flat:
+            pt.fill(l, t, r, b, sysc(COLOR_BTNFACE))
+            pt.frame(l, t, r, b, sysc(COLOR_BTNSHADOW))
+        elif pushed:
+            pt.fill(l, t, r, b, sysc(COLOR_BTNFACE))
+            pt.frame(l, t, r, b, sysc(COLOR_BTNSHADOW))
+        else:
+            _draw_edge(pt, rect, 5, 15 | 0x800 | 0x1000)
+        off = 1 if pushed else 0
+        d = {0: 0, 1: 1, 2: 2, 3: 3, 5: 1}.get(kind, 1)
+        rr = (l + off, t + off, r + off, b + off)
+        if inactive:
+            _glyph_arrow(pt, (rr[0] + 1, rr[1] + 1, rr[2] + 1, rr[3] + 1), d,
+                         sysc(COLOR_BTNHIGHLIGHT))
+            _glyph_arrow(pt, rr, d, sysc(COLOR_BTNSHADOW))
+        else:
+            _glyph_arrow(pt, rr, d, sysc(COLOR_BTNTEXT))
+        return
+    if typ == 2:                                           # DFC_MENU
+        kind = state & 0xFF
+        col = 0
+        if kind == 1:                                      # check
+            _draw_check(pt, l + (r - l - 7) // 2, t + (b - t - 7) // 2, col)
+        elif kind == 2:                                    # bullet
+            cx, cy = (l + r) // 2, (t + b) // 2
+            pt.fill(cx - 2, cy - 1, cx + 3, cy + 2, col)
+            pt.fill(cx - 1, cy - 2, cx + 2, cy + 3, col)
+        elif kind in (0, 4):                               # submenu arrow
+            _glyph_arrow(pt, rect, 3, col, 4)
+        return
+
+
+def _draw_radio(pt, x, y, sz, checked, pushed, inactive, flat):
+    sysc = pt.gdi.sys_color
+    # classic 12x12 radio: four arcs of 3-D colors
+    pts_outer_lt = [(4, 0), (5, 0), (6, 0), (7, 0), (2, 1), (3, 1), (8, 1), (9, 1), (1, 2), (1, 3),
+                    (0, 4), (0, 5), (0, 6), (0, 7), (1, 8), (1, 9)]
+    pts_outer_rb = [(10, 2), (10, 3), (11, 4), (11, 5), (11, 6), (11, 7), (10, 8), (10, 9),
+                    (8, 10), (9, 10), (2, 10), (3, 10), (4, 11), (5, 11), (6, 11), (7, 11)]
+    pts_inner_lt = [(4, 1), (5, 1), (6, 1), (7, 1), (2, 2), (3, 2), (8, 2), (9, 2), (2, 3), (1, 4),
+                    (1, 5), (1, 6), (1, 7), (2, 8)]
+    pts_inner_rb = [(9, 3), (10, 4), (10, 5), (10, 6), (10, 7), (9, 8), (9, 9), (8, 9), (2, 9),
+                    (3, 9), (4, 10), (5, 10), (6, 10), (7, 10)]
+    fillc = sysc(COLOR_BTNFACE) if pushed or inactive else sysc(COLOR_WINDOW)
+    for yy in range(2, 10):
+        x0 = 2 if yy in (2, 9) else 2
+        pt.hline(x + 2, x + 10, y + yy, fillc)
+    pt.hline(x + 4, x + 8, y + 1, fillc)
+    pt.hline(x + 4, x + 8, y + 10, fillc)
+    for (a, b) in pts_outer_lt:
+        pt.plot(x + a, y + b, sysc(COLOR_BTNSHADOW))
+    for (a, b) in pts_inner_lt:
+        pt.plot(x + a, y + b, sysc(COLOR_3DDKSHADOW) if not flat else sysc(COLOR_BTNSHADOW))
+    for (a, b) in pts_outer_rb:
+        pt.plot(x + a, y + b, sysc(COLOR_BTNHIGHLIGHT))
+    for (a, b) in pts_inner_rb:
+        pt.plot(x + a, y + b, sysc(COLOR_3DLIGHT))
+    if checked:
+        col = sysc(COLOR_GRAYTEXT) if inactive else sysc(COLOR_WINDOWTEXT)
+        pt.hline(x + 5, x + 7, y + 4, col)
+        pt.hline(x + 4, x + 8, y + 5, col)
+        pt.hline(x + 4, x + 8, y + 6, col)
+        pt.hline(x + 5, x + 7, y + 7, col)
+
+
+# -- icons & cursors --------------------------------------------------------------------------
+
+class _GIcon(_GObj):
+    def __init__(self, w, h, color=None, mask=None, alpha=None, cursor=False, hot=(0, 0),
+                 css="default"):
+        self.kind = "cursor" if cursor else "icon"
+        self.w, self.ht = w, h
+        self.color = color or _Surf(w, h)            # _Surf BGRX
+        self.mask = mask                             # bytearray w*h (1 = transparent)
+        self.alpha = alpha                           # bytearray w*h or None
+        self.hot = hot
+        self.css = css
+        self.shared = False
+        self.res = None
+
+
+def _draw_icon(dc, surf, clip, xy, ic, cx, cy, flags):
+    X, Y = xy
+    sw_, sh_ = ic.w, ic.ht
+    px = ic.color.px
+    for j in range(cy):
+        yy = Y + j
+        if not 0 <= yy < surf.h:
+            continue
+        sj = j * sh_ // cy
+        for i in range(cx):
+            xx = X + i
+            if not 0 <= xx < surf.w:
+                continue
+            if not any(cl <= xx < cr and ct <= yy < cb for (cl, ct, cr, cb) in clip):
+                continue
+            si = i * sw_ // cx
+            o = (sj * sw_ + si)
+            do = (yy * surf.w + xx) * 4
+            if ic.alpha is not None and flags & 2:
+                a = ic.alpha[o]
+                if a == 0:
+                    continue
+                if a == 255:
+                    surf.px[do:do + 3] = px[o * 4:o * 4 + 3]
+                else:
+                    for ch in range(3):
+                        surf.px[do + ch] = (px[o * 4 + ch] * a + surf.px[do + ch] * (255 - a)) // 255
+                continue
+            m = ic.mask[o] if ic.mask is not None else 0
+            if flags & 1 and m and not (flags & 2):
+                continue
+            if m:
+                # AND mask 1: screen XOR color (usually black -> transparent)
+                if flags & 2:
+                    c = px[o * 4:o * 4 + 3]
+                    if c != b"\0\0\0":
+                        for ch in range(3):
+                            surf.px[do + ch] ^= c[ch]
+                continue
+            if flags & 2:
+                surf.px[do:do + 3] = px[o * 4:o * 4 + 3]
+            else:
+                surf.px[do:do + 3] = b"\0\0\0"
+
+
+def _icon_from_dib(data, cursor=False):
+    """RT_ICON / RT_CURSOR image (BITMAPINFOHEADER + XOR + AND, or PNG)."""
+    hot = (0, 0)
+    if cursor and data[:4] != b"\x28\0\0\0" and len(data) > 4:
+        hot = struct.unpack_from("<HH", data, 0)
+        data = data[4:]
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        img = _png_decode(data)
+        if img is None:
+            return None
+        w, h, rgba = img
+        ic = _GIcon(w, h, cursor=cursor, hot=hot)
+        ic.color.px[:] = bytes(b for i in range(0, len(rgba), 4)
+                               for b in (rgba[i + 2], rgba[i + 1], rgba[i], 0))
+        ic.alpha = bytearray(rgba[3::4])
+        ic.mask = bytearray(1 if a == 0 else 0 for a in ic.alpha)
+        return ic
+    if len(data) < 40:
+        return None
+    hsz, w, h2, planes, bpp, comp = struct.unpack_from("<IiiHHI", data, 0)
+    h = abs(h2) // 2
+    if w <= 0 or h <= 0 or w > 1024 or h > 1024:
+        return None
+    clr_used = struct.unpack_from("<I", data, 32)[0]
+    ncol = (clr_used or (1 << bpp)) if bpp <= 8 else 0
+    pal = []
+    off = hsz
+    for i in range(ncol):
+        pal.append(bytes(data[off + 4 * i:off + 4 * i + 3]) + b"\0")
+    off += 4 * ncol
+    stride = ((w * bpp + 31) // 32) * 4
+    mstride = ((w + 31) // 32) * 4
+    ic = _GIcon(w, h, cursor=cursor, hot=hot)
+    tables = _pal_tables(pal) if bpp <= 8 else None
+    alpha = bytearray(w * h) if bpp == 32 else None
+    any_alpha = False
+    for i in range(h):
+        row = data[off + i * stride: off + (i + 1) * stride]
+        y = h - 1 - i
+        px = _row_to_bgrx(row, w, bpp, pal, None, tables)
+        ic.color.px[y * w * 4:(y + 1) * w * 4] = px[:w * 4]
+        if bpp == 32:
+            a = row[3:w * 4:4]
+            alpha[y * w:(y + 1) * w] = a
+            if any(a):
+                any_alpha = True
+    moff = off + stride * h
+    mask = bytearray(w * h)
+    for i in range(h):
+        row = data[moff + i * mstride: moff + (i + 1) * mstride]
+        y = h - 1 - i
+        if len(row) < (w + 7) // 8:
+            break
+        bits = _expand_bits(bytes(row), w)
+        mask[y * w:(y + 1) * w] = bits
+    ic.mask = mask
+    if any_alpha:
+        ic.alpha = alpha
+    return ic
+
+
+def _png_decode(data):
+    """Minimal PNG decoder (8-bit RGB/RGBA/gray/palette, non-interlaced) -> (w, h, rgba)."""
+    try:
+        pos = 8
+        idat = b""
+        w = h = depth = ctype = interlace = 0
+        plte = b""
+        trns = b""
+        while pos + 8 <= len(data):
+            n, t = struct.unpack_from(">I4s", data, pos)
+            chunk = data[pos + 8:pos + 8 + n]
+            pos += 12 + n
+            if t == b"IHDR":
+                w, h, depth, ctype, _c, _f, interlace = struct.unpack(">IIBBBBB", chunk)
+            elif t == b"IDAT":
+                idat += chunk
+            elif t == b"PLTE":
+                plte = chunk
+            elif t == b"tRNS":
+                trns = chunk
+            elif t == b"IEND":
+                break
+        if depth != 8 or interlace:
+            return None
+        ch = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[ctype]
+        raw = _zlib.decompress(idat)
+        stride = w * ch
+        out = bytearray(w * h * 4)
+        prev = bytearray(stride)
+        o = 0
+        for y in range(h):
+            f = raw[o]
+            line = bytearray(raw[o + 1:o + 1 + stride])
+            o += 1 + stride
+            if f == 1:
+                for i in range(ch, stride):
+                    line[i] = (line[i] + line[i - ch]) & 255
+            elif f == 2:
+                for i in range(stride):
+                    line[i] = (line[i] + prev[i]) & 255
+            elif f == 3:
+                for i in range(stride):
+                    a = line[i - ch] if i >= ch else 0
+                    line[i] = (line[i] + ((a + prev[i]) >> 1)) & 255
+            elif f == 4:
+                for i in range(stride):
+                    a = line[i - ch] if i >= ch else 0
+                    b = prev[i]
+                    c = prev[i - ch] if i >= ch else 0
+                    pp = a + b - c
+                    pa, pb, pc = abs(pp - a), abs(pp - b), abs(pp - c)
+                    pr = a if pa <= pb and pa <= pc else (b if pb <= pc else c)
+                    line[i] = (line[i] + pr) & 255
+            prev = line
+            for x in range(w):
+                d = (y * w + x) * 4
+                if ctype == 6:
+                    out[d:d + 4] = line[x * 4:x * 4 + 4]
+                elif ctype == 2:
+                    out[d:d + 3] = line[x * 3:x * 3 + 3]
+                    out[d + 3] = 255
+                elif ctype == 0:
+                    v = line[x]
+                    out[d:d + 4] = bytes((v, v, v, 255))
+                elif ctype == 4:
+                    v = line[x * 2]
+                    out[d:d + 4] = bytes((v, v, v, line[x * 2 + 1]))
+                else:
+                    i = line[x]
+                    out[d:d + 3] = plte[i * 3:i * 3 + 3]
+                    out[d + 3] = trns[i] if i < len(trns) else 255
+        return w, h, out
+    except Exception:
+        return None
+
+
+def _stock_icon(which, size=32):
+    """Procedural IDI_* icons (classic look)."""
+    ic = _GIcon(size, size)
+    ic.alpha = bytearray(size * size)
+    s = size / 32.0
+
+    def put(x, y, cr, a=255):
+        if 0 <= x < size and 0 <= y < size:
+            o = y * size + x
+            ic.color.px[o * 4:o * 4 + 3] = bytes(((cr >> 16) & 255, (cr >> 8) & 255, cr & 255))
+            ic.alpha[o] = a
+
+    def disc(cx, cy, r, cr):
+        for y in range(size):
+            for x in range(size):
+                if (x + 0.5 - cx) ** 2 + (y + 0.5 - cy) ** 2 <= r * r:
+                    put(x, y, cr)
+
+    if which in (32513,):                              # error: red disc with white X
+        disc(16 * s, 16 * s, 14 * s, 0xDD2020)
+        for i in range(int(-7 * s), int(7 * s) + 1):
+            for d in (-1, 0, 1):
+                put(int(16 * s) + i + d, int(16 * s) + i, 0xFFFFFF)
+                put(int(16 * s) - i + d, int(16 * s) + i, 0xFFFFFF)
+    elif which in (32515,):                            # warning: yellow triangle with !
+        for y in range(int(3 * s), int(29 * s)):
+            half = (y - 3 * s) * 0.55
+            for x in range(int(16 * s - half), int(16 * s + half) + 1):
+                put(x, y, 0xF0D000 if abs(x - 16 * s) < half - 1 and y < 28 * s else 0x303030)
+        for y in range(int(10 * s), int(21 * s)):
+            for x in (int(15 * s), int(16 * s)):
+                put(x, y, 0x000000)
+        for y in (int(23 * s), int(24 * s)):
+            for x in (int(15 * s), int(16 * s)):
+                put(x, y, 0x000000)
+    elif which in (32516, 32514):                      # information "i" / question "?"
+        disc(16 * s, 16 * s, 14 * s, 0x1E5FD0 if which == 32516 else 0x2E7FE0)
+        if which == 32516:
+            for y in range(int(13 * s), int(25 * s)):
+                for x in range(int(14 * s), int(18 * s)):
+                    put(x, y, 0xFFFFFF)
+            disc(16 * s, 9 * s, 2.2 * s, 0xFFFFFF)
+        else:
+            f = _GFont("sansb", max(8, int(20 * s)))
+            for (dx, dy) in f.pixels("?"):
+                put(int(10 * s) + dx, int(4 * s) + dy, 0xFFFFFF)
+    else:                                              # application: window glyph
+        for y in range(int(4 * s), int(28 * s)):
+            for x in range(int(3 * s), int(29 * s)):
+                edge = y in (int(4 * s), int(28 * s) - 1) or x in (int(3 * s), int(29 * s) - 1)
+                put(x, y, 0x000000 if edge else (0x0A246A if y < 9 * s else 0xFFFFFF))
+    ic.mask = bytearray(1 if a == 0 else 0 for a in ic.alpha)
+    return ic
+
+
+_CURSOR_CSS = {32512: "default", 32513: "text", 32514: "wait", 32515: "crosshair",
+               32516: "default", 32640: "move", 32641: "default", 32642: "nwse-resize",
+               32643: "nesw-resize", 32644: "ew-resize", 32645: "ns-resize", 32646: "move",
+               32648: "not-allowed", 32649: "pointer", 32650: "progress", 32651: "help",
+               32631: "default"}
+
+
+# -- resources (any module) --------------------------------------------------------------------
+
+def _res_module(p, hmod):
+    mm = p.modules
+    if not hmod:
+        return mm.main
+    return mm.by_handle.get(hmod & 0xFFFFFFFFFFFF)
+
+
+def _res_key(p, arg, wide):
+    if arg < 0x10000:
+        return arg
+    s = _gstr(p.mem, arg, -1, wide)
+    if s.startswith("#") and s[1:].isdigit():
+        return int(s[1:])
+    return s.upper()
+
+
+def _res_find(p, hmod, rtype, name, lang=None):
+    """-> (address, size, module) of a resource or None."""
+    mods = [_res_module(p, hmod)]
+    for m in mods:
+        if m is None or m.pe is None:
+            continue
+        best = None
+        for ent in m.pe.resources:
+            path = ent["path"]
+            if len(path) < 2:
+                continue
+            t, n = path[0], path[1]
+            tn = t.upper() if isinstance(t, str) else t
+            nn = n.upper() if isinstance(n, str) else n
+            if tn != rtype and not (isinstance(rtype, str) and
+                                    PEFile._RT_NAMES.get(t, None) == rtype):
+                continue
+            if nn != name:
+                continue
+            lg = path[2] if len(path) > 2 else 0
+            if lang is not None and lg == lang:
+                return m.base + ent["rva"], ent["size"], m
+            if best is None:
+                best = (m.base + ent["rva"], ent["size"], m)
+        if best is not None:
+            return best
+    return None
+
+
+def _res_bytes(p, hmod, rtype, name):
+    r = _res_find(p, hmod, rtype, name)
+    if r is None:
+        return None
+    try:
+        return bytes(p.mem.read(r[0], r[1]))
+    except Exception:
+        return None
+
+
+def _load_icon_res(p, hmod, name, want=32, cursor=False):
+    grp = _res_bytes(p, hmod, 12 if cursor else 14, name)
+    if grp is None or len(grp) < 6:
+        return None
+    _r, _t, n = struct.unpack_from("<HHH", grp, 0)
+    best = None
+    for i in range(n):
+        off = 6 + 14 * i
+        if off + 14 > len(grp):
+            break
+        if cursor:
+            w, h2, planes, bpp, size, nid = struct.unpack_from("<HHHHIH", grp, off)
+            h = h2 // 2
+        else:
+            w, h, cc, _res, planes, bpp, size, nid = struct.unpack_from("<BBBBHHIH", grp, off)
+            w, h = w or 256, h or 256
+        score = (abs(w - want) * 1000) - bpp
+        if best is None or score < best[0]:
+            best = (score, nid)
+    if best is None:
+        return None
+    data = _res_bytes(p, hmod, 1 if cursor else 3, best[1])
+    if data is None:
+        return None
+    return _icon_from_dib(data, cursor)
+
+
+def _read_icon_file(raw, want=32, cursor=False):
+    """.ico / .cur file bytes -> _GIcon."""
+    if len(raw) < 6:
+        return None
+    _r, typ, n = struct.unpack_from("<HHH", raw, 0)
+    best = None
+    for i in range(n):
+        off = 6 + 16 * i
+        w, h, cc, _res, a, b, size, dataoff = struct.unpack_from("<BBBBHHII", raw, off)
+        w = w or 256
+        score = abs(w - want) * 1000 - (b if typ == 1 else 0)
+        if best is None or score < best[0]:
+            best = (score, dataoff, size, a, b)
+    if best is None:
+        return None
+    img = raw[best[1]:best[1] + best[2]]
+    ic = _icon_from_dib(img, False)
+    if ic is not None and typ == 2:
+        ic.kind = "cursor"
+        ic.hot = (best[3], best[4])
+    return ic
+
+
+def _bitmap_from_packed(p, data, bm_dib=False):
+    """Packed DIB (BITMAPINFOHEADER + colors + bits) -> _GBitmap."""
+    gdi = p.gdi
+    if len(data) < 12:
+        return None
+    hsz = struct.unpack_from("<I", data, 0)[0]
+    tmp = p.heap_alloc(p.process_heap_handle, len(data) + 16)
+    try:
+        p.mem.write(tmp, data)
+        w, h, bpp, top, colors, masks, comp, hs = _read_bmi(p.mem, tmp, 0)
+        ncol = len(colors)
+        bits_off = hs + (ncol * (3 if hs == 12 else 4)) + (12 if comp == 3 and hs < 52 else 0)
+        bm = _GBitmap(w, h, 1 if bpp == 1 else 32)
+        _dib_rows_to_surf(p.mem, tmp + bits_off, w, h, bpp, top, colors, masks, bm.surf,
+                          comp=comp)
+        bm.src_bpp = bpp
+        if bpp == 32 and any(data[bits_off + 3:bits_off + 4 * w * h:4] or b""):
+            bm.has_alpha = True
+            s = bm.surf
+            stride = w * 4
+            for i in range(h):
+                y = i if top else h - 1 - i
+                s.px[y * stride + 3:(y + 1) * stride:4] = data[bits_off + i * stride + 3:
+                                                               bits_off + (i + 1) * stride:4]
+        return bm
+    finally:
+        p.heap_free(p.process_heap_handle, tmp)
+
+
+# -- DefWindowProc, non-client area, scroll bars, modal loops -----------------------------------
+
+def _nc_frame(style, exstyle):
+    if style & WS_THICKFRAME:
+        return _M["frame"]
+    if (style & WS_DLGFRAME) or exstyle & WS_EX_DLGMODALFRAME:
+        return _M["dlgframe"]
+    if style & WS_BORDER:
+        return _M["border"]
+    return 0
+
+
+def _nc_layout(wm, w):
+    """Non-client geometry in window coordinates."""
+    style, ex = w.style, w.exstyle
+    b = _nc_frame(style, ex)
+    if style & WS_CHILD and (style & WS_CAPTION) != WS_CAPTION and style & WS_DLGFRAME \
+            and not style & WS_BORDER:
+        b = _M["dlgframe"]
+    cap = 0
+    if (style & WS_CAPTION) == WS_CAPTION:
+        cap = _M["smcaption"] if ex & WS_EX_TOOLWINDOW else _M["caption"]
+    menu_h = 0
+    if not (style & WS_CHILD) and w.menu and _menu_obj(wm, w.menu) is not None:
+        menu_h = _menubar_height(wm, w, max(1, w.w - 2 * b))
+    ce = 2 if ex & WS_EX_CLIENTEDGE else (1 if ex & WS_EX_STATICEDGE else 0)
+    vs = _M["vscroll"] if style & WS_VSCROLL else 0
+    hs = _M["hscroll"] if style & WS_HSCROLL else 0
+    L = {"b": b, "cap": cap, "menu": menu_h, "ce": ce, "vs": vs, "hs": hs}
+    top = b + cap + menu_h
+    L["caption"] = (b, b, w.w - b, b + cap - 1) if cap else None
+    L["menubar"] = (b, b + cap, w.w - b, b + cap + menu_h) if menu_h else None
+    il, it, ir, ib = b + ce, top + ce, w.w - b - ce, w.h - b - ce
+    L["inner"] = (il, it, ir, ib)
+    L["vsb"] = (ir - vs, it, ir, ib - hs) if vs else None
+    L["hsb"] = (il, ib - hs, ir - vs, ib) if hs else None
+    L["grip"] = (ir - vs, ib - hs, ir, ib) if vs and hs else None
+    L["client"] = (il, it, max(il, ir - vs), max(it, ib - hs))
+    # caption buttons
+    btns = {}
+    if cap and style & WS_SYSMENU:
+        bw = (_M["smsize"] if ex & WS_EX_TOOLWINDOW else _M["size"]) - 2
+        bh = cap - 5
+        y0 = b + 2
+        x = w.w - b - 2 - bw
+        btns["close"] = (x, y0, x + bw, y0 + bh)
+        x -= 2
+        if not (ex & WS_EX_TOOLWINDOW):
+            if style & (WS_MAXIMIZEBOX | WS_MINIMIZEBOX):
+                btns["max"] = (x - bw, y0, x, y0 + bh)
+                btns["min"] = (x - 2 * bw, y0, x - bw, y0 + bh)
+                x -= 2 * bw + 2
+            elif ex & 0x400:                               # WS_EX_CONTEXTHELP
+                btns["help"] = (x - bw, y0, x, y0 + bh)
+                x -= bw + 2
+        if not (ex & WS_EX_DLGMODALFRAME) and not (ex & WS_EX_TOOLWINDOW):
+            btns["sys"] = (b + 1, b + 1, b + 1 + 16, b + 1 + 16)
+    L["btns"] = btns
+    return L
+
+
+def _def_nccalc(wm, w, lp, full):
+    L = _nc_layout(wm, w)
+    mem = wm.mem
+    l, t, r, b = _rd_rect(mem, lp)
+    cl = L["client"]
+    nl, nt = l + cl[0], t + cl[1]
+    nr, nb = l + cl[2], t + cl[3]
+    if w.min_state == 1:
+        nr, nb = nl, nt
+    _wr_rect(mem, lp, (nl, nt, max(nl, nr), max(nt, nb)))
+    return 0
+
+
+def _def_hittest(wm, w, X, Y):
+    sx, sy = wm.screen_origin(w)
+    x, y = X - sx, Y - sy
+    if not (0 <= x < w.w and 0 <= y < w.h):
+        return HTNOWHERE
+    cl = w.cl
+    if cl[0] <= x < cl[2] and cl[1] <= y < cl[3]:
+        return HTCLIENT
+    L = _nc_layout(wm, w)
+    b = L["b"]
+    if w.style & WS_THICKFRAME and w.min_state != 2:
+        g = 16
+        if x < b:
+            return HTTOPLEFT if y < g else HTBOTTOMLEFT if y >= w.h - g else HTLEFT
+        if x >= w.w - b:
+            return HTTOPRIGHT if y < g else HTBOTTOMRIGHT if y >= w.h - g else HTRIGHT
+        if y < b:
+            return HTTOPLEFT if x < g else HTTOPRIGHT if x >= w.w - g else HTTOP
+        if y >= w.h - b:
+            return HTBOTTOMLEFT if x < g else HTBOTTOMRIGHT if x >= w.w - g else HTBOTTOM
+    if L["caption"] and L["caption"][1] <= y < L["caption"][3] + 1 and b <= x < w.w - b:
+        for nm, code in (("close", HTCLOSE), ("max", HTMAXBUTTON), ("min", HTMINBUTTON),
+                         ("help", HTHELP), ("sys", HTSYSMENU)):
+            r = L["btns"].get(nm)
+            if r and r[0] <= x < r[2] and r[1] <= y < r[3]:
+                return code
+        return HTCAPTION
+    if L["menubar"] and L["menubar"][1] <= y < L["menubar"][3]:
+        return HTMENU
+    for key, code in (("vsb", HTVSCROLL), ("hsb", HTHSCROLL)):
+        r = L[key]
+        if r and r[0] <= x < r[2] and r[1] <= y < r[3]:
+            return code
+    if L["grip"]:
+        r = L["grip"]
+        if r[0] <= x < r[2] and r[1] <= y < r[3]:
+            return HTBOTTOMRIGHT if w.style & WS_THICKFRAME else 4    # HTGROWBOX
+    return HTBORDER
+
+
+def _caption_font(wm, small=False):
+    key = "capfont_s" if small else "capfont"
+    f = wm.__dict__.get(key)
+    if f is None:
+        f = wm.__dict__[key] = _GFont("sans", 10 if small else 11, bold=True)
+    return f
+
+
+def _gui_font(wm):
+    f = wm.__dict__.get("guifont")
+    if f is None:
+        f = wm.__dict__["guifont"] = _GFont("sans", 11)
+    return f
+
+
+def _win_font(wm, w):
+    """The realized font a built-in control paints with (WM_SETFONT or system font)."""
+    fo = wm.gdi.get(w.font, "font") if w.font else None
+    if fo is None:
+        fo = wm.gdi.stock[13]
+    return fo
+
+
+def _nc_paint(wm, w, pt=None):
+    if not wm.visible(w) or w.dead:
+        return
+    L = _nc_layout(wm, w)
+    own = pt is None
+    if own:
+        pt = _Painter(wm, w, client=False)
+    sysc = wm.gdi.sys_color
+    try:
+        b = L["b"]
+        W, H = w.w, w.h
+        style, ex = w.style, w.exstyle
+        active = wm.active == wm.top(w).hwnd if not (style & WS_CHILD) else True
+        if w.py.get("ncactive") is not None and not (style & WS_CHILD):
+            active = w.py["ncactive"]
+        # outer frame
+        if b >= 3 or (style & WS_THICKFRAME):
+            r = _draw_edge(pt, (0, 0, W, H), 5, 15)            # EDGE_RAISED
+            l, t, rr, bb = r
+            for i in range(b - 2):
+                pt.frame(l + i, t + i, rr - i, bb - i, sysc(COLOR_BTNFACE))
+        elif b == 1:
+            pt.frame(0, 0, W, H, sysc(COLOR_WINDOWFRAME))
+        # caption
+        if L["caption"]:
+            cl, ct, cr, cb = L["caption"]
+            c1 = sysc(COLOR_ACTIVECAPTION if active else COLOR_INACTIVECAPTION)
+            c2 = sysc(COLOR_GRADIENTACTIVECAPTION if active else COLOR_GRADIENTINACTIVECAPTION)
+            n = max(1, cr - cl)
+            steps = min(n, 64)
+            for i in range(steps):
+                x0 = cl + n * i // steps
+                x1 = cl + n * (i + 1) // steps
+                f = i / float(max(1, steps - 1))
+                col = _rgb(int((c1 & 255) + ((c2 & 255) - (c1 & 255)) * f),
+                           int(((c1 >> 8) & 255) + (((c2 >> 8) & 255) - ((c1 >> 8) & 255)) * f),
+                           int(((c1 >> 16) & 255) + (((c2 >> 16) & 255) - ((c1 >> 16) & 255)) * f))
+                pt.fill(x0, ct, x1, cb, col)
+            pt.hline(cl, cr, cb, sysc(COLOR_BTNFACE))
+            tx = cl + 3
+            sysbtn = L["btns"].get("sys")
+            if sysbtn:
+                hic = _window_icon(wm, w, small=True)
+                if hic:
+                    pt.icon(sysbtn[0] + 1, sysbtn[1], hic, 16, 16)
+                tx = sysbtn[2] + 3
+            font = _caption_font(wm, bool(ex & WS_EX_TOOLWINDOW))
+            txtcol = sysc(COLOR_CAPTIONTEXT if active else COLOR_INACTIVECAPTIONTEXT)
+            limit = min((r[0] for k, r in L["btns"].items() if k != "sys"), default=cr) - 2
+            text = w.text.replace("\r", "").replace("\n", " ")
+            text = _ellipsize(font, text, max(0, limit - tx), "end")
+            ty = ct + (cb - ct - font.height) // 2
+            pt.text(tx, ty, text, font, txtcol, (tx, ct, limit, cb))
+            pressed = w.py.get("nc_pressed")
+            for nm, kind in (("close", 0), ("max", 3 if w.min_state == 2 else 2), ("min", 1),
+                             ("help", 4)):
+                r = L["btns"].get(nm)
+                if not r:
+                    continue
+                st = kind
+                if pressed == nm:
+                    st |= 0x200
+                if nm == "max" and not (style & WS_MAXIMIZEBOX):
+                    st |= 0x100
+                if nm == "min" and not (style & WS_MINIMIZEBOX):
+                    st |= 0x100
+                if nm == "close" and w.py.get("close_disabled"):
+                    st |= 0x100
+                _draw_frame_control(pt, r, 1, st)
+        if L["menubar"]:
+            _menubar_paint(wm, w, pt, L["menubar"])
+        # client edge
+        il, it, ir, ib = L["inner"]
+        if L["ce"] == 2:
+            _draw_edge(pt, (il - 2, it - 2, ir + 2, ib + 2), 10, 15)
+        elif L["ce"] == 1:
+            _draw_edge(pt, (il - 1, it - 1, ir + 1, ib + 1), 2, 15)   # BDR_SUNKENOUTER
+        if L["vsb"]:
+            _sb_paint(wm, w, pt, 1, L["vsb"])
+        if L["hsb"]:
+            _sb_paint(wm, w, pt, 0, L["hsb"])
+        if L["grip"]:
+            g = L["grip"]
+            pt.fill(g[0], g[1], g[2], g[3], sysc(COLOR_BTNFACE))
+            if style & WS_THICKFRAME and not (style & WS_CHILD):
+                _draw_frame_control(pt, g, 3, 8)
+    finally:
+        if own:
+            pt.done()
+    w.ncdirty = False
+
+
+def _window_icon(wm, w, small=True):
+    h = w.icon_sm if small else w.icon
+    if not h:
+        h = w.icon or w.icon_sm
+    if not h and w.cls is not None:
+        h = (w.cls.icon_sm or w.cls.icon) if small else (w.cls.icon or w.cls.icon_sm)
+    if not h and not (w.exstyle & WS_EX_DLGMODALFRAME):
+        h = wm.std_icons.get(32512, 0) if hasattr(wm, "std_icons") else 0
+    return h
+
+
+# -- scroll bars ------------------------------------------------------------------------------
+
+def _sb_info(w, bar):
+    if bar not in w.scroll:
+        w.scroll[bar] = [0, 100, 0, 0, 0, True]
+    return w.scroll[bar]
+
+
+def _sb_geom(info, rect, vert):
+    """-> (arrow1, track, thumb, arrow2) rects for a scroll bar."""
+    l, t, r, b = rect
+    length = (b - t) if vert else (r - l)
+    thick = (r - l) if vert else (b - t)
+    arrow = min(thick, length // 2)
+    mn, mx, page, pos = info[0], info[1], info[2], info[3]
+    track_len = length - 2 * arrow
+    rng = mx - mn + 1
+    if rng <= 0 or track_len <= 8 or (page and page >= rng):
+        thumb_len, thumb_pos = 0, 0
+    else:
+        thumb_len = max(8, track_len * page // rng) if page else min(thick, track_len)
+        span = rng - (page if page else 1)
+        thumb_pos = ((max(mn, min(pos, mx)) - mn) * (track_len - thumb_len) // span) if span > 0 else 0
+    if vert:
+        a1 = (l, t, r, t + arrow)
+        a2 = (l, b - arrow, r, b)
+        track = (l, t + arrow, r, b - arrow)
+        thumb = (l, t + arrow + thumb_pos, r, t + arrow + thumb_pos + thumb_len) if thumb_len else None
+    else:
+        a1 = (l, t, l + arrow, b)
+        a2 = (r - arrow, t, r, b)
+        track = (l + arrow, t, r - arrow, b)
+        thumb = (l + arrow + thumb_pos, t, l + arrow + thumb_pos + thumb_len, b) if thumb_len else None
+    return a1, track, thumb, a2
+
+
+def _sb_paint(wm, w, pt, bar, rect, vert=None):
+    info = _sb_info(w, bar)
+    if vert is None:
+        vert = bar == 1
+    sysc = wm.gdi.sys_color
+    a1, track, thumb, a2 = _sb_geom(info, rect, vert)
+    enabled = info[5] and wm.enabled_chain(w)
+    pressed = w.py.get("sb_pressed")
+    dis = 0 if enabled and thumb is not None else 0x100
+    _draw_frame_control(pt, a1, 3, (0 if vert else 2) | dis | (0x200 if pressed == (bar, "a1") else 0))
+    _draw_frame_control(pt, a2, 3, (1 if vert else 3) | dis | (0x200 if pressed == (bar, "a2") else 0))
+    tl, tt, tr, tb = track
+    if tr > tl and tb > tt:
+        pt.dither(tl, tt, tr, tb, sysc(COLOR_BTNHIGHLIGHT), sysc(COLOR_SCROLLBAR))
+        if pressed in ((bar, "pgup"), (bar, "pgdn")) and thumb:
+            if pressed[1] == "pgup":
+                r = (tl, tt, tr, thumb[1]) if vert else (tl, tt, thumb[0], tb)
+            else:
+                r = (tl, thumb[3], tr, tb) if vert else (thumb[2], tt, tr, tb)
+            pt.fill(r[0], r[1], r[2], r[3], sysc(COLOR_3DDKSHADOW))
+    if thumb is not None and enabled:
+        _draw_edge(pt, thumb, 5, 15 | 0x800 | 0x1000)
+
+
+def _sb_rect_for(wm, w, bar):
+    L = _nc_layout(wm, w)
+    return L["vsb"] if bar == 1 else L["hsb"]
+
+
+def _sb_redraw(wm, w, bar):
+    if bar == 2:
+        wm.invalidate(w, None, True, False)
+        return
+    r = _sb_rect_for(wm, w, bar)
+    if r is None or not wm.visible(w):
+        return
+    pt = _Painter(wm, w, client=False)
+    try:
+        _sb_paint(wm, w, pt, bar, r)
+    finally:
+        pt.done()
+
+
+def _sb_set(wm, w, bar, mask, mn, mx, page, pos, redraw):
+    info = _sb_info(w, bar)
+    if mask & 1:                                            # SIF_RANGE
+        info[0], info[1] = mn, mx
+    if mask & 2:                                            # SIF_PAGE
+        info[2] = max(0, page)
+    if mask & 4:                                            # SIF_POS
+        info[3] = pos
+    rng = info[1] - info[0] + 1
+    info[2] = min(info[2], max(0, rng)) if rng > 0 else 0
+    hi = info[1] - max(info[2] - 1, 0)
+    info[3] = max(info[0], min(info[3], max(info[0], hi)))
+    if bar in (0, 1) and mask & 3:
+        # show / hide the standard scroll bar automatically
+        need = rng > (info[2] if info[2] else 1) and info[1] > info[0]
+        flag = WS_VSCROLL if bar == 1 else WS_HSCROLL
+        if mask & 8 and not need:                          # SIF_DISABLENOSCROLL
+            info[5] = False
+            need = True
+        elif need:
+            info[5] = True
+        if bool(w.style & flag) != need:
+            if need:
+                w.style |= flag
+            else:
+                w.style &= ~flag
+            wm.set_pos(w, 0, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER |
+                       SWP_NOACTIVATE | SWP_FRAMECHANGED)
+            return info[3]
+    if redraw:
+        _sb_redraw(wm, w, bar)
+    return info[3]
+
+
+def _sb_track(wm, w, bar, X, Y, rect=None, notify=None, vert=None):
+    """Modal scroll-bar tracking (arrows, page areas, thumb) from a button-down."""
+    info = _sb_info(w, bar)
+    if vert is None:
+        vert = bar == 1
+    if rect is None:
+        r = _sb_rect_for(wm, w, bar)
+        if r is None:
+            return
+        sx, sy = wm.screen_origin(w)
+        client_based = False
+    else:
+        r = rect
+        sx, sy = wm.client_origin(w)
+        client_based = True
+    msg = WM_VSCROLL if vert else WM_HSCROLL
+    if notify is None:
+        target, lp_ = w.hwnd, 0
+    else:
+        target, lp_ = notify, w.hwnd
+
+    def send(code, pos=0):
+        wm.send(target, msg, (code & 0xFFFF) | ((pos & 0xFFFF) << 16), lp_)
+
+    def part_at(x, y):
+        a1, track, thumb, a2 = _sb_geom(info, r, vert)
+        for nm, rc in (("a1", a1), ("a2", a2), ("thumb", thumb)):
+            if rc and rc[0] <= x < rc[2] and rc[1] <= y < rc[3]:
+                return nm
+        if thumb and track[0] <= x < track[2] and track[1] <= y < track[3]:
+            if (y < thumb[1]) if vert else (x < thumb[0]):
+                return "pgup"
+            return "pgdn"
+        return None
+
+    x, y = X - sx, Y - sy
+    part = part_at(x, y)
+    if part is None or not info[5]:
+        return
+    codes = {"a1": 0, "a2": 1, "pgup": 2, "pgdn": 3}
+    wm.set_capture(w.hwnd, True)
+    w.py["sb_pressed"] = (bar, part)
+    _sb_redraw(wm, w, bar)
+    start_pos = info[3]
+    a1, track, thumb, a2 = _sb_geom(info, r, vert)
+    grab = (y - thumb[1]) if (part == "thumb" and vert) else (x - thumb[0]) if part == "thumb" else 0
+    if part != "thumb":
+        send(codes[part])
+    next_rep = time.monotonic() + 0.4
+    try:
+        while True:
+            m = _modal_next(wm, timeout=0.05 if part != "thumb" else None)
+            if m is None:
+                if part != "thumb" and time.monotonic() >= next_rep:
+                    cx, cy = wm.cursor_pos
+                    if part_at(cx - sx, cy - sy) == part:
+                        send(codes[part])
+                    next_rep = time.monotonic() + 0.05
+                continue
+            mm = m["msg"]
+            if mm in (0x200, WM_NCMOUSEMOVE, WM_LBUTTONUP, WM_NCLBUTTONUP):
+                cx, cy = m["pt"]
+                if part == "thumb":
+                    a1, track, thumb_now, a2 = _sb_geom(info, r, vert)
+                    tlen = (thumb_now[3] - thumb_now[1]) if thumb_now and vert else \
+                        (thumb_now[2] - thumb_now[0]) if thumb_now else 0
+                    tstart = track[1] if vert else track[0]
+                    tspan = ((track[3] - track[1]) if vert else (track[2] - track[0])) - tlen
+                    cur = ((cy - sy) if vert else (cx - sx)) - grab - tstart
+                    rng = info[1] - info[0] + 1 - (info[2] if info[2] else 1)
+                    newpos = info[0] + (cur * rng + tspan // 2) // max(1, tspan) if tspan > 0 else info[0]
+                    newpos = max(info[0], min(newpos, info[0] + max(0, rng)))
+                    info[4] = newpos
+                    if mm in (0x200, WM_NCMOUSEMOVE):
+                        send(5, newpos)                                # SB_THUMBTRACK
+                    else:
+                        send(4, newpos)                                # SB_THUMBPOSITION
+                if mm in (WM_LBUTTONUP, WM_NCLBUTTONUP):
+                    break
+            elif mm in (0x100, 0x104) and m["w"] == 0x1B:
+                break
+            elif mm not in (0x201, WM_NCLBUTTONDOWN, 0x203, WM_NCLBUTTONDBLCLK):
+                _dispatch_py(wm, m)
+            if wm.capture != w.hwnd:
+                break
+    finally:
+        w.py.pop("sb_pressed", None)
+        if wm.capture == w.hwnd:
+            wm.set_capture(0)
+        send(8)                                                        # SB_ENDSCROLL
+        if w.hwnd in wm.wins:
+            _sb_redraw(wm, w, bar)
+
+
+# -- modal message pumping (Python-side loops) --------------------------------------------------
+
+def _modal_next(wm, filt=(0, 0, 0), timeout=None):
+    """Blocking PeekMessage(PM_REMOVE) for Python modal loops; None on timeout."""
+    p = wm.p
+    m = wm.peek(filt[0], filt[1], filt[2], True)
+    if m is not None:
+        return m
+    tid = wm.cur_tid()
+    deadline = None if timeout is None else time.monotonic() + timeout
+    nt = wm.next_timer(tid)
+    if nt is not None:
+        deadline = nt if deadline is None else min(deadline, nt)
+    p.py_wait(lambda: wm.wait_ready(tid, filt), deadline)
+    return wm.peek(filt[0], filt[1], filt[2], True)
+
+
+def _dispatch_py(wm, m):
+    """DispatchMessage from Python code."""
+    msg = m["msg"]
+    hwnd = m["hwnd"]
+    if msg in (0x113, 0x118) and m["l"]:
+        return wm.call_proc(m["l"], hwnd, msg, m["w"], wm.tick(), True)
+    w = wm.wnd(hwnd)
+    if w is None:
+        return 0
+    if msg == 0xF and hasattr(wm, "paint_dispatch"):
+        return wm.paint_dispatch(w)
+    return wm.send(hwnd, msg, m["w"], m["l"], w.unicode)
+
+
+def _translate_py(wm, m):
+    """TranslateMessage: WM_KEYDOWN -> WM_CHAR using the key map / front-end char."""
+    msg = m["msg"]
+    if msg not in (0x100, WM_SYSKEYDOWN):
+        return False
+    vk = m["w"] & 0xFF
+    ch = _vk_to_char(wm, vk)
+    if ch is None:
+        return False
+    cm = WM_CHAR if msg == 0x100 else WM_SYSCHAR
+    q = wm.queue()
+    q.posted.insert(0, {"hwnd": m["hwnd"], "msg": cm, "w": ord(ch), "l": m["l"],
+                        "time": m.get("time", 0), "pt": m.get("pt", (0, 0))})
+    return True
+
+
+_VK_CHARS = {0x20: " ", 0x0D: "\r", 0x08: "\b", 0x09: "\t", 0x1B: "\x1b",
+             0xBA: ";:", 0xBB: "=+", 0xBC: ",<", 0xBD: "-_", 0xBE: ".>", 0xBF: "/?",
+             0xC0: "`~", 0xDB: "[{", 0xDC: "\\|", 0xDD: "]}", 0xDE: "'\""}
+_VK_SHIFT_DIGITS = ")!@#$%^&*("
+
+
+def _vk_to_char(wm, vk):
+    shift = bool(wm.keys[0x10] & 0x80)
+    ctrl = bool(wm.keys[0x11] & 0x80)
+    alt = bool(wm.keys[0x12] & 0x80)
+    caps = bool(wm.keys[0x14] & 1)
+    fe = wm.char_for_key.get(vk)
+    if fe and not ctrl and len(fe) == 1:
+        return fe
+    if 0x41 <= vk <= 0x5A:
+        c = chr(vk)
+        if ctrl and not alt:
+            return chr(vk - 0x40)
+        return c if (shift != caps) else c.lower()
+    if 0x30 <= vk <= 0x39:
+        if ctrl:
+            return None
+        return _VK_SHIFT_DIGITS[vk - 0x30] if shift else chr(vk)
+    if 0x60 <= vk <= 0x69:
+        return chr(0x30 + vk - 0x60)
+    if vk in (0x6A, 0x6B, 0x6D, 0x6E, 0x6F):
+        return "*+?-./"[[0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F].index(vk)]
+    s = _VK_CHARS.get(vk)
+    if s is None:
+        return None
+    if vk == 0x0D and ctrl:
+        return "\n"
+    if vk == 0x08 and ctrl:
+        return "\x7f"
+    if len(s) == 2:
+        return s[1] if shift else s[0]
+    return s
+
+
+# -- move / size loop --------------------------------------------------------------------------
+
+def _move_size_loop(wm, w, hit, X, Y):
+    """SC_MOVE / SC_SIZE with the mouse (full-window dragging)."""
+    if w.min_state == 2:
+        return
+    top = w
+    wm.send(w.hwnd, WM_ENTERSIZEMOVE, 0, 0)
+    wm.set_capture(w.hwnd, True)
+    ox, oy, ow, oh = w.x, w.y, w.w, w.h
+    try:
+        while True:
+            m = _modal_next(wm)
+            if m is None:
+                continue
+            mm = m["msg"]
+            if mm in (0x200, WM_NCMOUSEMOVE, WM_LBUTTONUP, WM_NCLBUTTONUP):
+                cx, cy = m["pt"]
+                dx, dy = cx - X, cy - Y
+                x, y, cw, ch = ox, oy, ow, oh
+                if hit == HTCAPTION:
+                    x, y = ox + dx, oy + dy
+                else:
+                    if hit in (HTLEFT, HTTOPLEFT, HTBOTTOMLEFT):
+                        x, cw = ox + dx, ow - dx
+                    if hit in (HTRIGHT, HTTOPRIGHT, HTBOTTOMRIGHT, 4):
+                        cw = ow + dx
+                    if hit in (HTTOP, HTTOPLEFT, HTTOPRIGHT):
+                        y, ch = oy + dy, oh - dy
+                    if hit in (HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, 4):
+                        ch = oh + dy
+                    mmi = wm.minmax(w)
+                    cw = max(mmi[3][0], min(cw, mmi[4][0]))
+                    ch = max(mmi[3][1], min(ch, mmi[4][1]))
+                    if hit in (HTLEFT, HTTOPLEFT, HTBOTTOMLEFT):
+                        x = ox + ow - cw
+                    if hit in (HTTOP, HTTOPLEFT, HTTOPRIGHT):
+                        y = oy + oh - ch
+                if w.style & WS_CHILD:
+                    pass
+                wm.set_pos(w, 0, x, y, cw, ch, SWP_NOZORDER | SWP_NOACTIVATE |
+                           (SWP_NOSIZE if hit == HTCAPTION else 0))
+                if mm in (WM_LBUTTONUP, WM_NCLBUTTONUP):
+                    break
+            elif mm in (0x100, WM_SYSKEYDOWN) and m["w"] == 0x1B:
+                wm.set_pos(w, 0, ox, oy, ow, oh, SWP_NOZORDER | SWP_NOACTIVATE)
+                break
+            elif mm not in (0x201, WM_NCLBUTTONDOWN):
+                _dispatch_py(wm, m)
+            if wm.capture != w.hwnd:
+                break
+    finally:
+        if wm.capture == w.hwnd:
+            wm.set_capture(0)
+        wm.send(w.hwnd, WM_EXITSIZEMOVE, 0, 0)
+
+
+def _caption_button_loop(wm, w, which):
+    """Track a pressed caption button; True if released over it."""
+    L = _nc_layout(wm, w)
+    r = L["btns"].get(which)
+    if r is None:
+        return False
+    sx, sy = wm.screen_origin(w)
+    w.py["nc_pressed"] = which
+    _nc_paint(wm, w)
+    wm.set_capture(w.hwnd, True)
+    inside = True
+    try:
+        while True:
+            m = _modal_next(wm)
+            if m is None:
+                continue
+            mm = m["msg"]
+            if mm in (0x200, WM_NCMOUSEMOVE, WM_LBUTTONUP, WM_NCLBUTTONUP):
+                cx, cy = m["pt"]
+                now = r[0] <= cx - sx < r[2] and r[1] <= cy - sy < r[3]
+                if now != inside:
+                    inside = now
+                    w.py["nc_pressed"] = which if inside else None
+                    _nc_paint(wm, w)
+                if mm in (WM_LBUTTONUP, WM_NCLBUTTONUP):
+                    break
+            elif mm not in (0x201, WM_NCLBUTTONDOWN):
+                _dispatch_py(wm, m)
+            if wm.capture != w.hwnd:
+                inside = False
+                break
+    finally:
+        w.py["nc_pressed"] = None
+        if wm.capture == w.hwnd:
+            wm.set_capture(0)
+        if w.hwnd in wm.wins:
+            _nc_paint(wm, w)
+    return inside
+
+
+# -- DefWindowProc ----------------------------------------------------------------------------
+
+def _def_erase(wm, w, hdc):
+    br = w.cls.brush if w.cls is not None else 0
+    if not br:
+        return 0
+    dc = wm.gdi.get(hdc, "dc")
+    if dc is None:
+        return 0
+    pt = _Painter(wm, w, dc=dc)
+    try:
+        r = wm.client_rect(w)
+        pt.fill_brush(r[0], r[1], r[2], r[3], br)
+    finally:
+        pt.done()
+    return 1
+
+
+def _def_ctlcolor(wm, msg, hdc):
+    dc = wm.gdi.get(hdc, "dc")
+    sysc = wm.gdi.sys_color
+    if msg in (WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX):
+        if dc:
+            dc.text_color = sysc(COLOR_WINDOWTEXT)
+            dc.bk_color = sysc(COLOR_WINDOW)
+        return wm.gdi.sys_brush(COLOR_WINDOW).h
+    if msg == WM_CTLCOLORSCROLLBAR:
+        if dc:
+            dc.text_color = sysc(COLOR_BTNFACE)
+            dc.bk_color = sysc(COLOR_BTNHIGHLIGHT)
+        return wm.gdi.sys_brush(COLOR_SCROLLBAR).h
+    if dc:
+        dc.text_color = sysc(COLOR_WINDOWTEXT)
+        dc.bk_color = sysc(COLOR_BTNFACE)
+    return wm.gdi.sys_brush(COLOR_BTNFACE).h
+
+
+def _def_window_proc(wm, hwnd, msg, wp, lp, wide):
+    w = wm.wnd(hwnd)
+    if w is None:
+        return 0
+    mem = wm.mem
+    msg &= 0xFFFFFFFF
+    if msg == WM_NCCREATE:
+        if lp:
+            ps = wm.ps
+            nptr = wm.rp(lp + (56 if ps == 8 else 36))
+            if nptr and nptr >= 0x10000:
+                w.text = wm.gstr(nptr, wide)
+        if w.style & WS_VSCROLL:
+            w.sbshow[1] = True
+        if w.style & WS_HSCROLL:
+            w.sbshow[0] = True
+        return 1
+    if msg == WM_NCCALCSIZE:
+        return _def_nccalc(wm, w, lp, wp)
+    if msg == WM_NCHITTEST:
+        X, Y = _xy_lparam(lp)
+        return _def_hittest(wm, w, X, Y) & 0xFFFFFFFF
+    if msg == WM_NCPAINT:
+        _nc_paint(wm, w)
+        return 0
+    if msg == WM_NCACTIVATE:
+        w.py["ncactive"] = bool(wp)
+        if not (w.style & WS_CHILD):
+            _nc_paint(wm, w)
+        return 1
+    if msg == 0x000F:                                     # WM_PAINT
+        wm.begin_end_paint(w)
+        return 0
+    if msg == 0x0014:                                     # WM_ERASEBKGND
+        return _def_erase(wm, w, wp)
+    if msg == WM_PRINTCLIENT:
+        return 0
+    if msg == WM_PRINT:
+        dc = wm.gdi.get(wp, "dc")
+        if dc is not None and lp & 2:                     # PRF_NONCLIENT
+            pt = _Painter(wm, w, dc=dc)
+            try:
+                _nc_paint(wm, w, pt)
+            finally:
+                pt.done()
+        if lp & 8:                                        # PRF_ERASEBKGND
+            wm.send(hwnd, 0x0014, wp, 0)
+        if lp & 4:                                        # PRF_CLIENT
+            wm.send(hwnd, WM_PRINTCLIENT, wp, lp)
+        return 0
+    if msg == WM_SETTEXT:
+        w.text = wm.gstr(lp, wide) if lp else ""
+        if (w.style & WS_CAPTION) == WS_CAPTION:
+            _nc_paint(wm, w)
+        wm.surface_dirty(hwnd)
+        wm.title_changed(w)
+        return 1
+    if msg == WM_GETTEXT:
+        if not wp or not lp:
+            return 0
+        return wm.put_str(lp, wp, w.text, wide)
+    if msg == WM_GETTEXTLENGTH:
+        return wm.str_len(w.text, wide)
+    if msg == 0x0010:                                     # WM_CLOSE
+        wm.destroy(w)
+        return 0
+    if msg == WM_SYSCOMMAND:
+        return _def_syscommand(wm, w, wp & 0xFFF0, lp)
+    if msg == WM_NCLBUTTONDOWN:
+        return _def_nclbuttondown(wm, w, wp, lp)
+    if msg == WM_NCLBUTTONDBLCLK:
+        if wp == HTCAPTION and w.style & WS_MAXIMIZEBOX and not (w.style & WS_CHILD):
+            wm.send(hwnd, WM_SYSCOMMAND, SC_RESTORE if w.min_state == 2 else SC_MAXIMIZE, lp)
+        elif wp == HTSYSMENU:
+            wm.send(hwnd, WM_SYSCOMMAND, SC_CLOSE, lp)
+        elif wp in (HTVSCROLL, HTHSCROLL):
+            return _def_nclbuttondown(wm, w, wp, lp)
+        return 0
+    if msg in (WM_RBUTTONUP, WM_NCRBUTTONUP):
+        X, Y = _xy_lparam(lp)
+        if msg == WM_RBUTTONUP:
+            cx, cy = wm.client_origin(w)
+            X, Y = X + cx, Y + cy
+        wm.send(hwnd, WM_CONTEXTMENU, hwnd, _lparam_xy(X, Y))
+        return 0
+    if msg == WM_CONTEXTMENU:
+        if w.style & WS_CHILD:
+            return wm.send_notify_parent(w, msg, wp, lp, wide)
+        X, Y = _xy_lparam(lp)
+        if _def_hittest(wm, w, X, Y) in (HTCAPTION, HTSYSMENU):
+            _sysmenu_track(wm, w, X, Y)
+        return 0
+    if msg in (WM_MOUSEWHEEL, WM_MOUSEHWHEEL, 0x319):     # + WM_APPCOMMAND
+        if w.style & WS_CHILD:
+            return wm.send_notify_parent(w, msg, wp, lp, wide)
+        return 0
+    if msg == WM_HELP:
+        if w.style & WS_CHILD:
+            return wm.send_notify_parent(w, msg, wp, lp, wide)
+        return 0
+    if msg == WM_SETCURSOR:
+        if w.style & WS_CHILD and w.parent is not None and w.parent is not wm.desktop:
+            if wm.send(w.parent.hwnd, WM_SETCURSOR, wp, lp) & 0xFFFFFFFF:
+                return 1
+        ht = _s32(lp & 0xFFFF) if lp & 0x8000 else lp & 0xFFFF
+        ht = ht - 0x10000 if ht & 0x8000 else ht
+        if ht == HTCLIENT:
+            cur = w.cls.cursor if w.cls is not None else 0
+            wm.cursor = cur or wm.std_cursors.get(32512, 0) if hasattr(wm, "std_cursors") else cur
+        else:
+            css = {HTLEFT: 32644, HTRIGHT: 32644, HTTOP: 32645, HTBOTTOM: 32645,
+                   HTTOPLEFT: 32642, HTBOTTOMRIGHT: 32642, HTTOPRIGHT: 32643,
+                   HTBOTTOMLEFT: 32643}.get(ht, 32512)
+            if hasattr(wm, "std_cursors"):
+                wm.cursor = wm.std_cursors.get(css, 0)
+        return 0
+    if msg == WM_MOUSEACTIVATE:
+        if w.style & WS_CHILD and w.parent is not None and w.parent is not wm.desktop:
+            r = wm.send(w.parent.hwnd, WM_MOUSEACTIVATE, wp, lp) & 0xFFFFFFFF
+            if r:
+                return r
+        return 1                                          # MA_ACTIVATE
+    if msg == WM_ACTIVATE:
+        if wp & 0xFFFF and w.min_state != 1:
+            f = wm.wnd(wm.focus)
+            if f is None or (f is not w and not wm.is_child_of(f, w)):
+                wm.set_focus(hwnd)
+        return 0
+    if msg in (WM_CTLCOLORMSGBOX, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORBTN,
+               WM_CTLCOLORDLG, WM_CTLCOLORSCROLLBAR, WM_CTLCOLORSTATIC):
+        return _def_ctlcolor(wm, msg, wp)
+    if msg == WM_WINDOWPOSCHANGED:
+        ps = wm.ps
+        fl = mem.read32(lp + (32 if ps == 8 else 24)) if lp else 0
+        if not (fl & SWP_NOSIZE) or fl & SWP_FRAMECHANGED:
+            st = 2 if w.min_state == 2 else 1 if w.min_state == 1 else 0
+            wm.send(hwnd, 0x0005, st, _lparam_xy(w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]))
+        if not (fl & SWP_NOMOVE):
+            wm.send(hwnd, WM_MOVE, 0, _lparam_xy(w.x + w.cl[0], w.y + w.cl[1]))
+        return 0
+    if msg in (WM_SYSKEYDOWN,):
+        if wp == 0x73 and lp & (1 << 29) and not (w.style & WS_CHILD):   # Alt+F4
+            wm.post(wm.top(w).hwnd, WM_SYSCOMMAND, SC_CLOSE, 0)
+            return 0
+        if wp == 0x12:
+            w.py["alt_alone"] = True
+        else:
+            w.py["alt_alone"] = False
+        if wp == 0x79:                                    # F10
+            w.py["f10"] = True
+        return 0
+    if msg == WM_SYSKEYUP:
+        if (wp == 0x12 and w.py.get("alt_alone")) or (wp == 0x79 and w.py.get("f10")):
+            w.py["alt_alone"] = w.py["f10"] = False
+            top = wm.top(w)
+            if top is not None and top.menu:
+                wm.send(top.hwnd, WM_SYSCOMMAND, SC_KEYMENU, 0)
+        return 0
+    if msg == WM_SYSCHAR:
+        w.py["alt_alone"] = False
+        if wp == 0x20:
+            top = wm.top(w)
+            if top is not None:
+                wm.send(top.hwnd, WM_SYSCOMMAND, SC_KEYMENU, 0x20)
+        elif lp & (1 << 29):
+            top = wm.top(w)
+            if top is not None and top.menu:
+                wm.send(top.hwnd, WM_SYSCOMMAND, SC_KEYMENU, wp)
+        return 0
+    if msg == WM_KEYUP and wp == 0x79:
+        return 0
+    if msg == WM_SHOWWINDOW:
+        return 0
+    if msg in (WM_QUERYENDSESSION, 0x13):                 # + WM_QUERYOPEN
+        return 1
+    if msg == WM_GETICON:
+        return (w.icon_sm or w.icon) if wp in (0, 2) else w.icon
+    if msg == WM_SETICON:
+        if wp == 0:
+            old, w.icon_sm = w.icon_sm, lp
+        else:
+            old, w.icon = w.icon, lp
+        if (w.style & WS_CAPTION) == WS_CAPTION:
+            _nc_paint(wm, w)
+        return old
+    if msg == WM_SETREDRAW:
+        w.redraw = bool(wp)
+        return 0
+    if msg == WM_NOTIFYFORMAT:
+        return 2 if w.unicode else 1
+    if msg == WM_QUERYUISTATE:
+        return w.py.get("uistate", 0)
+    if msg == WM_CHANGEUISTATE:
+        if w.style & WS_CHILD and w.parent is not wm.desktop:
+            return wm.send_notify_parent(w, msg, wp, lp, wide)
+        wm.send(hwnd, WM_UPDATEUISTATE, wp, lp)
+        return 0
+    if msg == WM_UPDATEUISTATE:
+        act, fl = wp & 0xFFFF, (wp >> 16) & 0xFFFF
+        st = w.py.get("uistate", 0)
+        st = (st | fl) if act == 1 else (st & ~fl) if act == 2 else st
+        w.py["uistate"] = st
+        for ch in w.children:
+            wm.send(ch.hwnd, msg, wp, lp)
+        return 0
+    if msg in (WM_VKEYTOITEM, WM_CHARTOITEM):
+        return 0xFFFFFFFF
+    if msg == WM_CANCELMODE:
+        if wm.menu_state is not None:
+            wm.menu_state["cancel"] = True
+        if wm.capture == hwnd:
+            wm.set_capture(0)
+        return 0
+    if msg == WM_GETFONT:
+        return w.font
+    if msg == WM_SETFONT:
+        w.font = wp
+        return 0
+    if msg == 0x02E0:                                     # WM_DPICHANGED
+        if lp:
+            r = _rd_rect(mem, lp)
+            wm.set_pos(w, 0, r[0], r[1], r[2] - r[0], r[3] - r[1], SWP_NOZORDER | SWP_NOACTIVATE)
+        return 0
+    if msg == 0x0050:                                     # WM_INPUTLANGCHANGEREQUEST
+        return 0
+    if msg == 0x0088:                                     # WM_SYNCPAINT
+        return 0
+    if msg == 0x0118:                                     # WM_SYSTIMER (caret blink)
+        return 0
+    return 0
+
+
+def _def_syscommand(wm, w, cmd, lp):
+    hwnd = w.hwnd
+    if cmd == SC_CLOSE:
+        if w.py.get("close_disabled"):
+            return 0
+        wm.send(hwnd, 0x0010, 0, 0)
+    elif cmd == SC_MINIMIZE:
+        wm.show(w, 6)
+    elif cmd == SC_MAXIMIZE:
+        wm.show(w, 3)
+    elif cmd == SC_RESTORE:
+        wm.show(w, 9)
+    elif cmd == SC_MOVE:
+        X, Y = _xy_lparam(lp) if lp else wm.cursor_pos
+        _move_size_loop(wm, w, HTCAPTION, X, Y)
+    elif cmd == SC_SIZE:
+        X, Y = _xy_lparam(lp) if lp else wm.cursor_pos
+        ht = w.py.pop("size_hit", HTBOTTOMRIGHT)
+        _move_size_loop(wm, w, ht, X, Y)
+    elif cmd in (SC_VSCROLL, SC_HSCROLL):
+        X, Y = _xy_lparam(lp)
+        _sb_track(wm, w, 1 if cmd == SC_VSCROLL else 0, X, Y)
+    elif cmd in (SC_KEYMENU, SC_MOUSEMENU):
+        if lp == 0x20 or (cmd == SC_KEYMENU and not w.menu and not (w.style & WS_CHILD)):
+            L = _nc_layout(wm, w)
+            sx, sy = wm.screen_origin(w)
+            _sysmenu_track(wm, w, sx + L["b"], sy + L["b"] + L["cap"])
+        else:
+            _menubar_keyboard(wm, w, lp)
+    elif cmd == SC_CONTEXTHELP:
+        pass
+    elif cmd == SC_TASKLIST:
+        pass
+    return 0
+
+
+def _def_nclbuttondown(wm, w, ht, lp):
+    X, Y = _xy_lparam(lp)
+    top = wm.top(w)
+    if ht == HTCAPTION:
+        if top is not None and top.hwnd != wm.active and not (w.style & WS_CHILD):
+            wm.set_active(top.hwnd, True)
+        if not (w.style & WS_CHILD) or True:
+            wm.send(w.hwnd, WM_SYSCOMMAND, SC_MOVE | HTCAPTION, lp)
+    elif ht == HTSYSMENU:
+        L = _nc_layout(wm, w)
+        sx, sy = wm.screen_origin(w)
+        _sysmenu_track(wm, w, sx + L["b"], sy + L["b"] + L["cap"])
+    elif ht == HTMENU:
+        _menubar_mouse(wm, w, X, Y)
+    elif ht in (HTCLOSE, HTMINBUTTON, HTMAXBUTTON, HTHELP):
+        nm = {HTCLOSE: "close", HTMINBUTTON: "min", HTMAXBUTTON: "max", HTHELP: "help"}[ht]
+        if nm == "min" and not (w.style & WS_MINIMIZEBOX):
+            return 0
+        if nm == "max" and not (w.style & WS_MAXIMIZEBOX):
+            return 0
+        if _caption_button_loop(wm, w, nm):
+            cmd = {"close": SC_CLOSE, "min": SC_MINIMIZE, "help": SC_CONTEXTHELP,
+                   "max": SC_RESTORE if w.min_state == 2 else SC_MAXIMIZE}[nm]
+            wm.send(w.hwnd, WM_SYSCOMMAND, cmd, lp)
+    elif ht in (HTVSCROLL, HTHSCROLL):
+        wm.send(w.hwnd, WM_SYSCOMMAND, (SC_VSCROLL if ht == HTVSCROLL else SC_HSCROLL) + ht, lp)
+    elif ht in (HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HTBOTTOM, HTBOTTOMLEFT,
+                HTBOTTOMRIGHT, 4):
+        if w.style & WS_THICKFRAME or ht == 4:
+            w.py["size_hit"] = ht
+            wm.send(w.hwnd, WM_SYSCOMMAND, SC_SIZE + (ht - HTLEFT + 1 if ht >= HTLEFT else 9), lp)
+    return 0
+
+
+# -- menus: objects, resources, menu bar, popup windows, tracking --------------------------------
+
+MF_GRAYED, MF_DISABLED, MF_BITMAP, MF_CHECKED, MF_POPUP = 1, 2, 4, 8, 0x10
+MF_MENUBARBREAK, MF_MENUBREAK, MF_HILITE, MF_OWNERDRAW, MF_BYPOSITION = 0x20, 0x40, 0x80, 0x100, 0x400
+MF_SEPARATOR, MF_DEFAULT, MF_SYSMENU, MF_RIGHTJUSTIFY, MF_MOUSESELECT = 0x800, 0x1000, 0x2000, \
+    0x4000, 0x8000
+MFT_RADIOCHECK = 0x200
+
+
+class _MItem:
+    __slots__ = ("type", "state", "id", "sub", "text", "data", "bmp", "chk", "unchk", "rect")
+
+    def __init__(self, type_=0, state=0, id_=0, sub=0, text="", data=0, bmp=0):
+        self.type, self.state, self.id, self.sub, self.text = type_, state, id_, sub, text
+        self.data, self.bmp, self.chk, self.unchk = data, bmp, 0, 0
+        self.rect = (0, 0, 0, 0)
+
+
+class _Menu(_GObj):
+    kind = "menu"
+
+    def __init__(self, popup=False):
+        self.items = []
+        self.popup = popup
+        self.style = 0
+        self.max_h = 0
+        self.brush = 0
+        self.data = 0
+        self.help = 0
+        self.owner = 0
+        self.sysmenu = False
+        self.bar_rows = 1
+        self.width = 0
+        self.height = 0
+
+
+def _menu_obj(wm, h):
+    return wm.gdi.get(h, "menu") if h else None
+
+
+def _menu_find(wm, menu, key, by_pos, deep=True):
+    """-> (menu, index) of an item by command id (recursive) or position."""
+    if menu is None:
+        return None, -1
+    if by_pos:
+        if 0 <= key < len(menu.items):
+            return menu, key
+        return None, -1
+    for i, it in enumerate(menu.items):
+        if it.id == key and not (it.sub and it.type & MF_SEPARATOR):
+            if not it.sub:
+                return menu, i
+    if deep:
+        for it in menu.items:
+            if it.sub:
+                m2, i2 = _menu_find(wm, _menu_obj(wm, it.sub), key, False)
+                if m2 is not None:
+                    return m2, i2
+    for i, it in enumerate(menu.items):
+        if it.id == key:
+            return menu, i
+    return None, -1
+
+
+def _parse_menu_res(wm, data):
+    """RT_MENU (normal or MENUEX) -> menu handle."""
+    gdi = wm.gdi
+    if len(data) < 4:
+        return 0
+    ver, hsz = struct.unpack_from("<HH", data, 0)
+
+    def rd_wstr(o):
+        e = o
+        while e + 1 < len(data) and data[e:e + 2] != b"\0\0":
+            e += 2
+        return data[o:e].decode("utf-16-le", "replace"), e + 2
+
+    if ver == 0:
+        def parse(o, menu):
+            while o + 2 <= len(data):
+                flags = struct.unpack_from("<H", data, o)[0]
+                o += 2
+                if flags & MF_POPUP:
+                    text, o = rd_wstr(o)
+                    sub = _Menu(True)
+                    gdi.add(sub)
+                    o = parse(o, sub)
+                    menu.items.append(_MItem(flags & ~(0x80 | MF_POPUP) & 0x7F6F, flags & 0x8B,
+                                             sub.h, sub.h, text))
+                    menu.items[-1].type = (0x800 if not text and False else 0) | \
+                        (flags & (MF_MENUBARBREAK | MF_MENUBREAK | MF_OWNERDRAW | MF_BITMAP |
+                                  MF_RIGHTJUSTIFY))
+                    menu.items[-1].state = flags & (MF_GRAYED | MF_DISABLED | MF_CHECKED |
+                                                    MF_HILITE | MF_DEFAULT)
+                else:
+                    iid = struct.unpack_from("<H", data, o)[0]
+                    o += 2
+                    text, o = rd_wstr(o)
+                    typ = flags & (MF_MENUBARBREAK | MF_MENUBREAK | MF_OWNERDRAW | MF_BITMAP |
+                                   MF_RIGHTJUSTIFY)
+                    if (flags & MF_SEPARATOR) or (not text and iid == 0 and not flags & 0x7F):
+                        typ |= MF_SEPARATOR
+                    menu.items.append(_MItem(typ, flags & (MF_GRAYED | MF_DISABLED | MF_CHECKED |
+                                                           MF_HILITE | MF_DEFAULT), iid, 0, text))
+                if flags & 0x80:                               # MF_END
+                    break
+            return o
+
+        top = _Menu(False)
+        gdi.add(top)
+        parse(4 + hsz, top)
+        return top.h
+
+    # MENUEX
+    def parse_ex(o, menu):
+        while o + 14 <= len(data):
+            o = (o + 3) & ~3
+            typ, state, iid, wflags = struct.unpack_from("<IIIH", data, o)
+            o += 14
+            text, o = rd_wstr(o)
+            it = _MItem(typ, state, iid, 0, text)
+            if wflags & 1:
+                o = (o + 3) & ~3
+                _help = struct.unpack_from("<I", data, o)[0]
+                o += 4
+                sub = _Menu(True)
+                gdi.add(sub)
+                o = parse_ex(o, sub)
+                it.sub = sub.h
+            menu.items.append(it)
+            if wflags & 0x80:
+                break
+        return o
+
+    top = _Menu(False)
+    gdi.add(top)
+    parse_ex(4 + hsz, top)
+    return top.h
+
+
+def _menu_from_template(wm, addr):
+    """LoadMenuIndirect: parse a template in guest memory."""
+    data = bytes(wm.mem.read(addr, 65536)) if True else b""
+    return _parse_menu_res(wm, data)
+
+
+def _menu_font(wm):
+    f = wm.__dict__.get("menufont")
+    if f is None:
+        f = wm.__dict__["menufont"] = _GFont("sans", 11)
+    return f
+
+
+def _item_label(it):
+    t = it.text or ""
+    if "\t" in t:
+        a, b = t.split("\t", 1)
+    elif "\x08" in t:
+        a, b = t.split("\x08", 1)
+    else:
+        a, b = t, ""
+    return a, b
+
+
+# -- menu bar --------------------------------------------------------------------------------
+
+def _menubar_layout(wm, w, width):
+    menu = _menu_obj(wm, w.menu)
+    if menu is None:
+        return 0
+    f = _menu_font(wm)
+    x, y = 0, 0
+    row_h = 18
+    rows = 1
+    right_from = None
+    for i, it in enumerate(menu.items):
+        label, _acc = _item_label(it)
+        vis, _ul = _strip_prefix(label)
+        if it.type & MF_OWNERDRAW:
+            iw, ih = _measure_ownerdraw(wm, w.hwnd, it, 0)
+            iw += 4
+        elif it.type & MF_BITMAP:
+            bm = wm.gdi.get(it.bmp or it.id, "bitmap")
+            iw = (bm.surf.w + 4) if bm else 16
+        elif it.type & MF_SEPARATOR:
+            iw = 8
+        else:
+            iw = f.width(vis) + 14
+        if x + iw > width and x > 0 or it.type & (MF_MENUBARBREAK | MF_MENUBREAK) and x > 0:
+            x = 0
+            y += row_h
+            rows += 1
+        it.rect = (x, y, x + iw, y + row_h)
+        if it.type & MF_RIGHTJUSTIFY and right_from is None:
+            right_from = i
+        x += iw
+    if right_from is not None:
+        # shift the right-justified tail
+        last_row_y = menu.items[right_from].rect[1]
+        tail = [it for it in menu.items[right_from:] if it.rect[1] == last_row_y]
+        tw = sum(it.rect[2] - it.rect[0] for it in tail)
+        xx = width - tw
+        for it in tail:
+            iw = it.rect[2] - it.rect[0]
+            it.rect = (xx, it.rect[1], xx + iw, it.rect[3])
+            xx += iw
+    menu.bar_rows = rows
+    return rows * row_h + 1
+
+
+def _menubar_height(wm, w, width):
+    return _menubar_layout(wm, w, width)
+
+
+def _menubar_paint(wm, w, pt, rect):
+    menu = _menu_obj(wm, w.menu)
+    sysc = wm.gdi.sys_color
+    l, t, r, b = rect
+    pt.fill(l, t, r, b, sysc(COLOR_MENU))
+    if menu is None:
+        return
+    f = _menu_font(wm)
+    sel = None
+    ms = wm.menu_state
+    if ms is not None and ms.get("bar_hwnd") == w.hwnd:
+        sel = ms.get("bar_sel")
+    show_ul = ms is not None and ms.get("keyboard") or bool(w.py.get("uistate", 0) & 0) is False
+    for i, it in enumerate(menu.items):
+        il, it_, ir, ib = it.rect
+        il, ir = il + l, ir + l
+        it_, ib = it_ + t, ib + t
+        if it.type & MF_OWNERDRAW:
+            _draw_ownerdraw(wm, w.hwnd, pt, it, (il, it_, ir, ib), sel == i, menu)
+            continue
+        if it.type & MF_SEPARATOR:
+            continue
+        label, _acc = _item_label(it)
+        off = 0
+        if sel == i:
+            if ms.get("open"):
+                _draw_edge(pt, (il, it_, ir, ib), 2, 15)             # sunken outer
+                off = 1
+            else:
+                _draw_edge(pt, (il, it_, ir, ib), 4, 15)             # raised inner
+        if it.type & MF_BITMAP:
+            bm = wm.gdi.get(it.bmp or it.id, "bitmap")
+            if bm is not None:
+                _blit_surface(pt, bm.surf, il + 2, it_ + 1)
+            continue
+        vis, ul = _strip_prefix(label)
+        grayed = it.state & (MF_GRAYED | MF_DISABLED)
+        col = sysc(COLOR_GRAYTEXT) if grayed else sysc(COLOR_MENUTEXT)
+        tx = il + 7 + off
+        ty = it_ + (ib - it_ - f.height) // 2 + off
+        if grayed and it.state & MF_GRAYED:
+            pt.text(tx + 1, ty + 1, vis, f, sysc(COLOR_BTNHIGHLIGHT))
+        pt.text(tx, ty, vis, f, col)
+        if 0 <= ul < len(vis) and show_ul:
+            ux = tx + f.width(vis[:ul])
+            pt.hline(ux, ux + f.advance(vis[ul]), ty + f.ascent + 1, col)
+
+
+def _blit_surface(pt, surf, x, y):
+    X, Y = pt.xy(x, y)
+    for j in range(surf.h):
+        yy = Y + j
+        for (cl, ct, cr, cb) in pt.clip:
+            if ct <= yy < cb:
+                a, b = max(X, cl, 0), min(X + surf.w, cr, pt.surf.w)
+                if a < b and 0 <= yy < pt.surf.h:
+                    o = (yy * pt.surf.w + a) * 4
+                    so = (j * surf.w + (a - X)) * 4
+                    pt.surf.px[o:o + (b - a) * 4] = surf.px[so:so + (b - a) * 4]
+
+
+def _menubar_item_at(wm, w, X, Y):
+    menu = _menu_obj(wm, w.menu)
+    if menu is None:
+        return -1
+    L = _nc_layout(wm, w)
+    mb = L["menubar"]
+    if not mb:
+        return -1
+    sx, sy = wm.screen_origin(w)
+    x, y = X - sx - mb[0], Y - sy - mb[1]
+    for i, it in enumerate(menu.items):
+        l, t, r, b = it.rect
+        if l <= x < r and t <= y < b:
+            return i
+    return -1
+
+
+def _menubar_item_screen_rect(wm, w, i):
+    menu = _menu_obj(wm, w.menu)
+    L = _nc_layout(wm, w)
+    mb = L["menubar"]
+    sx, sy = wm.screen_origin(w)
+    l, t, r, b = menu.items[i].rect
+    return (sx + mb[0] + l, sy + mb[1] + t, sx + mb[0] + r, sy + mb[1] + b)
+
+
+# -- owner-draw -----------------------------------------------------------------------------
+
+def _measure_ownerdraw(wm, owner, it, menu_h):
+    ps = wm.ps
+    mark = wm.scratch_mark()
+    try:
+        if ps == 8:
+            a = wm.scratch(struct.pack("<IIIII4xQ", 1, 0, it.id, 0, 0, it.data & M64))
+        else:
+            a = wm.scratch(struct.pack("<IIIIII", 1, 0, it.id, 0, 0, it.data & 0xFFFFFFFF))
+        wm.send(owner, WM_MEASUREITEM, 0, a)
+        return wm.mem.read32(a + 12), wm.mem.read32(a + 16)
+    finally:
+        wm.scratch_release(mark)
+
+
+def _draw_ownerdraw(wm, owner, pt, it, rect, selected, menu):
+    """WM_DRAWITEM for an owner-draw menu item (DC = the painter's DC)."""
+    gdi = wm.gdi
+    dc = pt.dc
+    if not dc.h:
+        gdi.add(dc)
+    ps = wm.ps
+    state = (1 if selected else 0) | (4 if it.state & MF_GRAYED else 0) | \
+        (8 if it.state & MF_CHECKED else 0)
+    l, t, r, b = rect
+    mark = wm.scratch_mark()
+    try:
+        if ps == 8:
+            data = struct.pack("<IIIII4xQQiiiiQ", 1, 0, it.id, 1, state, menu.h, dc.h,
+                               l, t, r, b, it.data & M64)
+        else:
+            data = struct.pack("<IIIIIIIiiiiI", 1, 0, it.id, 1, state, menu.h, dc.h,
+                               l, t, r, b, it.data & 0xFFFFFFFF)
+        a = wm.scratch(data)
+        pt.done()
+        wm.send(owner, WM_DRAWITEM, 0, a)
+        pt.t = gdi.begin(dc)
+        pt.surf, pt.ox, pt.oy, pt.clip, _bm = pt.t
+    finally:
+        wm.scratch_release(mark)
+
+
+# -- popup menu windows ----------------------------------------------------------------------
+
+def _popup_layout(wm, menu, owner):
+    f = _menu_font(wm)
+    x = 3
+    y = 3
+    colw = 0
+    cols = []
+    maxacc = 0
+    col_items = []
+    for it in menu.items:
+        if it.type & (MF_MENUBREAK | MF_MENUBARBREAK) and col_items:
+            cols.append(col_items)
+            col_items = []
+        col_items.append(it)
+    if col_items:
+        cols.append(col_items)
+    total_w = 3
+    max_h = 0
+    for col in cols:
+        y = 3
+        cw = 0
+        acw = 0
+        for it in col:
+            if it.type & MF_SEPARATOR:
+                h = 9
+                iw = 0
+            elif it.type & MF_OWNERDRAW:
+                iw, h = _measure_ownerdraw(wm, owner, it, menu.h)
+                iw += 12
+            else:
+                label, acc = _item_label(it)
+                vis, _ = _strip_prefix(label)
+                iw = f.width(vis)
+                if acc:
+                    acw = max(acw, f.width(acc))
+                h = max(17, f.height + 4)
+                if it.type & MF_BITMAP:
+                    bm = wm.gdi.get(it.bmp or it.id, "bitmap")
+                    if bm is not None:
+                        iw = max(iw, bm.surf.w)
+                        h = max(h, bm.surf.h + 2)
+            it.rect = (0, y, 0, y + h)
+            y += h
+            cw = max(cw, iw)
+        colw = 20 + cw + (acw + 20 if acw else 0) + 20
+        for it in col:
+            it.rect = (total_w, it.rect[1], total_w + colw, it.rect[3])
+        total_w += colw
+        max_h = max(max_h, y)
+    menu.width = total_w + 3
+    menu.height = max_h + 3
+    return menu.width, menu.height
+
+
+def _popup_paint(wm, w, pt, menu, sel):
+    sysc = wm.gdi.sys_color
+    W, H = w.w, w.h
+    pt.fill(0, 0, W, H, sysc(COLOR_MENU))
+    _draw_edge(pt, (0, 0, W, H), 5, 15)
+    f = _menu_font(wm)
+    bold = _GFont("sans", 11, bold=True)
+    for i, it in enumerate(menu.items):
+        l, t, r, b = it.rect
+        if it.type & MF_SEPARATOR:
+            y = (t + b) // 2
+            pt.hline(l + 1, r - 1, y - 1, sysc(COLOR_BTNSHADOW))
+            pt.hline(l + 1, r - 1, y, sysc(COLOR_BTNHIGHLIGHT))
+            continue
+        if it.type & MF_OWNERDRAW:
+            _draw_ownerdraw(wm, menu.owner, pt, it, (l, t, r, b), sel == i, menu)
+            continue
+        grayed = it.state & (MF_GRAYED | MF_DISABLED)
+        hi = sel == i
+        if hi:
+            pt.fill(l, t, r, b, sysc(COLOR_HIGHLIGHT))
+        col = sysc(COLOR_HIGHLIGHTTEXT if hi else COLOR_MENUTEXT)
+        if grayed:
+            col = sysc(COLOR_GRAYTEXT) if not hi else sysc(COLOR_BTNFACE)
+        label, acc = _item_label(it)
+        vis, ul = _strip_prefix(label)
+        fnt = bold if it.state & MF_DEFAULT else f
+        ty = t + (b - t - fnt.height) // 2
+        if it.state & MF_CHECKED:
+            if it.type & MFT_RADIOCHECK:
+                cx, cy = l + 9, (t + b) // 2
+                pt.fill(cx - 2, cy - 1, cx + 3, cy + 2, col)
+                pt.fill(cx - 1, cy - 2, cx + 2, cy + 3, col)
+            else:
+                _draw_check(pt, l + 6, (t + b) // 2 - 3, col)
+        if it.type & MF_BITMAP:
+            bm = wm.gdi.get(it.bmp or it.id, "bitmap")
+            if bm is not None:
+                _blit_surface(pt, bm.surf, l + 20, t + 1)
+        tx = l + 20
+        if grayed and not hi:
+            pt.text(tx + 1, ty + 1, vis, fnt, sysc(COLOR_BTNHIGHLIGHT))
+            if acc:
+                pt.text(r - 20 - f.width(acc) + 1, ty + 1, acc, f, sysc(COLOR_BTNHIGHLIGHT))
+        pt.text(tx, ty, vis, fnt, col)
+        if 0 <= ul < len(vis):
+            ux = tx + fnt.width(vis[:ul])
+            pt.hline(ux, ux + fnt.advance(vis[ul]), ty + fnt.ascent + 1, col)
+        if acc:
+            pt.text(r - 20 - f.width(acc), ty, acc, f, col)
+        if it.sub:
+            _glyph_arrow(pt, (r - 14, t, r - 4, b), 3, col, 4)
+
+
+def _popup_proc_factory(wm):
+    def proc(hwnd, msg, wp, lp, wide):
+        w = wm.wnd(hwnd)
+        if w is None:
+            return 0
+        if msg == 0x000F:
+            ps = wm.begin_paint_py(w)
+            try:
+                menu = _menu_obj(wm, w.py.get("menu", 0))
+                if menu is not None:
+                    pt = _Painter(wm, w, client=False)
+                    try:
+                        _popup_paint(wm, w, pt, menu, w.py.get("sel", -1))
+                    finally:
+                        pt.done()
+            finally:
+                wm.end_paint_py(w, ps)
+            return 0
+        if msg == WM_NCCALCSIZE:
+            return 0
+        if msg in (0x0014, WM_NCPAINT):
+            return 1 if msg == 0x0014 else 0
+        if msg == WM_MOUSEACTIVATE:
+            return 3                                         # MA_NOACTIVATE
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+    return proc
+
+
+def _popup_open(wm, menu, owner, x, y, flags=0, exclude=None):
+    """Create and show a popup window for menu at screen (x, y)."""
+    w_, h_ = _popup_layout(wm, menu, owner)
+    sw, sh = wm.gdi.screen.w, wm.gdi.screen.h
+    if flags & 8:                                            # TPM_RIGHTALIGN
+        x -= w_
+    elif flags & 4:                                          # TPM_CENTERALIGN
+        x -= w_ // 2
+    if flags & 0x20:                                         # TPM_BOTTOMALIGN
+        y -= h_
+    elif flags & 0x10:                                       # TPM_VCENTERALIGN
+        y -= h_ // 2
+    if x + w_ > sw:
+        x = max(0, (exclude[0] - w_) if exclude else sw - w_)
+    if y + h_ > sh:
+        y = max(0, sh - h_)
+    x, y = max(0, x), max(0, y)
+    cls = wm.find_class("#32768")
+    hwnd = wm.create(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, cls, "", WS_POPUP, x, y, w_, h_,
+                     owner, 0, 0, 0, True)
+    w = wm.wnd(hwnd)
+    if w is None:
+        return None
+    w.py["menu"] = menu.h
+    w.py["sel"] = -1
+    menu.owner = owner
+    wm.set_pos(w, 0xFFFFFFFF, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW |
+               SWP_NOACTIVATE)
+    return w
+
+
+def _popup_item_at(wm, pw, X, Y):
+    menu = _menu_obj(wm, pw.py.get("menu"))
+    if menu is None:
+        return -1
+    x, y = X - pw.x, Y - pw.y
+    for i, it in enumerate(menu.items):
+        l, t, r, b = it.rect
+        if l <= x < r and t <= y < b:
+            return i
+    return -1
+
+
+def _popup_redraw(wm, pw):
+    wm.invalidate(pw, None, False)
+    # paint immediately so the menu reacts while the loop runs
+    menu = _menu_obj(wm, pw.py.get("menu"))
+    if menu is not None and wm.visible(pw):
+        pt = _Painter(wm, pw, client=False)
+        try:
+            _popup_paint(wm, pw, pt, menu, pw.py.get("sel", -1))
+        finally:
+            pt.done()
+        wm.validate(pw)
+
+
+def _selectable(it):
+    return not (it.type & MF_SEPARATOR)
+
+
+def _menu_track(wm, owner, hmenu, X, Y, flags=0, bar=None, bar_index=-1, keyboard=False,
+                sysmenu=False, exclude=None):
+    """Modal menu loop. Returns the chosen command id (0 = cancelled)."""
+    ow = wm.wnd(owner)
+    if ow is None:
+        return 0
+    tid = wm.cur_tid()
+    st = {"events": [], "cancel": False, "bar_hwnd": bar.hwnd if bar is not None else 0,
+          "bar_sel": bar_index, "open": False, "keyboard": keyboard}
+    stack = []                                   # [(menu, popup window)]
+    result = [0]
+
+    def post_select(menu, idx):
+        if flags & 0x80:                                     # TPM_NONOTIFY
+            return
+        if idx < 0 or menu is None:
+            wm.send(owner, WM_MENUSELECT, 0xFFFF0000, 0)
+            return
+        it = menu.items[idx]
+        fl = (it.type | it.state | (MF_POPUP if it.sub else 0) | (MF_SYSMENU if sysmenu else 0)) \
+            & 0xFFFF
+        ident = idx if it.sub else it.id
+        wm.send(owner, WM_MENUSELECT, (ident & 0xFFFF) | (fl << 16), menu.h)
+
+    def open_popup(menu_h, x, y, excl=None, level_pos=0):
+        m = _menu_obj(wm, menu_h)
+        if m is None:
+            return None
+        if not (flags & 0x80):
+            wm.send(owner, WM_INITMENUPOPUP, menu_h, (level_pos & 0xFFFF) |
+                    ((1 if sysmenu and not stack else 0) << 16))
+        pw = _popup_open(wm, m, owner, x, y, flags if not stack else 0, excl)
+        if pw is None:
+            return None
+        stack.append((m, pw))
+        return pw
+
+    def close_to(level):
+        while len(stack) > level:
+            m, pw = stack.pop()
+            if not (flags & 0x80):
+                wm.send(owner, 0x0125, m.h, 0)               # WM_UNINITMENUPOPUP
+            wm.destroy(pw)
+
+    def open_bar_item(i, select_first=False):
+        close_to(0)
+        menu = _menu_obj(wm, bar.menu)
+        st["bar_sel"] = i
+        _nc_paint(wm, bar)
+        if i < 0 or menu is None:
+            return
+        it = menu.items[i]
+        post_select(menu, i)
+        if it.sub and not (it.state & (MF_GRAYED | MF_DISABLED)):
+            r = _menubar_item_screen_rect(wm, bar, i)
+            st["open"] = True
+            pw = open_popup(it.sub, r[0], r[3], None, i)
+            if pw is not None and select_first:
+                m = stack[-1][0]
+                for k_, it2 in enumerate(m.items):
+                    if _selectable(it2):
+                        set_sel(len(stack) - 1, k_)
+                        break
+        else:
+            st["open"] = False
+        _nc_paint(wm, bar)
+
+    def set_sel(level, idx):
+        m, pw = stack[level]
+        if pw.py.get("sel") == idx:
+            return
+        pw.py["sel"] = idx
+        _popup_redraw(wm, pw)
+        post_select(m, idx)
+
+    def open_sub(level, idx):
+        m, pw = stack[level]
+        it = m.items[idx]
+        close_to(level + 1)
+        if it.sub and not (it.state & (MF_GRAYED | MF_DISABLED)):
+            l, t, r, b = it.rect
+            open_popup(it.sub, pw.x + r - 3, pw.y + t - 3, (pw.x, pw.y, pw.x + pw.w, pw.y + pw.h),
+                       idx)
+
+    def execute(m, idx):
+        it = m.items[idx]
+        if it.state & (MF_GRAYED | MF_DISABLED) or it.type & MF_SEPARATOR:
+            return False
+        if it.sub:
+            return False
+        result[0] = it.id if it.id else 0
+        st["done"] = True
+        return True
+
+    def on_mouse(act, btn, X_, Y_):
+        st["events"].append(("mouse", act, btn, X_, Y_))
+
+    def on_key(vk, down):
+        st["events"].append(("key", vk, down))
+        return True
+
+    st["mouse"] = on_mouse
+    st["key"] = on_key
+    prev_state = wm.menu_state
+    wm.menu_state = st
+    if not (flags & 0x80):
+        wm.send(owner, WM_ENTERMENULOOP, 1 if bar is None else 0, 0)
+        if bar is not None or sysmenu:
+            wm.send(owner, WM_INITMENU, (bar.menu if bar is not None else hmenu), 0)
+    old_capture = wm.capture
+    wm.capture = owner
+    try:
+        if bar is not None:
+            open_bar_item(bar_index, keyboard)
+            if keyboard and not st["open"]:
+                pass
+        else:
+            pw = open_popup(hmenu, X, Y, exclude)
+            if pw is None:
+                return 0
+            if keyboard:
+                m = stack[-1][0]
+                for k_, it2 in enumerate(m.items):
+                    if _selectable(it2):
+                        set_sel(0, k_)
+                        break
+        button_down = bar is not None and not keyboard
+        start = time.monotonic()
+        while not st.get("done") and not st["cancel"]:
+            if not st["events"]:
+                m_ = wm.peek(0, 0, 0, True)
+                if m_ is not None:
+                    if m_["msg"] in (0x200, 0x201, 0x202, 0x204, 0x205, 0x100, 0x101, 0x104,
+                                     0x105, WM_NCMOUSEMOVE, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP):
+                        continue
+                    _dispatch_py(wm, m_)
+                    continue
+                if not stack and bar is None:
+                    break
+                wm.p.py_wait(lambda: bool(st["events"]) or wm.wait_ready(tid, (0, 0, 0)),
+                             wm.next_timer(tid))
+                continue
+            ev = st["events"].pop(0)
+            if ev[0] == "mouse":
+                _k, act, btn, X_, Y_ = ev
+                # which popup level / bar item is under the pointer?
+                level, idx = -1, -1
+                for lv in range(len(stack) - 1, -1, -1):
+                    pw = stack[lv][1]
+                    if pw.x <= X_ < pw.x + pw.w and pw.y <= Y_ < pw.y + pw.h:
+                        level, idx = lv, _popup_item_at(wm, pw, X_, Y_)
+                        break
+                bar_i = -1
+                if level < 0 and bar is not None:
+                    bar_i = _menubar_item_at(wm, bar, X_, Y_)
+                if act == "move":
+                    if level >= 0:
+                        if idx >= 0 and _selectable(stack[level][0].items[idx]):
+                            set_sel(level, idx)
+                            if stack[level][0].items[idx].sub:
+                                if len(stack) <= level + 1 or stack[level + 1][0].h != \
+                                        stack[level][0].items[idx].sub:
+                                    open_sub(level, idx)
+                            else:
+                                close_to(level + 1)
+                    elif bar_i >= 0 and bar_i != st["bar_sel"] and (st["open"] or button_down):
+                        open_bar_item(bar_i)
+                elif act == "down":
+                    if level >= 0:
+                        continue
+                    if bar_i >= 0:
+                        if bar_i == st["bar_sel"] and st["open"]:
+                            st["cancel"] = True
+                            break
+                        open_bar_item(bar_i)
+                        button_down = True
+                        continue
+                    st["cancel"] = True
+                    break
+                elif act == "up":
+                    if level >= 0 and idx >= 0:
+                        m = stack[level][0]
+                        if execute(m, idx):
+                            break
+                        if m.items[idx].sub:
+                            open_sub(level, idx)
+                    elif bar is None and time.monotonic() - start > 0.3 and level < 0 and \
+                            not stack:
+                        st["cancel"] = True
+                    button_down = False
+            else:
+                _k, vk, down = ev
+                if not down:
+                    continue
+                level = len(stack) - 1
+                if vk == 0x1B:                                   # Esc
+                    if level > 0 or (level == 0 and bar is not None):
+                        close_to(level)
+                        if bar is not None and not stack:
+                            st["open"] = False
+                            st["keyboard"] = True
+                            _nc_paint(wm, bar)
+                        continue
+                    st["cancel"] = True
+                    break
+                if vk in (0x12, 0x79) and bar is not None:        # Alt / F10 closes
+                    st["cancel"] = True
+                    break
+                if level < 0:
+                    if bar is not None:
+                        menu = _menu_obj(wm, bar.menu)
+                        n = len(menu.items) if menu else 0
+                        if vk in (0x25, 0x27) and n:
+                            d = -1 if vk == 0x25 else 1
+                            open_bar_item((st["bar_sel"] + d) % n, False)
+                            close_to(0)
+                            st["open"] = False
+                            _nc_paint(wm, bar)
+                        elif vk in (0x0D, 0x28, 0x26) and st["bar_sel"] >= 0:
+                            open_bar_item(st["bar_sel"], True)
+                        else:
+                            ch = _vk_to_char(wm, vk)
+                            if ch and menu:
+                                for k_, it in enumerate(menu.items):
+                                    vis, ul = _strip_prefix(_item_label(it)[0])
+                                    if 0 <= ul < len(vis) and vis[ul].lower() == ch.lower():
+                                        open_bar_item(k_, True)
+                                        if not it.sub:
+                                            if execute(menu, k_):
+                                                break
+                                        break
+                    continue
+                m, pw = stack[level]
+                cur = pw.py.get("sel", -1)
+                n = len(m.items)
+                if vk in (0x26, 0x28):                           # up / down
+                    d = -1 if vk == 0x26 else 1
+                    i = cur
+                    for _ in range(n):
+                        i = (i + d) % n
+                        if _selectable(m.items[i]):
+                            break
+                    set_sel(level, i)
+                elif vk == 0x27:                                 # right
+                    if cur >= 0 and m.items[cur].sub:
+                        open_sub(level, cur)
+                        m2 = stack[-1][0] if len(stack) > level + 1 else None
+                        if m2 is not None:
+                            for k_, it2 in enumerate(m2.items):
+                                if _selectable(it2):
+                                    set_sel(level + 1, k_)
+                                    break
+                    elif bar is not None:
+                        menu = _menu_obj(wm, bar.menu)
+                        open_bar_item((st["bar_sel"] + 1) % len(menu.items), True)
+                elif vk == 0x25:                                 # left
+                    if level > 0:
+                        close_to(level)
+                    elif bar is not None:
+                        menu = _menu_obj(wm, bar.menu)
+                        open_bar_item((st["bar_sel"] - 1) % len(menu.items), True)
+                elif vk == 0x0D:
+                    if cur >= 0:
+                        if execute(m, cur):
+                            break
+                        if m.items[cur].sub:
+                            open_sub(level, cur)
+                else:
+                    ch = _vk_to_char(wm, vk)
+                    if ch:
+                        hits = []
+                        for k_, it in enumerate(m.items):
+                            vis, ul = _strip_prefix(_item_label(it)[0])
+                            if 0 <= ul < len(vis) and vis[ul].lower() == ch.lower():
+                                hits.append(k_)
+                        if not hits:
+                            r = wm.send(owner, WM_MENUCHAR, ord(ch) | (0x10 << 16), m.h)
+                            if (r >> 16) & 0xFFFF == 2:          # MNC_EXECUTE
+                                idx = r & 0xFFFF
+                                if 0 <= idx < n and execute(m, idx):
+                                    break
+                            elif (r >> 16) & 0xFFFF == 3:        # MNC_SELECT
+                                set_sel(level, r & 0xFFFF)
+                            continue
+                        nxt = next((h_ for h_ in hits if h_ > cur), hits[0])
+                        set_sel(level, nxt)
+                        if len(hits) == 1:
+                            if m.items[nxt].sub:
+                                open_sub(level, nxt)
+                            elif execute(m, nxt):
+                                break
+    finally:
+        close_to(0)
+        wm.menu_state = prev_state
+        wm.capture = old_capture if wm.wnd(old_capture) is not None else 0
+        if bar is not None and bar.hwnd in wm.wins:
+            st["bar_sel"] = -1
+            _nc_paint(wm, bar)
+        if not (flags & 0x80):
+            wm.send(owner, WM_MENUSELECT, 0xFFFF0000, 0)
+            wm.send(owner, WM_EXITMENULOOP, 1 if bar is None else 0, 0)
+    cmd = result[0] if st.get("done") else 0
+    if cmd and not (flags & 0x100):                              # !TPM_RETURNCMD
+        if sysmenu:
+            wm.post(owner, WM_SYSCOMMAND, cmd, _lparam_xy(*wm.cursor_pos))
+        else:
+            wm.post(owner, 0x0111, cmd & 0xFFFF, 0)
+    return cmd
+
+
+def _menubar_mouse(wm, w, X, Y):
+    i = _menubar_item_at(wm, w, X, Y)
+    if i < 0:
+        return
+    _menu_track(wm, w.hwnd, w.menu, X, Y, 0, bar=w, bar_index=i)
+
+
+def _menubar_keyboard(wm, w, ch):
+    top = wm.top(w)
+    menu = _menu_obj(wm, top.menu) if top is not None else None
+    if menu is None or not menu.items:
+        return
+    idx = 0
+    if ch:
+        c = chr(ch & 0xFFFF).lower()
+        found = -1
+        for k_, it in enumerate(menu.items):
+            vis, ul = _strip_prefix(_item_label(it)[0])
+            if 0 <= ul < len(vis) and vis[ul].lower() == c:
+                found = k_
+                break
+        if found < 0:
+            return
+        idx = found
+        _menu_track(wm, top.hwnd, top.menu, 0, 0, 0, bar=top, bar_index=idx, keyboard=True)
+        return
+    _menu_track(wm, top.hwnd, top.menu, 0, 0, 0, bar=top, bar_index=idx, keyboard=True)
+
+
+def _system_menu(wm, w):
+    h = w.py.get("sysmenu")
+    m = _menu_obj(wm, h)
+    if m is None:
+        m = _Menu(True)
+        m.sysmenu = True
+        wm.gdi.add(m)
+        for (typ, iid, text) in ((0, SC_RESTORE, "&Restore"), (0, SC_MOVE, "&Move"),
+                                 (0, SC_SIZE, "&Size"), (0, SC_MINIMIZE, "Mi&nimize"),
+                                 (0, SC_MAXIMIZE, "Ma&ximize"), (MF_SEPARATOR, 0, ""),
+                                 (0, SC_CLOSE, "&Close\tAlt+F4")):
+            it = _MItem(typ, 0, iid, 0, text)
+            if iid == SC_CLOSE:
+                it.state |= MF_DEFAULT
+            m.items.append(it)
+        w.py["sysmenu"] = m.h
+    return m
+
+
+def _sysmenu_track(wm, w, X, Y):
+    m = _system_menu(wm, w)
+    for it in m.items:
+        if it.id == SC_RESTORE:
+            it.state = 0 if w.min_state else MF_GRAYED
+        elif it.id == SC_MAXIMIZE:
+            it.state = MF_GRAYED if (w.min_state == 2 or not w.style & WS_MAXIMIZEBOX) else 0
+        elif it.id == SC_MINIMIZE:
+            it.state = MF_GRAYED if (w.min_state == 1 or not w.style & WS_MINIMIZEBOX) else 0
+        elif it.id == SC_SIZE:
+            it.state = 0 if (w.style & WS_THICKFRAME and not w.min_state) else MF_GRAYED
+        elif it.id == SC_MOVE:
+            it.state = MF_GRAYED if w.min_state == 2 else 0
+    _menu_track(wm, w.hwnd, m.h, X, Y, 0, sysmenu=True)
+
+
+# -- standard controls: Button, Static, Edit, ListBox, ComboBox, ScrollBar ------------------------
+
+DLGC_WANTARROWS, DLGC_WANTTAB, DLGC_WANTALLKEYS, DLGC_WANTMESSAGE = 1, 2, 4, 4
+DLGC_HASSETSEL, DLGC_DEFPUSHBUTTON, DLGC_UNDEFPUSHBUTTON, DLGC_RADIOBUTTON = 8, 0x10, 0x20, 0x40
+DLGC_WANTCHARS, DLGC_STATIC, DLGC_BUTTON = 0x80, 0x100, 0x2000
+
+
+def _ctl_hfont(wm, w):
+    return w.font if w.font and wm.gdi.get(w.font, "font") else wm.gdi.stock[13].h
+
+
+def _ctl_gfont(wm, w):
+    return wm.gdi.get(_ctl_hfont(wm, w), "font").realize()
+
+
+def _notify(wm, w, code):
+    par = w.parent
+    if par is None or par is wm.desktop:
+        par = wm.wnd(w.owner)
+        if par is None:
+            return 0
+    return wm.send(par.hwnd, 0x0111, (w.id & 0xFFFF) | ((code & 0xFFFF) << 16), w.hwnd)
+
+
+def _ctl_color(wm, w, msg, dc):
+    """Ask the parent for colors (WM_CTLCOLOR*) -> brush handle."""
+    par = w.parent if w.parent is not wm.desktop else wm.wnd(w.owner)
+    if not dc.h:
+        wm.gdi.add(dc)
+    br = 0
+    if par is not None and par is not wm.desktop:
+        br = wm.send(par.hwnd, msg, dc.h, w.hwnd)
+    if not br or wm.gdi.brush(br) is None:
+        br = _def_ctlcolor(wm, msg, dc.h)
+    return br
+
+
+def _ctl_paint(wm, w, fn, hdc=0):
+    """Run fn(painter) inside BeginPaint/EndPaint (or on a WM_PRINTCLIENT DC)."""
+    if hdc and wm.gdi.get(hdc, "dc") is not None:
+        pt = _Painter(wm, w, dc=wm.gdi.get(hdc, "dc"))
+        try:
+            fn(pt)
+        finally:
+            pt.done()
+        return
+    dc = wm.begin_paint_py(w)
+    try:
+        pt = _Painter(wm, w, dc=dc)
+        try:
+            fn(pt)
+        finally:
+            pt.done()
+    finally:
+        wm.end_paint_py(w, dc)
+
+
+def _focus_rect(pt, l, t, r, b):
+    """Dotted focus rectangle (XOR)."""
+    X0, Y0 = pt.xy(l, t)
+    X1, Y1 = pt.xy(r, b)
+    pix = b"\xff\xff\xff\x00"
+    for x in range(X0, X1):
+        if (x - X0) % 2 == 0:
+            _plot(pt.surf, pt.clip, x, Y0, pix, 7)
+            _plot(pt.surf, pt.clip, x, Y1 - 1, pix, 7)
+    for y in range(Y0 + 1, Y1 - 1):
+        if (y - Y0) % 2 == 0:
+            _plot(pt.surf, pt.clip, X0, y, pix, 7)
+            _plot(pt.surf, pt.clip, X1 - 1, y, pix, 7)
+
+
+def _grayed_text(pt, rect, text, fmt, hfont, sysc):
+    r2 = (rect[0] + 1, rect[1] + 1, rect[2] + 1, rect[3] + 1)
+    pt.draw_text(r2, text, fmt, hfont, sysc(COLOR_BTNHIGHLIGHT))
+    pt.draw_text(rect, text, fmt, hfont, sysc(COLOR_GRAYTEXT))
+
+
+# == Button ==========================================================================
+
+def _button_proc(wm):
+    def kind(w):
+        return w.style & 0xF
+
+    def is_push(w):
+        return kind(w) in (0, 1, 10, 0xC, 0xD, 0xE) or w.style & 0x1000
+
+    def paint(w, hdc=0):
+        sysc = wm.gdi.sys_color
+        st = w.py
+        k = kind(w)
+        hf = _ctl_hfont(wm, w)
+
+        def draw(pt):
+            dc = pt.dc
+            dc.font = hf
+            W, H = w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]
+            enabled = wm.enabled_chain(w)
+            focused = wm.focus == w.hwnd
+            if k == 0xB:                                  # BS_OWNERDRAW
+                _owner_draw_item(wm, w, pt, 4, 0, 1,
+                                 (1 if st.get("pushed") else 0) | (0x10 if focused else 0) |
+                                 (4 if not enabled else 0), (0, 0, W, H), 0)
+                return
+            if k == 7:                                    # group box
+                br = _ctl_color(wm, w, WM_CTLCOLORSTATIC, dc)
+                f = dc.gfont()
+                th = f.height
+                text = w.text
+                vis, _ul = _strip_prefix(text)
+                pt.fill_brush(0, 0, W, H, br) if False else None
+                y = th // 2
+                _draw_edge(pt, (0, y, W, H), 6, 15)       # EDGE_ETCHED
+                if vis:
+                    tw = f.width(vis)
+                    x = 8 if not (w.style & 0x300) == 0x200 else W - tw - 10
+                    pt.fill_brush(x - 2, 0, x + tw + 2, th, br)
+                    col = dc.text_color if enabled else sysc(COLOR_GRAYTEXT)
+                    pt.draw_text((x, 0, x + tw + 1, th), text, 0x20, hf, col)
+                return
+            if is_push(w):
+                br = _ctl_color(wm, w, WM_CTLCOLORBTN, dc)
+                pushed = st.get("pushed") or (w.style & 0x1000 and st.get("check"))
+                default = st.get("default") or k == 1
+                rect = (0, 0, W, H)
+                if default and not w.style & 0x8000:
+                    pt.frame(0, 0, W, H, sysc(COLOR_WINDOWFRAME))
+                    rect = (1, 1, W - 1, H - 1)
+                if pushed:
+                    pt.frame(rect[0], rect[1], rect[2], rect[3], sysc(COLOR_BTNSHADOW))
+                    pt.fill(rect[0] + 1, rect[1] + 1, rect[2] - 1, rect[3] - 1, sysc(COLOR_BTNFACE))
+                elif w.style & 0x8000:                    # BS_FLAT
+                    pt.frame(rect[0], rect[1], rect[2], rect[3], sysc(COLOR_WINDOWFRAME))
+                    pt.fill(rect[0] + 1, rect[1] + 1, rect[2] - 1, rect[3] - 1, sysc(COLOR_BTNFACE))
+                else:
+                    _draw_edge(pt, rect, 5, 15 | 0x800 | 0x1000)
+                off = 1 if pushed else 0
+                tr = (rect[0] + 3 + off, rect[1] + 3 + off, rect[2] - 3 + off, rect[3] - 3 + off)
+                img = st.get("image")
+                if img and (w.style & 0xC0):
+                    o = wm.gdi.get(img)
+                    if o is not None and o.kind in ("icon", "cursor"):
+                        pt.icon((W - o.w) // 2 + off, (H - o.ht) // 2 + off, img)
+                    elif o is not None and o.kind == "bitmap":
+                        _blit_surface(pt, o.surf, (W - o.surf.w) // 2 + off,
+                                      (H - o.surf.h) // 2 + off)
+                else:
+                    fmt = _btn_text_fmt(w, 1)
+                    if enabled:
+                        pt.draw_text(tr, w.text, fmt, hf, sysc(COLOR_BTNTEXT))
+                    else:
+                        _grayed_text(pt, tr, w.text, fmt, hf, sysc)
+                if focused and not (w.py.get("uistate", 0) & 1):
+                    _focus_rect(pt, rect[0] + 3, rect[1] + 3, rect[2] - 3, rect[3] - 3)
+                return
+            # check box / radio button
+            br = _ctl_color(wm, w, WM_CTLCOLORSTATIC, dc)
+            pt.fill_brush(0, 0, W, H, br)
+            box = 13
+            left_text = w.style & 0x20
+            by = (H - box) // 2
+            if w.style & 0xC00 == 0x400:
+                by = 0
+            elif w.style & 0xC00 == 0x800:
+                by = H - box
+            bx = W - box if left_text else 0
+            chk = st.get("check", 0)
+            if k in (4, 9):
+                state = 4 | (0x400 if chk else 0)
+            else:
+                state = (8 if k in (5, 6) and chk == 2 else 0) | (0x400 if chk else 0)
+            if st.get("pushed"):
+                state |= 0x200
+            if not enabled:
+                state |= 0x100
+            if w.style & 0x8000:
+                state |= 0x4000
+            _draw_frame_control(pt, (bx, by, bx + box, by + box), 4, state)
+            tl = 0 if left_text else box + 4
+            tr = W - box - 4 if left_text else W
+            f = dc.gfont()
+            fmt = _btn_text_fmt(w, 0) | (0x20 | 4 if not (w.style & 0x2000) else 0x10)
+            col = dc.text_color if enabled else sysc(COLOR_GRAYTEXT)
+            if enabled:
+                pt.draw_text((tl, 0, tr, H), w.text, fmt, hf, col)
+            else:
+                _grayed_text(pt, (tl, 0, tr, H), w.text, fmt, hf, sysc)
+            if focused and w.text:
+                vis, _ = _strip_prefix(w.text)
+                tw = min(f.width(vis), tr - tl)
+                ty = (H - f.height) // 2
+                _focus_rect(pt, tl - 1, max(0, ty - 1), tl + tw + 2, min(H, ty + f.height + 1))
+
+        _ctl_paint(wm, w, draw, hdc)
+
+    def click(w):
+        k = kind(w)
+        if k in (3,):                                     # auto check box
+            w.py["check"] = 0 if w.py.get("check") else 1
+        elif k == 6:                                      # auto 3-state
+            w.py["check"] = (w.py.get("check", 0) + 1) % 3
+        elif k == 9:                                      # auto radio
+            _check_radio_group(wm, w)
+        wm.invalidate(w, None, True)
+        _notify(wm, w, 0)                                 # BN_CLICKED
+
+    def proc(hwnd, msg, wp, lp, wide):
+        w = wm.wnd(hwnd)
+        if w is None:
+            return 0
+        st = w.py
+        k = kind(w)
+        if msg == 0x0001:
+            st.setdefault("check", 0)
+            return 0
+        if msg == 0x000F:
+            paint(w, wp)
+            return 0
+        if msg == WM_PRINTCLIENT:
+            paint(w, wp)
+            return 0
+        if msg == 0x0014:
+            return 1
+        if msg == WM_GETDLGCODE:
+            if k in (0, 10, 0xC, 0xE):
+                return DLGC_BUTTON | DLGC_UNDEFPUSHBUTTON
+            if k in (1, 0xD):
+                return DLGC_BUTTON | DLGC_DEFPUSHBUTTON
+            if k in (4, 9):
+                return DLGC_BUTTON | DLGC_RADIOBUTTON
+            if k == 7:
+                return DLGC_STATIC
+            return DLGC_BUTTON
+        if msg == WM_NCHITTEST:
+            if k == 7:
+                return HTTRANSPARENT & 0xFFFFFFFF
+            return HTCLIENT
+        if msg in (0x0201, 0x0203):                       # LBUTTONDOWN / DBLCLK
+            if msg == 0x0203 and (k in (4, 9) or w.style & 0x4000):
+                _notify(wm, w, 5)
+            wm.set_capture(hwnd)
+            wm.set_focus(hwnd)
+            st["pushed"] = True
+            st["tracking"] = True
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x0200:
+            if st.get("tracking"):
+                x, y = _xy_lparam(lp)
+                inside = 0 <= x < w.cl[2] - w.cl[0] and 0 <= y < w.cl[3] - w.cl[1]
+                if inside != bool(st.get("pushed")):
+                    st["pushed"] = inside
+                    wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x0202:
+            if st.get("tracking"):
+                st["tracking"] = False
+                was = st.get("pushed")
+                st["pushed"] = False
+                if wm.capture == hwnd:
+                    wm.set_capture(0)
+                wm.invalidate(w, None, True)
+                x, y = _xy_lparam(lp)
+                if was and 0 <= x < w.cl[2] - w.cl[0] and 0 <= y < w.cl[3] - w.cl[1]:
+                    click(w)
+            return 0
+        if msg in (WM_CAPTURECHANGED,):
+            if st.get("tracking") and lp != hwnd:
+                st["tracking"] = False
+                st["pushed"] = False
+                wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x0100:
+            if wp == 0x20:
+                st["pushed"] = True
+                st["key_down"] = True
+                wm.invalidate(w, None, True)
+                return 0
+            if k in (4, 9) and wp in (0x25, 0x26, 0x27, 0x28):
+                return 0
+        if msg == WM_KEYUP and wp == 0x20 and st.get("key_down"):
+            st["key_down"] = False
+            st["pushed"] = False
+            click(w)
+            return 0
+        if msg == WM_CHAR:
+            return 0
+        if msg == WM_SETFOCUS:
+            if k in (4, 9) and not st.get("check") and wm.keys[1] & 0x80 == 0 and k == 9:
+                pass
+            wm.invalidate(w, None, True)
+            if w.style & 0x4000:
+                _notify(wm, w, 6)                         # BN_SETFOCUS (BS_NOTIFY)
+            return 0
+        if msg == WM_KILLFOCUS:
+            if st.get("pushed") or st.get("tracking"):
+                st["pushed"] = st["tracking"] = False
+                if wm.capture == hwnd:
+                    wm.set_capture(0)
+            wm.invalidate(w, None, True)
+            if w.style & 0x4000:
+                _notify(wm, w, 7)
+            return 0
+        if msg == WM_SETTEXT:
+            r = _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+            wm.invalidate(w, None, True)
+            return r
+        if msg == WM_SETFONT:
+            w.font = wp
+            if lp:
+                wm.invalidate(w, None, True)
+            return 0
+        if msg == WM_ENABLE:
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == 0xF0:                                   # BM_GETCHECK
+            return st.get("check", 0)
+        if msg == 0xF1:                                   # BM_SETCHECK
+            v = wp & 3
+            if k in (4, 9, 2, 3, 5, 6) or w.style & 0x1000:
+                if st.get("check", 0) != v:
+                    st["check"] = v
+                    wm.invalidate(w, None, True)
+                if k in (4, 9) and v:
+                    w.style |= WS_TABSTOP
+            return 0
+        if msg == 0xF2:                                   # BM_GETSTATE
+            return st.get("check", 0) | (4 if st.get("pushed") else 0) | \
+                (8 if wm.focus == hwnd else 0)
+        if msg == 0xF3:                                   # BM_SETSTATE
+            st["pushed"] = bool(wp)
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == 0xF4:                                   # BM_SETSTYLE
+            w.style = (w.style & 0xFFFF0000) | (wp & 0xFFFF)
+            st["default"] = (wp & 0xF) == 1
+            if lp:
+                wm.invalidate(w, None, True)
+            return 0
+        if msg == 0xF5:                                   # BM_CLICK
+            if wm.enabled_chain(w):
+                click(w)
+            return 0
+        if msg == 0xF6:                                   # BM_GETIMAGE
+            return st.get("image", 0)
+        if msg == 0xF7:                                   # BM_SETIMAGE
+            old = st.get("image", 0)
+            st["image"] = lp
+            wm.invalidate(w, None, True)
+            return old
+        if msg == 0xF8:
+            return 0
+        if msg == 0x1600 + 0x0001 or msg == 0x160A:       # BCM_GETIDEALSIZE etc.
+            return 0
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+    return proc
+
+
+def _btn_text_fmt(w, default_h):
+    h = w.style & 0x300
+    fmt = {0x100: 0, 0x200: 2, 0x300: 1}.get(h, 1 if default_h else 0)
+    v = w.style & 0xC00
+    if not (w.style & 0x2000):
+        fmt |= 0x20 | {0x400: 0, 0x800: 8}.get(v, 4)
+    else:
+        fmt |= 0x10
+    return fmt
+
+
+def _check_radio_group(wm, w):
+    par = w.parent
+    if par is None:
+        return
+    group = _dlg_group(wm, par, w)
+    for g in group:
+        if g is w:
+            g.py["check"] = 1
+            wm.invalidate(g, None, True)
+        elif (g.style & 0xF) == 9 and g.py.get("check"):
+            g.py["check"] = 0
+            wm.invalidate(g, None, True)
+    w.style |= WS_TABSTOP
+
+
+def _dlg_group(wm, par, w):
+    """Siblings in w's WS_GROUP group (z-order)."""
+    kids = [c for c in par.children if not c.dead]
+    if w not in kids:
+        return [w]
+    i = kids.index(w)
+    s = i
+    while s > 0 and not (kids[s].style & WS_GROUP):
+        s -= 1
+    e = i + 1
+    while e < len(kids) and not (kids[e].style & WS_GROUP):
+        e += 1
+    return kids[s:e]
+
+
+def _owner_draw_item(wm, w, pt, ctltype, item_id, action, state, rect, data):
+    """WM_DRAWITEM for owner-drawn controls (the DC is the painter's DC)."""
+    dc = pt.dc
+    gdi = wm.gdi
+    if not dc.h:
+        gdi.add(dc)
+    ps = wm.ps
+    l, t, r, b = rect
+    mark = wm.scratch_mark()
+    try:
+        if ps == 8:
+            d = struct.pack("<IIIII4xQQiiiiQ", ctltype, w.id & 0xFFFFFFFF, item_id & 0xFFFFFFFF,
+                            action, state, w.hwnd, dc.h, l, t, r, b, data & M64)
+        else:
+            d = struct.pack("<IIIIIIIiiiiI", ctltype, w.id & 0xFFFFFFFF, item_id & 0xFFFFFFFF,
+                            action, state, w.hwnd, dc.h, l, t, r, b, data & 0xFFFFFFFF)
+        a = wm.scratch(d)
+        pt.done()
+        saved = dc.save()
+        par = w.parent if w.parent is not wm.desktop else wm.wnd(w.owner)
+        if par is not None:
+            wm.send(par.hwnd, WM_DRAWITEM, w.id & 0xFFFF, a)
+        dc.restore(saved)
+        pt.t = gdi.begin(dc)
+        pt.surf, pt.ox, pt.oy, pt.clip, _bm = pt.t
+    finally:
+        wm.scratch_release(mark)
+
+
+# == Static ===========================================================================
+
+def _static_proc(wm):
+    def paint(w, hdc=0):
+        sysc = wm.gdi.sys_color
+        typ = w.style & 0x1F
+        hf = _ctl_hfont(wm, w)
+
+        def draw(pt):
+            dc = pt.dc
+            dc.font = hf
+            W, H = w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]
+            if typ in (4, 5, 6):
+                pt.fill(0, 0, W, H, sysc({4: COLOR_WINDOWFRAME, 5: COLOR_BACKGROUND,
+                                          6: COLOR_WINDOW}[typ]))
+                return
+            if typ in (7, 8, 9):
+                pt.frame(0, 0, W, H, sysc({7: COLOR_WINDOWFRAME, 8: COLOR_BACKGROUND,
+                                           9: COLOR_WINDOW}[typ]))
+                return
+            if typ == 0x10:
+                _draw_edge(pt, (0, 0, W, 2), 6, 2 | 8)
+                return
+            if typ == 0x11:
+                _draw_edge(pt, (0, 0, 2, H), 6, 1 | 4)
+                return
+            if typ == 0x12:
+                _draw_edge(pt, (0, 0, W, H), 6, 15)
+                return
+            if typ == 0xD:                                # SS_OWNERDRAW
+                _owner_draw_item(wm, w, pt, 3, 0, 1, 0, (0, 0, W, H), 0)
+                return
+            br = _ctl_color(wm, w, WM_CTLCOLORSTATIC, dc)
+            if typ in (3, 0xE):                           # icon / bitmap
+                pt.fill_brush(0, 0, W, H, br)
+                img = w.py.get("image", 0)
+                o = wm.gdi.get(img) if img else None
+                if o is None:
+                    return
+                if o.kind == "bitmap":
+                    iw, ih = o.surf.w, o.surf.h
+                else:
+                    iw, ih = o.w, o.ht
+                x = y = 0
+                if w.style & 0x200:
+                    x, y = (W - iw) // 2, (H - ih) // 2
+                if o.kind == "bitmap":
+                    _blit_surface(pt, o.surf, x, y)
+                else:
+                    pt.icon(x, y, img)
+                return
+            if typ != 0xB:
+                pt.fill_brush(0, 0, W, H, br)
+            fmt = {0: 0x10, 1: 0x10 | 1, 2: 0x10 | 2, 0xB: 0x20, 0xC: 0x20}.get(typ, 0x10)
+            fmt |= 0x40                                   # DT_EXPANDTABS
+            if w.style & 0x80:
+                fmt |= 0x800
+            if w.style & 0x200 and typ in (0, 1, 2):
+                fmt = (fmt & ~0x10) | 0x20 | 4
+            ell = w.style & 0xC000
+            if ell:
+                fmt |= {0x4000: 0x8000, 0x8000: 0x4000, 0xC000: 0x40000}[ell]
+                fmt = (fmt & ~0x10) | 0x20
+            if w.style & 0x2000:
+                fmt |= 0x2000
+            enabled = wm.enabled_chain(w)
+            if enabled:
+                pt.draw_text((0, 0, W, H), w.text, fmt, hf, dc.text_color)
+            else:
+                pt.draw_text((0, 0, W, H), w.text, fmt, hf, sysc(COLOR_GRAYTEXT))
+
+        _ctl_paint(wm, w, draw, hdc)
+
+    def proc(hwnd, msg, wp, lp, wide):
+        w = wm.wnd(hwnd)
+        if w is None:
+            return 0
+        typ = w.style & 0x1F
+        if msg == WM_NCCREATE:
+            r = _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+            if typ in (3, 0xE) and lp:
+                # the "text" of an icon/bitmap static names a resource
+                ps = wm.ps
+                nptr = wm.rp(lp + (56 if ps == 8 else 36))
+                name = nptr if nptr and nptr < 0x10000 else (
+                    _res_key(wm.p, nptr, wide) if nptr else 0)
+                if isinstance(name, str) and name.startswith("\xff"):
+                    name = 0
+                if name:
+                    inst = w.inst
+                    if typ == 3:
+                        ic = _load_icon_res(wm.p, inst, name, 32)
+                        if ic is not None:
+                            w.py["image"] = wm.gdi.add(ic)
+                            if not (w.style & 0x40):
+                                w.w, w.h = ic.w, ic.ht
+                    else:
+                        data = _res_bytes(wm.p, inst, 2, name)
+                        if data:
+                            bm = _bitmap_from_packed(wm.p, data)
+                            if bm is not None:
+                                w.py["image"] = wm.gdi.add(bm)
+                                w.w, w.h = bm.surf.w, bm.surf.h
+                w.text = ""
+            if w.style & 0x1000:                          # SS_SUNKEN
+                w.exstyle |= WS_EX_STATICEDGE
+            return r
+        if msg == 0x000F or msg == WM_PRINTCLIENT:
+            paint(w, wp)
+            return 0
+        if msg == 0x0014:
+            return 1
+        if msg == WM_NCHITTEST:
+            return HTCLIENT if w.style & 0x100 else HTTRANSPARENT & 0xFFFFFFFF
+        if msg == WM_GETDLGCODE:
+            return DLGC_STATIC
+        if msg in (0x0201, 0x0203) and w.style & 0x100:
+            _notify(wm, w, 0 if msg == 0x0201 else 1)       # STN_CLICKED / STN_DBLCLK
+            return 0
+        if msg == WM_SETTEXT:
+            if typ in (3, 0xE):
+                return 1
+            r = _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+            wm.invalidate(w, None, True)
+            return r
+        if msg == WM_SETFONT:
+            w.font = wp
+            if lp:
+                wm.invalidate(w, None, True)
+            return 0
+        if msg == WM_ENABLE:
+            wm.invalidate(w, None, True)
+            return 0
+        if msg in (0x170, 0x172):                         # STM_SETICON / STM_SETIMAGE
+            h = wp if msg == 0x170 else lp
+            old = w.py.get("image", 0)
+            w.py["image"] = h
+            o = wm.gdi.get(h) if h else None
+            if o is not None and not (w.style & 0x240):
+                iw, ih = (o.surf.w, o.surf.h) if o.kind == "bitmap" else (o.w, o.ht)
+                wm.set_pos(w, 0, 0, 0, iw, ih, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)
+            wm.invalidate(w, None, True)
+            return old
+        if msg in (0x171, 0x173):
+            return w.py.get("image", 0)
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+    return proc
+
+
+# == Edit ===========================================================================
+
+class _EditState:
+    def __init__(self):
+        self.ss = self.se = 0
+        self.xoff = 0
+        self.top = 0
+        self.limit = 30000
+        self.modified = False
+        self.undo = None
+        self.pwchar = "*"
+        self.margins = [1, 1]
+        self.tabs = []
+        self.lines = None            # cached visual lines [(start, end)]
+        self.lines_key = None
+        self.drag = False
+        self.cue = ""
+        self.readonly = False
+        self.handle = 0
+        self.anchor = 0
+
+
+def _edit_proc(wm):
+    def st_of(w):
+        es = w.py.get("edit")
+        if es is None:
+            es = w.py["edit"] = _EditState()
+        return es
+
+    def multi(w):
+        return bool(w.style & 4)
+
+    def shown(w, text):
+        if w.style & 0x20 and not multi(w):
+            return st_of(w).pwchar * len(text)
+        return text
+
+    def fmt_rect(w):
+        es = st_of(w)
+        W, H = w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]
+        f = _ctl_gfont(wm, w)
+        if not multi(w):
+            y = max(0, (H - f.height) // 2) if H < f.height + 6 else 1
+            return (es.margins[0], y, W - es.margins[1], y + f.height)
+        return (es.margins[0], 0, W - es.margins[1], H)
+
+    def wrap(w):
+        return multi(w) and not (w.style & 0x80) and not (w.style & WS_HSCROLL)
+
+    def vlines(w):
+        """Visual lines [(start, end)] (end excludes the break)."""
+        es = st_of(w)
+        text = w.text
+        key = (text, w.cl, w.font, w.style & 0x80)
+        if es.lines_key == key:
+            return es.lines
+        out = []
+        if not multi(w):
+            out = [(0, len(text))]
+        else:
+            f = _ctl_gfont(wm, w)
+            width = fmt_rect(w)[2] - fmt_rect(w)[0]
+            pos = 0
+            for line in text.split("\r\n"):
+                if wrap(w) and line and width > 0:
+                    s = 0
+                    while s < len(line):
+                        acc = 0
+                        e = s
+                        last_sp = -1
+                        while e < len(line):
+                            cw = f.advance(line[e]) if line[e] != "\t" else f.advance(" ") * 4
+                            if acc + cw > width and e > s:
+                                break
+                            acc += cw
+                            if line[e] == " ":
+                                last_sp = e
+                            e += 1
+                        if e < len(line) and last_sp >= s:
+                            e = last_sp + 1
+                        out.append((pos + s, pos + e))
+                        s = e
+                else:
+                    out.append((pos, pos + len(line)))
+                pos += len(line) + 2
+            if not out:
+                out = [(0, 0)]
+        es.lines, es.lines_key = out, key
+        return out
+
+    def line_of(w, ci):
+        ls = vlines(w)
+        for i, (s, e) in enumerate(ls):
+            if ci <= e or i == len(ls) - 1:
+                if ci >= s:
+                    return i
+        return len(ls) - 1
+
+    def text_w(w, s):
+        f = _ctl_gfont(wm, w)
+        tot = 0
+        for c in s:
+            tot += f.advance(" ") * 4 if c == "\t" else f.advance(c)
+        return tot
+
+    def pos_of(w, ci):
+        """Client coordinates of char index ci."""
+        es = st_of(w)
+        f = _ctl_gfont(wm, w)
+        fr = fmt_rect(w)
+        li = line_of(w, ci)
+        s, e = vlines(w)[li]
+        x = fr[0] + text_w(w, shown(w, w.text[s:min(ci, e)])) - es.xoff
+        if not multi(w):
+            align = w.style & 3
+            tw = text_w(w, shown(w, w.text))
+            if align == 1:
+                x += max(0, ((fr[2] - fr[0]) - tw) // 2)
+            elif align == 2:
+                x += max(0, (fr[2] - fr[0]) - tw)
+        y = fr[1] + (li - es.top) * f.height
+        return x, y
+
+    def char_at(w, x, y):
+        es = st_of(w)
+        f = _ctl_gfont(wm, w)
+        fr = fmt_rect(w)
+        ls = vlines(w)
+        li = es.top + (y - fr[1]) // max(1, f.height) if multi(w) else 0
+        li = max(0, min(li, len(ls) - 1))
+        s, e = ls[li]
+        base = pos_of(w, s)[0]
+        acc = base
+        txt = shown(w, w.text[s:e]) if not multi(w) else w.text[s:e]
+        for i, c in enumerate(txt):
+            cw = f.advance(" ") * 4 if c == "\t" else f.advance(c)
+            if x < acc + cw // 2:
+                return s + i
+            acc += cw
+        return e
+
+    def scroll_to_caret(w):
+        es = st_of(w)
+        f = _ctl_gfont(wm, w)
+        fr = fmt_rect(w)
+        ci = es.se
+        if multi(w):
+            li = line_of(w, ci)
+            vis = max(1, (fr[3] - fr[1]) // max(1, f.height))
+            old = es.top
+            if li < es.top:
+                es.top = li
+            elif li >= es.top + vis:
+                es.top = li - vis + 1
+            if es.top != old:
+                _notify(wm, w, 0x602)
+                update_sb(w)
+        if not wrap(w):
+            s, e = vlines(w)[line_of(w, ci)]
+            cx = text_w(w, shown(w, w.text[s:ci]))
+            width = fr[2] - fr[0]
+            old = es.xoff
+            if cx - es.xoff > width - 1:
+                es.xoff = cx - width + max(1, width // 3 if not multi(w) else 1)
+            elif cx < es.xoff:
+                es.xoff = max(0, cx - (width // 3 if not multi(w) else 0))
+            if es.xoff != old:
+                _notify(wm, w, 0x601)
+
+    def update_sb(w):
+        if not multi(w) or not (w.style & WS_VSCROLL):
+            return
+        es = st_of(w)
+        f = _ctl_gfont(wm, w)
+        fr = fmt_rect(w)
+        n = len(vlines(w))
+        vis = max(1, (fr[3] - fr[1]) // max(1, f.height))
+        info = _sb_info(w, 1)
+        info[0], info[1], info[2], info[3] = 0, max(0, n - 1), vis, es.top
+        _sb_redraw(wm, w, 1)
+
+    def caret_update(w):
+        if wm.focus != w.hwnd:
+            return
+        es = st_of(w)
+        x, y = pos_of(w, es.se)
+        wm.caret_set_pos(w.hwnd, x, y)
+
+    def refresh(w):
+        caret_update(w)
+        wm.invalidate(w, None, True)
+
+    def set_text(w, text, notify=True, undoable=False):
+        es = st_of(w)
+        if undoable:
+            es.undo = (w.text, es.ss, es.se)
+        w.text = text
+        es.lines_key = None
+        if notify:
+            es.modified = True
+
+    def replace_sel(w, s, undoable=True, notify=True):
+        es = st_of(w)
+        a, b = sorted((es.ss, es.se))
+        if w.style & 8:
+            s = s.upper()
+        elif w.style & 0x10:
+            s = s.lower()
+        if not multi(w):
+            s = s.replace("\r\n", "").replace("\n", "").replace("\r", "")
+        else:
+            s = s.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+        room = es.limit - (len(w.text) - (b - a))
+        if len(s) > room:
+            s = s[:max(0, room)]
+            _notify(wm, w, 0x501)                          # EN_MAXTEXT
+        if not multi(w) and not (w.style & 0x80) and s:
+            fr = fmt_rect(w)
+            newt = w.text[:a] + s + w.text[b:]
+            while s and text_w(w, shown(w, newt)) > fr[2] - fr[0]:
+                s = s[:-1]
+                newt = w.text[:a] + s + w.text[b:]
+            if not s and newt != w.text[:a] + w.text[b:]:
+                pass
+        new = w.text[:a] + s + w.text[b:]
+        if new == w.text:
+            return
+        set_text(w, new, True, undoable)
+        es.ss = es.se = a + len(s)
+        scroll_to_caret(w)
+        if notify:
+            _notify(wm, w, 0x400)                          # EN_UPDATE
+        refresh(w)
+        update_sb(w)
+        if notify:
+            _notify(wm, w, 0x300)                          # EN_CHANGE
+
+    def word_left(w, ci):
+        t = w.text
+        i = ci
+        while i > 0 and t[i - 1] in " \t\r\n":
+            i -= 1
+        while i > 0 and t[i - 1] not in " \t\r\n":
+            i -= 1
+        return i
+
+    def word_right(w, ci):
+        t = w.text
+        i = ci
+        n = len(t)
+        while i < n and t[i] not in " \t\r\n":
+            i += 1
+        while i < n and t[i] in " \t\r\n":
+            i += 1
+        return i
+
+    def move(w, ci, extend):
+        es = st_of(w)
+        ci = max(0, min(ci, len(w.text)))
+        # never land inside a CR LF pair
+        if 0 < ci < len(w.text) and w.text[ci - 1] == "\r" and w.text[ci] == "\n":
+            ci += 1 if ci > es.se else -1
+        if extend:
+            es.se = ci
+        else:
+            es.ss = es.se = ci
+        scroll_to_caret(w)
+        refresh(w)
+
+    def keydown(w, vk):
+        es = st_of(w)
+        shift = bool(wm.keys[0x10] & 0x80)
+        ctrl = bool(wm.keys[0x11] & 0x80)
+        ls = vlines(w)
+        if vk in (0x25, 0x27):
+            if not shift and es.ss != es.se:
+                a, b = sorted((es.ss, es.se))
+                move(w, a if vk == 0x25 else b, False)
+                return
+            if ctrl:
+                ci = word_left(w, es.se) if vk == 0x25 else word_right(w, es.se)
+            else:
+                ci = es.se - 1 if vk == 0x25 else es.se + 1
+                if vk == 0x25 and ci > 0 and w.text[ci - 1:ci + 1] == "\r\n":
+                    ci -= 1
+                if vk == 0x27 and w.text[es.se:es.se + 2] == "\r\n":
+                    ci = es.se + 2
+            move(w, ci, shift)
+        elif vk in (0x26, 0x28, 0x21, 0x22) and multi(w):
+            f = _ctl_gfont(wm, w)
+            fr = fmt_rect(w)
+            x, y = pos_of(w, es.se)
+            vis = max(1, (fr[3] - fr[1]) // max(1, f.height))
+            d = {0x26: -1, 0x28: 1, 0x21: -vis, 0x22: vis}[vk]
+            li = max(0, min(line_of(w, es.se) + d, len(ls) - 1))
+            if vk in (0x21, 0x22):
+                es.top = max(0, min(es.top + d, max(0, len(ls) - vis)))
+                update_sb(w)
+            y2 = fr[1] + (li - es.top) * f.height
+            move(w, char_at(w, x, y2 + 1), shift)
+        elif vk == 0x24:
+            if ctrl:
+                move(w, 0, shift)
+            else:
+                move(w, ls[line_of(w, es.se)][0], shift)
+        elif vk == 0x23:
+            if ctrl:
+                move(w, len(w.text), shift)
+            else:
+                move(w, ls[line_of(w, es.se)][1], shift)
+        elif vk == 0x2E:                                   # Delete
+            if es.readonly:
+                return
+            if shift:
+                cut(w)
+                return
+            if es.ss == es.se:
+                n = 2 if w.text[es.se:es.se + 2] == "\r\n" else 1
+                if ctrl:
+                    n = word_right(w, es.se) - es.se
+                es.se = min(len(w.text), es.se + n)
+            replace_sel(w, "")
+        elif vk == 0x2D:                                   # Insert
+            if shift:
+                paste(w)
+            elif ctrl:
+                copy(w)
+
+    def copy(w):
+        es = st_of(w)
+        a, b = sorted((es.ss, es.se))
+        if a != b and not (w.style & 0x20):
+            wm.clip_set_text(w.text[a:b])
+
+    def cut(w):
+        es = st_of(w)
+        if es.readonly or w.style & 0x20:
+            return
+        copy(w)
+        replace_sel(w, "")
+
+    def paste(w):
+        es = st_of(w)
+        if es.readonly:
+            return
+        t = wm.clip_get_text()
+        if t is None:
+            return
+        if w.style & 0x2000 and not t.isdigit():
+            return
+        replace_sel(w, t)
+
+    def char(w, ch):
+        es = st_of(w)
+        c = chr(ch)
+        ctrl = bool(wm.keys[0x11] & 0x80)
+        if ch == 3:
+            copy(w)
+            return
+        if ch == 0x18:
+            cut(w)
+            return
+        if ch == 0x16:
+            paste(w)
+            return
+        if ch == 0x1A:                                     # Ctrl+Z
+            undo(w)
+            return
+        if ch == 1:                                        # Ctrl+A
+            es.ss, es.se = 0, len(w.text)
+            refresh(w)
+            return
+        if es.readonly:
+            return
+        if ch == 8:
+            if es.ss == es.se:
+                if es.se == 0:
+                    return
+                n = 2 if w.text[es.se - 2:es.se] == "\r\n" else 1
+                es.ss = es.se - n
+            replace_sel(w, "")
+            return
+        if ch == 0x7F:                                     # Ctrl+Backspace
+            if es.ss == es.se:
+                es.ss = word_left(w, es.se)
+            replace_sel(w, "")
+            return
+        if c in "\r\n":
+            if multi(w) and (w.style & 0x1000 or not wm.__dict__.get("in_dialog_nav")):
+                replace_sel(w, "\r\n")
+            return
+        if c == "\t":
+            if multi(w) and ctrl is False:
+                replace_sel(w, "\t")
+            return
+        if ch < 0x20:
+            return
+        if w.style & 0x2000 and not c.isdigit():           # ES_NUMBER
+            return
+        replace_sel(w, c)
+
+    def undo(w):
+        es = st_of(w)
+        if es.undo is None or es.readonly:
+            return 0
+        t, a, b = es.undo
+        es.undo = (w.text, es.ss, es.se)
+        w.text = t
+        es.lines_key = None
+        es.ss, es.se = a, b
+        es.modified = True
+        scroll_to_caret(w)
+        refresh(w)
+        _notify(wm, w, 0x300)
+        return 1
+
+    def paint(w, hdc=0):
+        es = st_of(w)
+        sysc = wm.gdi.sys_color
+        hf = _ctl_hfont(wm, w)
+        f = _ctl_gfont(wm, w)
+
+        def draw(pt):
+            dc = pt.dc
+            dc.font = hf
+            W, H = w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]
+            enabled = wm.enabled_chain(w)
+            msg = WM_CTLCOLORSTATIC if (es.readonly or not enabled) else WM_CTLCOLOREDIT
+            br = _ctl_color(wm, w, msg, dc)
+            pt.fill_brush(0, 0, W, H, br)
+            fr = fmt_rect(w)
+            clipr = (fr[0], 0, fr[2], H) if multi(w) else (fr[0], 0, fr[2], H)
+            tc = dc.text_color if enabled else sysc(COLOR_GRAYTEXT)
+            a, b = sorted((es.ss, es.se))
+            focused = wm.focus == w.hwnd
+            showsel = a != b and (focused or w.style & 0x100)
+            ls = vlines(w)
+            vis = max(1, (fr[3] - fr[1]) // max(1, f.height)) + 1 if multi(w) else 1
+            if not w.text and es.cue and not focused:
+                pt.text(fr[0], fr[1], es.cue, f, sysc(COLOR_GRAYTEXT), clipr)
+            for li in range(es.top, min(len(ls), es.top + vis)):
+                s, e = ls[li]
+                x, y = pos_of(w, s)
+                seg = shown(w, w.text[s:e]).replace("\t", "    ")
+                raw = w.text[s:e]
+                pt.text(x, y, seg, f, tc, clipr)
+                if showsel and a < e + (2 if multi(w) else 0) and b > s:
+                    sa, sb = max(a, s), min(b, e)
+                    x0 = x + text_w(w, shown(w, raw[:sa - s]))
+                    x1 = x + text_w(w, shown(w, raw[:sb - s]))
+                    if b > e and multi(w):
+                        x1 += f.advance(" ")
+                    hi_col = sysc(COLOR_HIGHLIGHT)
+                    pt.fill(max(x0, clipr[0]), y, min(x1, clipr[2]), y + f.height, hi_col)
+                    pt.text(x0, y, shown(w, raw[sa - s:sb - s]).replace("\t", "    "), f,
+                            sysc(COLOR_HIGHLIGHTTEXT), (max(x0, clipr[0]), y, min(x1, clipr[2]),
+                                                        y + f.height))
+
+        _ctl_paint(wm, w, draw, hdc)
+
+    def proc(hwnd, msg, wp, lp, wide):
+        w = wm.wnd(hwnd)
+        if w is None:
+            return 0
+        es = st_of(w)
+        if msg == WM_NCCREATE:
+            r = _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+            es.readonly = bool(w.style & 0x800)
+            if multi(w):
+                es.limit = 0x7FFFFFFE if False else 30000
+            if not multi(w):
+                w.text = w.text.replace("\r\n", "").replace("\n", "")
+            else:
+                w.text = w.text.replace("\r\n", "\n").replace("\n", "\r\n")
+            if w.style & WS_BORDER and not (w.exstyle & WS_EX_CLIENTEDGE):
+                w.style &= ~WS_BORDER
+                w.exstyle |= WS_EX_CLIENTEDGE
+            return r
+        if msg == 0x0001:
+            f = _ctl_gfont(wm, w)
+            es.margins = [1, 1] if not multi(w) else [2, 2]
+            update_sb(w)
+            return 0
+        if msg == 0x000F or msg == WM_PRINTCLIENT:
+            paint(w, wp)
+            return 0
+        if msg == 0x0014:
+            return 1
+        if msg == WM_GETDLGCODE:
+            code = DLGC_WANTCHARS | DLGC_HASSETSEL | DLGC_WANTARROWS
+            if multi(w):
+                code |= DLGC_WANTALLKEYS
+                if lp:
+                    ps = wm.ps
+                    mmsg = wm.mem.read32(lp + (8 if ps == 8 else 4))
+                    mwp = wm.rp(lp + (16 if ps == 8 else 8))
+                    if mmsg == 0x100 and mwp == 0x0D and not (w.style & 0x1000):
+                        code &= ~DLGC_WANTALLKEYS
+                    if mmsg == 0x100 and mwp == 0x1B:
+                        code &= ~DLGC_WANTALLKEYS
+                    if mmsg == 0x100 and mwp == 0x09 and not (wm.keys[0x11] & 0x80):
+                        code &= ~DLGC_WANTALLKEYS
+            return code
+        if msg == WM_SETFOCUS:
+            f = _ctl_gfont(wm, w)
+            wm.caret_create(hwnd, 0, 1, f.height)
+            caret_update(w)
+            wm.caret_show(hwnd)
+            if es.ss != es.se:
+                wm.invalidate(w, None, True)
+            _notify(wm, w, 0x100)
+            return 0
+        if msg == WM_KILLFOCUS:
+            wm.caret_destroy()
+            if es.ss != es.se and not (w.style & 0x100):
+                wm.invalidate(w, None, True)
+            _notify(wm, w, 0x200)
+            return 0
+        if msg in (0x0201, 0x0203):
+            if wm.focus != hwnd:
+                wm.set_focus(hwnd)
+            x, y = _xy_lparam(lp)
+            ci = char_at(w, x, y)
+            if msg == 0x0203:
+                a = word_left(w, ci) if ci > 0 and w.text[ci - 1:ci] not in (" ", "") else ci
+                b = word_right(w, ci)
+                while b > a and w.text[b - 1] in " \r\n":
+                    b -= 1
+                es.ss, es.se = a, b
+                refresh(w)
+                return 0
+            move(w, ci, bool(wm.keys[0x10] & 0x80))
+            es.drag = True
+            wm.set_capture(hwnd)
+            return 0
+        if msg == 0x0200:
+            if es.drag:
+                x, y = _xy_lparam(lp)
+                ci = char_at(w, x, y)
+                if ci != es.se:
+                    move(w, ci, True)
+            return 0
+        if msg == 0x0202:
+            if es.drag:
+                es.drag = False
+                if wm.capture == hwnd:
+                    wm.set_capture(0)
+            return 0
+        if msg == WM_MOUSEWHEEL and multi(w):
+            d = _s32(((wp >> 16) & 0xFFFF) << 16) >> 16
+            lines = -3 if d > 0 else 3
+            proc(hwnd, 0xB6, 0, lines, wide)
+            return 0
+        if msg == 0x0100:
+            keydown(w, wp & 0xFF)
+            return 0
+        if msg == WM_CHAR:
+            char(w, wp & 0xFFFF)
+            return 0
+        if msg == WM_SETTEXT:
+            t = wm.gstr(lp, wide) if lp else ""
+            if not multi(w):
+                t = t.replace("\r\n", "").replace("\n", "")
+            set_text(w, t[:es.limit] if es.limit else t, False)
+            es.ss = es.se = 0
+            es.xoff = es.top = 0
+            es.modified = False
+            es.undo = None
+            refresh(w)
+            update_sb(w)
+            _notify(wm, w, 0x400)
+            _notify(wm, w, 0x300)
+            return 1
+        if msg == WM_SETFONT:
+            w.font = wp
+            es.lines_key = None
+            if wm.focus == hwnd:
+                f = _ctl_gfont(wm, w)
+                wm.caret_create(hwnd, 0, 1, f.height)
+                caret_update(w)
+                wm.caret_show(hwnd)
+            if lp:
+                wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x0005:                                  # WM_SIZE
+            es.lines_key = None
+            scroll_to_caret(w)
+            update_sb(w)
+            return 0
+        if msg == WM_ENABLE:
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == WM_VSCROLL and multi(w):
+            code = wp & 0xFFFF
+            f = _ctl_gfont(wm, w)
+            fr = fmt_rect(w)
+            vis = max(1, (fr[3] - fr[1]) // max(1, f.height))
+            n = len(vlines(w))
+            top = es.top
+            if code == 0:
+                top -= 1
+            elif code == 1:
+                top += 1
+            elif code == 2:
+                top -= vis
+            elif code == 3:
+                top += vis
+            elif code in (4, 5):
+                top = (wp >> 16) & 0xFFFF
+            elif code == 6:
+                top = 0
+            elif code == 7:
+                top = n
+            top = max(0, min(top, max(0, n - vis)))
+            if top != es.top:
+                es.top = top
+                update_sb(w)
+                refresh(w)
+                _notify(wm, w, 0x602)
+            return 0
+        if msg == WM_HSCROLL:
+            return 0
+        # -- EM_* -------------------------------------------------------------------------------
+        if msg == 0xB0:                                    # EM_GETSEL
+            a, b = sorted((es.ss, es.se))
+            if wp:
+                wm.mem.write32(wp, a)
+            if lp:
+                wm.mem.write32(lp, b)
+            return (a & 0xFFFF) | ((b & 0xFFFF) << 16)
+        if msg == 0xB1:                                    # EM_SETSEL
+            n = len(w.text)
+            a, b = _s32(wp & 0xFFFFFFFF), _s32(lp & 0xFFFFFFFF)
+            if a == -1:
+                es.ss = es.se
+            else:
+                a = n if a < 0 else min(a, n)
+                b = n if b < 0 else min(b, n)
+                es.ss, es.se = a, b
+            scroll_to_caret(w)
+            refresh(w)
+            return 0
+        if msg in (0xB2,):                                 # EM_GETRECT
+            _wr_rect(wm.mem, lp, fmt_rect(w))
+            return 0
+        if msg in (0xB3, 0xB4):                            # EM_SETRECT(NP)
+            if lp:
+                l_, t_, r_, b_ = _rd_rect(wm.mem, lp)
+                es.margins = [max(0, l_), max(0, (w.cl[2] - w.cl[0]) - r_)]
+                es.lines_key = None
+                if msg == 0xB3:
+                    wm.invalidate(w, None, True)
+            return 0
+        if msg == 0xB6:                                    # EM_LINESCROLL
+            if multi(w):
+                n = len(vlines(w))
+                es.top = max(0, min(es.top + _s32(lp & 0xFFFFFFFF), max(0, n - 1)))
+                es.xoff = max(0, es.xoff + _s32(wp & 0xFFFFFFFF) * _ctl_gfont(wm, w).advance(" "))
+                update_sb(w)
+                refresh(w)
+            return 1
+        if msg == 0xB5:                                    # EM_SCROLL
+            proc(hwnd, WM_VSCROLL, wp & 0xFFFF, 0, wide)
+            return 0x10000 | 1
+        if msg == 0xB7:                                    # EM_SCROLLCARET
+            scroll_to_caret(w)
+            refresh(w)
+            return 1
+        if msg == 0xB8:
+            return 1 if es.modified else 0
+        if msg == 0xB9:
+            es.modified = bool(wp)
+            return 0
+        if msg == 0xBA:                                    # EM_GETLINECOUNT
+            return len(vlines(w)) if multi(w) else 1
+        if msg == 0xBB:                                    # EM_LINEINDEX
+            li = _s32(wp & 0xFFFFFFFF)
+            ls = vlines(w)
+            if li < 0:
+                li = line_of(w, es.se)
+            return ls[li][0] if li < len(ls) else 0xFFFFFFFF
+        if msg == 0xC1:                                    # EM_LINELENGTH
+            ci = _s32(wp & 0xFFFFFFFF)
+            if ci < 0:
+                a, b = sorted((es.ss, es.se))
+                la, lb = line_of(w, a), line_of(w, b)
+                ls = vlines(w)
+                return (a - ls[la][0]) + (ls[lb][1] - b)
+            s, e = vlines(w)[line_of(w, min(ci, len(w.text)))]
+            return e - s
+        if msg == 0xC2:                                    # EM_REPLACESEL
+            s = wm.gstr(lp, wide) if lp else ""
+            replace_sel(w, s, bool(wp))
+            return 0
+        if msg == 0xC4:                                    # EM_GETLINE
+            ls = vlines(w)
+            li = wp if multi(w) else 0
+            if li >= len(ls) or not lp:
+                return 0
+            s, e = ls[li]
+            n = wm.mem.read16(lp)
+            line = w.text[s:e][:n]
+            data = line.encode("utf-16-le") if wide else line.encode("utf-8")
+            wm.mem.write(lp, data)
+            return len(line)
+        if msg == 0xC5:                                    # EM_LIMITTEXT
+            es.limit = wp if wp else (0x7FFFFFFE if multi(w) else 0x7FFFFFFE)
+            return 0
+        if msg == 0xD5:
+            return es.limit
+        if msg == 0xC6:
+            return 1 if es.undo else 0
+        if msg in (0xC7, WM_UNDO):
+            return undo(w)
+        if msg == 0xCD:
+            es.undo = None
+            return 0
+        if msg == 0xC8:
+            return 1
+        if msg == 0xC9:                                    # EM_LINEFROMCHAR
+            ci = _s32(wp & 0xFFFFFFFF)
+            if ci < 0:
+                ci = min(es.ss, es.se)
+            return line_of(w, ci)
+        if msg == 0xCB:                                    # EM_SETTABSTOPS
+            return 1
+        if msg == 0xCC:                                    # EM_SETPASSWORDCHAR
+            es.pwchar = chr(wp) if wp else ""
+            if wp:
+                w.style |= 0x20
+            else:
+                w.style &= ~0x20
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == 0xD2:
+            return ord(es.pwchar) if es.pwchar and w.style & 0x20 else 0
+        if msg == 0xCE:
+            return es.top if multi(w) else 0
+        if msg == 0xCF:                                    # EM_SETREADONLY
+            es.readonly = bool(wp)
+            if wp:
+                w.style |= 0x800
+            else:
+                w.style &= ~0x800
+            wm.invalidate(w, None, True)
+            return 1
+        if msg in (0xD0, 0xD1):
+            return 0
+        if msg == 0xD3:                                    # EM_SETMARGINS
+            if wp & 1:
+                es.margins[0] = lp & 0xFFFF if (lp & 0xFFFF) != 0xFFFF else 1
+            if wp & 2:
+                es.margins[1] = (lp >> 16) & 0xFFFF if ((lp >> 16) & 0xFFFF) != 0xFFFF else 1
+            es.lines_key = None
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == 0xD4:
+            return (es.margins[0] & 0xFFFF) | ((es.margins[1] & 0xFFFF) << 16)
+        if msg == 0xD6:                                    # EM_POSFROMCHAR
+            if wp > len(w.text):
+                return 0xFFFFFFFF
+            x, y = pos_of(w, wp)
+            return _lparam_xy(x, y)
+        if msg == 0xD7:                                    # EM_CHARFROMPOS
+            x, y = _xy_lparam(lp)
+            ci = char_at(w, x, y)
+            return (ci & 0xFFFF) | ((line_of(w, ci) & 0xFFFF) << 16)
+        if msg == 0xBD:                                    # EM_GETHANDLE
+            data = (w.text.encode("utf-16-le") + b"\0\0") if wide else \
+                (w.text.encode("utf-8") + b"\0")
+            if es.handle:
+                try:
+                    wm.p.heap_free(wm.p.process_heap_handle, es.handle)
+                except Exception:
+                    pass
+            es.handle = wm.p.heap_alloc(wm.p.process_heap_handle, len(data) + 16)
+            wm.mem.write(es.handle, data)
+            return es.handle
+        if msg == 0xBC:                                    # EM_SETHANDLE
+            if wp:
+                set_text(w, wm.gstr(wp, wide), False)
+                refresh(w)
+            return 0
+        if msg == 0xBE:
+            return 0
+        if msg in (0xD8, 0xD9):
+            return 0
+        if msg == 0x1501:                                  # EM_SETCUEBANNER
+            es.cue = wm.gstr(lp, True) if lp else ""
+            wm.invalidate(w, None, True)
+            return 1
+        if msg == 0x1502:
+            return 0
+        if msg == WM_CUT:
+            cut(w)
+            return 0
+        if msg == WM_COPY:
+            copy(w)
+            return 0
+        if msg == WM_PASTE:
+            paste(w)
+            return 0
+        if msg == WM_CLEAR:
+            if not es.readonly:
+                replace_sel(w, "")
+            return 0
+        if msg == WM_CONTEXTMENU:
+            return 0
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+    return proc
+
+
+# == ListBox ===========================================================================
+
+class _LBItem:
+    __slots__ = ("text", "data", "sel", "h")
+
+    def __init__(self, text="", data=0):
+        self.text, self.data, self.sel, self.h = text, data, False, 0
+
+
+def _listbox_proc(wm):
+    LB_ERR = 0xFFFFFFFF
+
+    def st(w):
+        s = w.py.get("lb")
+        if s is None:
+            f = _ctl_gfont(wm, w)
+            s = w.py["lb"] = {"items": [], "cur": -1, "top": 0, "anchor": -1, "caret": 0,
+                              "ih": max(f.height, 13) if f else 16, "colw": 64, "tabs": [],
+                              "hext": 0, "search": "", "stime": 0.0, "drag": False}
+        return s
+
+    def ownerdraw(w):
+        return w.style & 0x30
+
+    def hasstrings(w):
+        return not ownerdraw(w) or w.style & 0x40
+
+    def multisel(w):
+        return w.style & 0x808
+
+    def visible_rows(w):
+        s = st(w)
+        return max(1, (w.cl[3] - w.cl[1]) // max(1, s["ih"]))
+
+    def update_sb(w):
+        s = st(w)
+        n = len(s["items"])
+        vis = visible_rows(w)
+        if w.style & WS_VSCROLL or w.style & 0x1000:
+            _sb_set(wm, w, 1, 7 | (8 if w.style & 0x1000 else 0), 0, max(0, n - 1), vis,
+                    s["top"], True)
+
+    def ensure_visible(w, i):
+        s = st(w)
+        vis = visible_rows(w)
+        if i < s["top"]:
+            s["top"] = max(0, i)
+        elif i >= s["top"] + vis:
+            s["top"] = i - vis + 1
+        update_sb(w)
+
+    def notify(w, code):
+        if w.style & 0x8000:                             # a combo box's list
+            combo = wm.wnd(w.py.get("combo", 0))
+            if combo is not None:
+                wm.send(combo.hwnd, 0x0111, (w.id & 0xFFFF) | ((code & 0xFFFF) << 16), w.hwnd)
+            return
+        if w.style & 1:                                  # LBS_NOTIFY
+            _notify(wm, w, code)
+
+    def item_rect(w, i):
+        s = st(w)
+        W = w.cl[2] - w.cl[0]
+        y = (i - s["top"]) * s["ih"]
+        return (0, y, W, y + s["ih"])
+
+    def paint(w, hdc=0):
+        s = st(w)
+        sysc = wm.gdi.sys_color
+        hf = _ctl_hfont(wm, w)
+
+        def draw(pt):
+            dc = pt.dc
+            dc.font = hf
+            W, H = w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]
+            enabled = wm.enabled_chain(w)
+            br = _ctl_color(wm, w, WM_CTLCOLORLISTBOX, dc)
+            pt.fill_brush(0, 0, W, H, br)
+            f = dc.gfont()
+            focused = wm.focus == w.hwnd or (w.style & 0x8000 and w.py.get("combo_focus"))
+            items = s["items"]
+            for i in range(s["top"], min(len(items), s["top"] + visible_rows(w) + 1)):
+                it = items[i]
+                r = item_rect(w, i)
+                sel = it.sel if multisel(w) else (i == s["cur"])
+                if ownerdraw(w):
+                    state = (1 if sel else 0) | (4 if not enabled else 0) | \
+                        (0x10 if focused and i == s["caret"] else 0)
+                    _owner_draw_item(wm, w, pt, 2, i, 1, state, r, it.data)
+                    continue
+                if sel:
+                    pt.fill(r[0], r[1], r[2], r[3], sysc(COLOR_HIGHLIGHT))
+                    col = sysc(COLOR_HIGHLIGHTTEXT)
+                else:
+                    col = dc.text_color if enabled else sysc(COLOR_GRAYTEXT)
+                txt = it.text.replace("\t", "    ") if w.style & 0x80 else it.text
+                pt.text(r[0] + 2, r[1] + (s["ih"] - f.height) // 2, txt, f, col, r)
+                if focused and i == s["caret"] and (multisel(w) or s["cur"] < 0 or True):
+                    if focused and (multisel(w) or i == s["cur"]):
+                        _focus_rect(pt, r[0], r[1], r[2], r[3])
+            if not items and focused:
+                _focus_rect(pt, 0, 0, W, s["ih"])
+
+        _ctl_paint(wm, w, draw, hdc)
+
+    def measure(w, it, i):
+        if w.style & 0x20:                                # LBS_OWNERDRAWVARIABLE
+            pass
+        return st(w)["ih"]
+
+    def insert(w, idx, text, data):
+        s = st(w)
+        items = s["items"]
+        it = _LBItem(text, data)
+        if idx < 0 or idx > len(items):
+            if w.style & 2 and hasstrings(w):             # LBS_SORT
+                idx = 0
+                tl = text.lower()
+                while idx < len(items) and items[idx].text.lower() <= tl:
+                    idx += 1
+            elif w.style & 2 and ownerdraw(w):
+                idx = len(items)
+                for j, other in enumerate(items):
+                    if _compare_item(wm, w, it, other, j) < 0:
+                        idx = j
+                        break
+            else:
+                idx = len(items)
+        items.insert(idx, it)
+        if s["cur"] >= idx:
+            s["cur"] += 1
+        if ownerdraw(w) and not s.get("measured"):
+            _measure_item(wm, w, s, 2, idx, data)
+        update_sb(w)
+        if not (w.style & 4):
+            wm.invalidate(w, None, True)
+        return idx
+
+    def find(w, start, text, exact):
+        s = st(w)
+        items = s["items"]
+        n = len(items)
+        if not n:
+            return LB_ERR
+        tl = text.lower()
+        start = _s32(start & 0xFFFFFFFF)
+        for k_ in range(n):
+            i = (start + 1 + k_) % n
+            t = items[i].text.lower()
+            if (t == tl) if exact else t.startswith(tl):
+                return i
+        return LB_ERR
+
+    def set_cur(w, i, notify_=False):
+        s = st(w)
+        if i != s["cur"]:
+            s["cur"] = i
+            s["caret"] = max(0, i)
+            if i >= 0:
+                ensure_visible(w, i)
+            wm.invalidate(w, None, True)
+            if notify_:
+                notify(w, 1)
+
+    def click_select(w, i, shift, ctrl):
+        s = st(w)
+        items = s["items"]
+        if i < 0 or i >= len(items) or w.style & 0x4000:
+            return
+        if w.style & 8:                                   # LBS_MULTIPLESEL
+            items[i].sel = not items[i].sel
+            s["caret"] = i
+        elif w.style & 0x800:                             # LBS_EXTENDEDSEL
+            if shift and s["anchor"] >= 0:
+                a, b = sorted((s["anchor"], i))
+                if not ctrl:
+                    for it in items:
+                        it.sel = False
+                for j in range(a, b + 1):
+                    items[j].sel = True
+            elif ctrl:
+                items[i].sel = not items[i].sel
+                s["anchor"] = i
+            else:
+                for it in items:
+                    it.sel = False
+                items[i].sel = True
+                s["anchor"] = i
+            s["caret"] = i
+        else:
+            s["cur"] = i
+            s["caret"] = i
+        ensure_visible(w, i)
+        wm.invalidate(w, None, True)
+        notify(w, 1)
+
+    def row_at(w, y):
+        s = st(w)
+        if y < 0:
+            return s["top"] - 1
+        return s["top"] + y // max(1, s["ih"])
+
+    def proc(hwnd, msg, wp, lp, wide):
+        w = wm.wnd(hwnd)
+        if w is None:
+            return 0
+        s = st(w)
+        items = s["items"]
+        n = len(items)
+        if msg == WM_NCCREATE:
+            if w.style & WS_BORDER and not (w.exstyle & WS_EX_CLIENTEDGE) and \
+                    not (w.style & 0x8000):
+                w.style &= ~WS_BORDER
+                w.exstyle |= WS_EX_CLIENTEDGE
+            return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+        if msg == 0x0001:
+            if ownerdraw(w) and w.style & 0x10:
+                _measure_item(wm, w, s, 2, 0, 0)
+                s["measured"] = True
+            update_sb(w)
+            return 0
+        if msg == 0x000F or msg == WM_PRINTCLIENT:
+            paint(w, wp)
+            return 0
+        if msg == 0x0014:
+            return 1
+        if msg == WM_GETDLGCODE:
+            return DLGC_WANTARROWS | DLGC_WANTCHARS
+        if msg == WM_SETFONT:
+            w.font = wp
+            if not ownerdraw(w):
+                f = _ctl_gfont(wm, w)
+                s["ih"] = max(f.height, 13)
+            if lp:
+                wm.invalidate(w, None, True)
+            update_sb(w)
+            return 0
+        if msg == 0x0005:
+            update_sb(w)
+            return 0
+        if msg in (WM_SETFOCUS, WM_KILLFOCUS):
+            wm.invalidate(w, None, True)
+            notify(w, 4 if msg == WM_SETFOCUS else 5)
+            return 0
+        if msg in (0x0201, 0x0203):
+            x, y = _xy_lparam(lp)
+            if w.style & 0x8000 and not (0 <= x < w.cl[2] - w.cl[0] and
+                                         0 <= y < w.cl[3] - w.cl[1]):
+                combo = wm.wnd(w.py.get("combo", 0))      # click outside a drop-down
+                if combo is not None:
+                    wm.send(combo.hwnd, 0x0400 + 0x77, 0, 0)
+                return 0
+            if wm.focus != hwnd and not (w.style & 0x8000):
+                wm.set_focus(hwnd)
+            i = row_at(w, y)
+            if 0 <= i < n:
+                click_select(w, i, bool(wp & 4), bool(wp & 8))
+                if msg == 0x0203:
+                    notify(w, 2)
+            s["drag"] = True
+            wm.set_capture(hwnd)
+            return 0
+        if msg == 0x0200:
+            if s["drag"] and not multisel(w):
+                x, y = _xy_lparam(lp)
+                i = max(0, min(row_at(w, y), n - 1))
+                if n and i != s["cur"]:
+                    set_cur(w, i, True)
+            elif w.style & 0x8000 and n:                  # dropdown list tracks the pointer
+                x, y = _xy_lparam(lp)
+                if 0 <= y < w.cl[3] - w.cl[1]:
+                    i = max(0, min(row_at(w, y), n - 1))
+                    if i != s["cur"]:
+                        set_cur(w, i)
+            return 0
+        if msg == 0x0202:
+            if s["drag"]:
+                s["drag"] = False
+                if wm.capture == hwnd:
+                    wm.set_capture(0)
+            if w.style & 0x8000:
+                x, y = _xy_lparam(lp)
+                inside = 0 <= x < w.cl[2] - w.cl[0] and 0 <= y < w.cl[3] - w.cl[1]
+                combo = wm.wnd(w.py.get("combo", 0))
+                if combo is not None and inside:
+                    wm.send(combo.hwnd, 0x0400 + 0x77, 1, 0)      # private: close + select
+                elif wm.capture != hwnd and combo is not None and \
+                        combo.py.get("cb", {}).get("dropped"):
+                    wm.set_capture(hwnd)                        # keep tracking the list
+            return 0
+        if msg == WM_MOUSEWHEEL:
+            d = _s32(((wp >> 16) & 0xFFFF) << 16) >> 16
+            s["top"] = max(0, min(s["top"] + (-3 if d > 0 else 3), max(0, n - visible_rows(w))))
+            update_sb(w)
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == WM_VSCROLL:
+            code = wp & 0xFFFF
+            vis = visible_rows(w)
+            top = s["top"]
+            top = {0: top - 1, 1: top + 1, 2: top - vis, 3: top + vis, 6: 0, 7: n}.get(
+                code, (wp >> 16) & 0xFFFF if code in (4, 5) else top)
+            top = max(0, min(top, max(0, n - vis)))
+            if top != s["top"]:
+                s["top"] = top
+                update_sb(w)
+                wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x0100:
+            vk = wp & 0xFF
+            if w.style & 0x400:                           # LBS_WANTKEYBOARDINPUT
+                par = w.parent
+                r = wm.send(par.hwnd, WM_VKEYTOITEM, (vk & 0xFFFF) | ((s["caret"] & 0xFFFF) << 16),
+                            hwnd)
+                r = _s32(r & 0xFFFFFFFF)
+                if r == -2:
+                    return 0
+                if r >= 0:
+                    s["caret"] = r
+            if not n:
+                return 0
+            cur = s["caret"] if multisel(w) else s["cur"]
+            vis = visible_rows(w)
+            new = {0x26: cur - 1, 0x28: cur + 1, 0x21: cur - vis + 1, 0x22: cur + vis - 1,
+                   0x24: 0, 0x23: n - 1}.get(vk)
+            if new is None:
+                if vk == 0x20 and multisel(w):
+                    click_select(w, s["caret"], False, True)
+                return 0
+            new = max(0, min(new, n - 1))
+            if multisel(w):
+                if w.style & 0x800:
+                    click_select(w, new, bool(wm.keys[0x10] & 0x80), False)
+                else:
+                    s["caret"] = new
+                    ensure_visible(w, new)
+                    wm.invalidate(w, None, True)
+            else:
+                set_cur(w, new, True)
+            return 0
+        if msg == WM_CHAR:
+            ch = chr(wp & 0xFFFF)
+            if ch < " " or not n:
+                return 0
+            now = time.monotonic()
+            if now - s["stime"] > 1.0:
+                s["search"] = ""
+            s["stime"] = now
+            s["search"] += ch
+            i = find(w, s["cur"] if len(s["search"]) > 1 else s["cur"], s["search"], False)
+            if i == LB_ERR and len(s["search"]) > 1:
+                s["search"] = ch
+                i = find(w, s["cur"], ch, False)
+            if i != LB_ERR:
+                if multisel(w):
+                    click_select(w, i, False, False)
+                else:
+                    set_cur(w, i, True)
+            return 0
+        # -- LB_* --------------------------------------------------------------------------------
+        if msg == 0x180:                                  # LB_ADDSTRING
+            if hasstrings(w):
+                return insert(w, -1, wm.gstr(lp, wide), 0)
+            return insert(w, -1, "", lp)
+        if msg == 0x181:                                  # LB_INSERTSTRING
+            idx = _s32(wp & 0xFFFFFFFF)
+            if idx > n:
+                return LB_ERR
+            if hasstrings(w):
+                return insert(w, idx if idx >= 0 else n, wm.gstr(lp, wide), 0)
+            return insert(w, idx if idx >= 0 else n, "", lp)
+        if msg == 0x182:                                  # LB_DELETESTRING
+            if wp >= n:
+                return LB_ERR
+            it = items.pop(wp)
+            if ownerdraw(w):
+                _delete_item(wm, w, wp, it.data)
+            if s["cur"] == wp:
+                s["cur"] = -1
+            elif s["cur"] > wp:
+                s["cur"] -= 1
+            s["top"] = max(0, min(s["top"], len(items) - 1))
+            update_sb(w)
+            wm.invalidate(w, None, True)
+            return len(items)
+        if msg == 0x184:                                  # LB_RESETCONTENT
+            if ownerdraw(w):
+                for i, it in enumerate(items):
+                    _delete_item(wm, w, i, it.data)
+            del items[:]
+            s["cur"] = -1
+            s["top"] = 0
+            s["caret"] = 0
+            update_sb(w)
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x185:                                  # LB_SETSEL
+            if not multisel(w):
+                return LB_ERR
+            idx = _s32(lp & 0xFFFFFFFF)
+            targets = items if idx == -1 else ([items[idx]] if 0 <= idx < n else [])
+            for it in targets:
+                it.sel = bool(wp)
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x186:                                  # LB_SETCURSEL
+            if multisel(w):
+                return LB_ERR
+            idx = _s32(wp & 0xFFFFFFFF)
+            if idx >= n:
+                set_cur(w, -1)
+                return LB_ERR
+            set_cur(w, idx)
+            return idx if idx >= 0 else LB_ERR
+        if msg == 0x187:                                  # LB_GETSEL
+            if wp >= n:
+                return LB_ERR
+            return 1 if (items[wp].sel if multisel(w) else wp == s["cur"]) else 0
+        if msg == 0x188:                                  # LB_GETCURSEL
+            if multisel(w):
+                return s["caret"] if n else LB_ERR
+            return s["cur"] if s["cur"] >= 0 else LB_ERR
+        if msg == 0x189:                                  # LB_GETTEXT
+            if wp >= n:
+                return LB_ERR
+            if not hasstrings(w):
+                wm.wp(lp, items[wp].data)
+                return wm.ps
+            t = items[wp].text
+            data = t.encode("utf-16-le") + b"\0\0" if wide else t.encode("utf-8") + b"\0"
+            wm.mem.write(lp, data)
+            return wm.str_len(t, wide)
+        if msg == 0x18A:                                  # LB_GETTEXTLEN
+            if wp >= n:
+                return LB_ERR
+            return wm.str_len(items[wp].text, wide) if hasstrings(w) else wm.ps
+        if msg == 0x18B:                                  # LB_GETCOUNT
+            return n
+        if msg in (0x18C,):                               # LB_SELECTSTRING
+            i = find(w, wp, wm.gstr(lp, wide), False)
+            if i != LB_ERR:
+                if multisel(w):
+                    click_select(w, i, False, False)
+                else:
+                    set_cur(w, i)
+            return i
+        if msg == 0x18E:
+            return s["top"]
+        if msg in (0x18F, 0x1A2):                         # LB_FINDSTRING(EXACT)
+            if not hasstrings(w):
+                for i, it in enumerate(items):
+                    if it.data == lp:
+                        return i
+                return LB_ERR
+            return find(w, wp, wm.gstr(lp, wide), msg == 0x1A2)
+        if msg == 0x190:                                  # LB_GETSELCOUNT
+            if not multisel(w):
+                return LB_ERR
+            return sum(1 for it in items if it.sel)
+        if msg == 0x191:                                  # LB_GETSELITEMS
+            if not multisel(w):
+                return LB_ERR
+            sel = [i for i, it in enumerate(items) if it.sel][:wp]
+            for k_, i in enumerate(sel):
+                wm.mem.write32(lp + 4 * k_, i)
+            return len(sel)
+        if msg == 0x192:
+            return 1
+        if msg == 0x193:
+            return s["hext"]
+        if msg == 0x194:
+            s["hext"] = wp
+            return 0
+        if msg == 0x195:
+            s["colw"] = wp
+            return 0
+        if msg == 0x197:                                  # LB_SETTOPINDEX
+            if wp >= max(1, n):
+                return LB_ERR
+            s["top"] = wp
+            update_sb(w)
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x198:                                  # LB_GETITEMRECT
+            if wp >= max(1, n) and wp != 0:
+                return LB_ERR
+            _wr_rect(wm.mem, lp, item_rect(w, wp))
+            return 1
+        if msg == 0x199:                                  # LB_GETITEMDATA
+            if wp >= n:
+                return LB_ERR
+            return items[wp].data
+        if msg == 0x19A:                                  # LB_SETITEMDATA
+            idx = _s32(wp & 0xFFFFFFFF)
+            if idx >= n:
+                return LB_ERR
+            for it in (items if idx == -1 else [items[idx]]):
+                it.data = lp
+            return 1
+        if msg in (0x19B, 0x183):                         # LB_SELITEMRANGE(EX)
+            if not multisel(w):
+                return LB_ERR
+            if msg == 0x19B:
+                a, b, on = lp & 0xFFFF, (lp >> 16) & 0xFFFF, bool(wp)
+            else:
+                a, b = wp, lp
+                on = a <= b
+                a, b = min(a, b), max(a, b)
+            for i in range(max(0, a), min(n - 1, b) + 1):
+                items[i].sel = on
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x19C:
+            s["anchor"] = wp
+            return 0
+        if msg == 0x19D:
+            return s["anchor"] if s["anchor"] >= 0 else 0
+        if msg == 0x19E:                                  # LB_SETCARETINDEX
+            s["caret"] = wp
+            ensure_visible(w, wp)
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x19F:
+            return s["caret"]
+        if msg == 0x1A0:                                  # LB_SETITEMHEIGHT
+            s["ih"] = max(1, lp & 0xFFFF)
+            update_sb(w)
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x1A1:
+            return s["ih"]
+        if msg == 0x1A7:                                  # LB_SETCOUNT
+            while len(items) < wp:
+                items.append(_LBItem())
+            del items[wp:]
+            update_sb(w)
+            return 0
+        if msg == 0x1A8:
+            return n
+        if msg == 0x1A9:                                  # LB_ITEMFROMPOINT
+            x, y = _xy_lparam(lp)
+            i = row_at(w, y)
+            outside = not (0 <= i < n)
+            return (max(0, min(i, n - 1)) & 0xFFFF) | ((1 if outside else 0) << 16)
+        if msg in (0x1A5, 0x1A6):
+            return 0x409
+        if msg == 0x18D or msg == 0x196:                  # LB_DIR / LB_ADDFILE
+            return LB_ERR
+        if msg == 0x1B2:
+            return 1
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+    return proc
+
+
+def _measure_item(wm, w, s, ctltype, idx, data):
+    ps = wm.ps
+    mark = wm.scratch_mark()
+    try:
+        if ps == 8:
+            a = wm.scratch(struct.pack("<IIIII4xQ", ctltype, w.id & 0xFFFFFFFF, idx,
+                                       w.cl[2] - w.cl[0], s["ih"], data & M64))
+        else:
+            a = wm.scratch(struct.pack("<IIIIII", ctltype, w.id & 0xFFFFFFFF, idx,
+                                       w.cl[2] - w.cl[0], s["ih"], data & 0xFFFFFFFF))
+        par = w.parent if w.parent is not wm.desktop else wm.wnd(w.owner)
+        if par is not None:
+            wm.send(par.hwnd, WM_MEASUREITEM, w.id & 0xFFFF, a)
+        h = wm.mem.read32(a + 16)
+        if h:
+            s["ih"] = h
+    finally:
+        wm.scratch_release(mark)
+
+
+def _delete_item(wm, w, idx, data):
+    ps = wm.ps
+    mark = wm.scratch_mark()
+    try:
+        if ps == 8:
+            a = wm.scratch(struct.pack("<IIIIQQ", 2, w.id & 0xFFFFFFFF, idx, 0, w.hwnd, data & M64))
+        else:
+            a = wm.scratch(struct.pack("<IIIII", 2, w.id & 0xFFFFFFFF, idx, w.hwnd,
+                                       data & 0xFFFFFFFF))
+        par = w.parent if w.parent is not wm.desktop else wm.wnd(w.owner)
+        if par is not None:
+            wm.send(par.hwnd, WM_DELETEITEM, w.id & 0xFFFF, a)
+    finally:
+        wm.scratch_release(mark)
+
+
+def _compare_item(wm, w, a, b, idx):
+    ps = wm.ps
+    mark = wm.scratch_mark()
+    try:
+        if ps == 8:
+            d = struct.pack("<IIQIIQIIQ", 2, w.id & 0xFFFFFFFF, w.hwnd, 0, 0, a.data & M64,
+                            idx, 0, b.data & M64)
+        else:
+            d = struct.pack("<IIIIIIII", 2, w.id & 0xFFFFFFFF, w.hwnd, 0, a.data & 0xFFFFFFFF,
+                            idx, b.data & 0xFFFFFFFF, 0)
+        ad = wm.scratch(d)
+        par = w.parent if w.parent is not wm.desktop else wm.wnd(w.owner)
+        r = wm.send(par.hwnd, WM_COMPAREITEM, w.id & 0xFFFF, ad) if par is not None else 0
+        return _s32(r & 0xFFFFFFFF)
+    finally:
+        wm.scratch_release(mark)
+
+
+# == ComboBox ==========================================================================
+
+def _combo_proc(wm):
+    CB_ERR = 0xFFFFFFFF
+
+    def st(w):
+        return w.py.setdefault("cb", {"lb": 0, "edit": 0, "dropped": False, "sel_on_drop": -1,
+                                      "ih": 0, "drop_h": 0, "ext": False, "dropw": 0})
+
+    def kind(w):
+        return w.style & 3
+
+    def lb(w):
+        return wm.wnd(st(w)["lb"])
+
+    def btn_rect(w):
+        W, H = w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]
+        return (W - 17, 2, W - 2, H - 2)
+
+    def field_h(w):
+        f = _ctl_gfont(wm, w)
+        return f.height + 8
+
+    def sync_edit(w):
+        s = st(w)
+        e = wm.wnd(s["edit"])
+        l_ = lb(w)
+        if e is None or l_ is None:
+            return
+        cur = l_.py["lb"]["cur"]
+        t = l_.py["lb"]["items"][cur].text if cur >= 0 else ""
+        mark = wm.scratch_mark()
+        try:
+            wm.send(e.hwnd, WM_SETTEXT, 0, wm.scratch((t.encode("utf-16-le") + b"\0\0")), True)
+        finally:
+            wm.scratch_release(mark)
+        wm.send(e.hwnd, 0xB1, 0, 0xFFFFFFFF, True)
+
+    def drop(w, show):
+        s = st(w)
+        l_ = lb(w)
+        if l_ is None or kind(w) == 1:
+            return
+        if show and not s["dropped"]:
+            _notify(wm, w, 7)                                    # CBN_DROPDOWN
+            sx, sy = wm.screen_origin(w)
+            n = len(l_.py["lb"]["items"])
+            ih = l_.py["lb"]["ih"]
+            h = max(ih + 2, min(n, 8) * ih + 2)
+            if s["drop_h"] > field_h(w):
+                h = min(h, s["drop_h"] - (w.h)) if False else h
+            W = max(w.w, s["dropw"])
+            y = sy + w.h
+            if y + h > wm.gdi.screen.h:
+                y = sy - h
+            wm.set_pos(l_, 0xFFFFFFFF, sx, y, W, h, SWP_SHOWWINDOW | SWP_NOACTIVATE)
+            s["dropped"] = True
+            s["sel_on_drop"] = l_.py["lb"]["cur"]
+            wm.set_capture(l_.hwnd)
+            wm.invalidate(w, None, True)
+        elif not show and s["dropped"]:
+            s["dropped"] = False
+            if wm.capture == l_.hwnd:
+                wm.set_capture(0)
+            wm.set_pos(l_, 0, 0, 0, 0, 0, SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE |
+                       SWP_NOZORDER | SWP_NOACTIVATE)
+            wm.invalidate(w, None, True)
+            _notify(wm, w, 8)                                    # CBN_CLOSEUP
+
+    def paint(w, hdc=0):
+        s = st(w)
+        sysc = wm.gdi.sys_color
+        hf = _ctl_hfont(wm, w)
+
+        def draw(pt):
+            dc = pt.dc
+            dc.font = hf
+            W, H = w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]
+            enabled = wm.enabled_chain(w)
+            if kind(w) == 1:
+                return
+            fh = min(H, field_h(w))
+            _draw_edge(pt, (0, 0, W, fh), 10, 15)
+            br = _ctl_color(wm, w, WM_CTLCOLOREDIT if kind(w) == 2 else WM_CTLCOLORSTATIC, dc)
+            pt.fill_brush(2, 2, W - 2, fh - 2, br)
+            b = (W - 18, 2, W - 2, fh - 2)
+            _draw_frame_control(pt, b, 3, 5 | (0x200 if s["dropped"] else 0) |
+                                (0x100 if not enabled else 0))
+            if kind(w) == 3:
+                l_ = lb(w)
+                cur = l_.py["lb"]["cur"] if l_ is not None else -1
+                focused = wm.focus == w.hwnd
+                r = (3, 3, W - 19, fh - 3)
+                if w.style & 0x30 and l_ is not None:
+                    data = l_.py["lb"]["items"][cur].data if cur >= 0 else 0
+                    _owner_draw_item(wm, w, pt, 3, cur, 1,
+                                     (1 if focused else 0) | 0x1000 | (4 if not enabled else 0),
+                                     r, data)
+                    return
+                text = l_.py["lb"]["items"][cur].text if (l_ is not None and cur >= 0) else ""
+                if focused and not s["dropped"]:
+                    pt.fill(r[0], r[1], r[2], r[3], sysc(COLOR_HIGHLIGHT))
+                    col = sysc(COLOR_HIGHLIGHTTEXT)
+                else:
+                    col = dc.text_color if enabled else sysc(COLOR_GRAYTEXT)
+                f = dc.gfont()
+                pt.text(r[0] + 1, r[1] + (r[3] - r[1] - f.height) // 2, text, f, col, r)
+                if focused and not s["dropped"]:
+                    _focus_rect(pt, r[0], r[1], r[2], r[3])
+
+        _ctl_paint(wm, w, draw, hdc)
+
+    def forward(w, msg, wp, lp, wide):
+        l_ = lb(w)
+        if l_ is None:
+            return CB_ERR
+        return wm.send(l_.hwnd, msg, wp, lp, wide)
+
+    def select(w, i, notify_=True):
+        l_ = lb(w)
+        if l_ is None:
+            return
+        wm.send(l_.hwnd, 0x186, i & 0xFFFFFFFF, 0)
+        sync_edit(w)
+        wm.invalidate(w, None, True)
+        if notify_:
+            _notify(wm, w, 1)
+
+    def proc(hwnd, msg, wp, lp, wide):
+        w = wm.wnd(hwnd)
+        if w is None:
+            return 0
+        s = st(w)
+        if msg == 0x0001:
+            f = _ctl_gfont(wm, w)
+            s["drop_h"] = w.h
+            W = w.cl[2] - w.cl[0]
+            if kind(w) != 1:
+                # the combo itself is only as tall as its edit field; the list pops up
+                fh = field_h(w)
+                w.h = fh + (w.h - (w.cl[3] - w.cl[1]))
+                wm.nc_calc(w)
+            lb_style = WS_BORDER | WS_VSCROLL | 0x8000 | 0x40 | 1 | (w.style & 0x30)
+            if w.style & 0x100:
+                lb_style |= 2                                    # sort
+            lbcls = wm.find_class("ComboLBox")
+            if kind(w) == 1:
+                lbh = wm.create(0, lbcls, "", WS_CHILD | WS_VISIBLE | lb_style, 0, field_h(w),
+                                W, max(0, s["drop_h"] - field_h(w)), hwnd, 1000, w.inst, 0, True)
+            else:
+                lbh = wm.create(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, lbcls, "", WS_POPUP | lb_style,
+                                0, 0, W, 100, 0, 1000, w.inst, 0, True)
+            s["lb"] = lbh
+            l_ = wm.wnd(lbh)
+            if l_ is not None:
+                l_.py["combo"] = hwnd
+                l_.id = 1000
+            if kind(w) in (1, 2):
+                es = WS_CHILD | WS_VISIBLE | 0x80 | (w.style & (0x2000 | 0x4000))
+                eh = wm.create(0, wm.find_class("Edit"), "", es, 3, 3, W - (21 if kind(w) == 2 else 6),
+                               field_h(w) - 6, hwnd, 1001, w.inst, 0, True)
+                s["edit"] = eh
+                e = wm.wnd(eh)
+                if e is not None:
+                    e.py["combo"] = hwnd
+                    e.exstyle &= ~WS_EX_CLIENTEDGE
+            return 0
+        if msg == 0x000F or msg == WM_PRINTCLIENT:
+            paint(w, wp)
+            return 0
+        if msg == 0x0014:
+            return 1
+        if msg == WM_GETDLGCODE:
+            return DLGC_WANTARROWS | DLGC_WANTCHARS
+        if msg == WM_SETFONT:
+            w.font = wp
+            for h in (s["lb"], s["edit"]):
+                if h:
+                    wm.send(h, WM_SETFONT, wp, lp)
+            if lp:
+                wm.invalidate(w, None, True)
+            return 0
+        if msg == WM_SETFOCUS:
+            e = wm.wnd(s["edit"])
+            if e is not None:
+                wm.set_focus(e.hwnd)
+                wm.send(e.hwnd, 0xB1, 0, 0xFFFFFFFF, True)
+            wm.invalidate(w, None, True)
+            _notify(wm, w, 3)
+            return 0
+        if msg == WM_KILLFOCUS:
+            f = wm.wnd(wp)
+            if f is not None and (f.hwnd in (s["edit"], s["lb"])):
+                return 0
+            drop(w, False)
+            wm.invalidate(w, None, True)
+            _notify(wm, w, 4)
+            return 0
+        if msg == 0x0111:                                        # from the edit child
+            code = (wp >> 16) & 0xFFFF
+            if lp == s["edit"]:
+                if code == 0x300:
+                    _notify(wm, w, 5)
+                elif code == 0x400:
+                    _notify(wm, w, 6)
+                elif code == 0x100:
+                    _notify(wm, w, 3)
+                elif code == 0x200:
+                    _notify(wm, w, 4)
+            elif lp == s["lb"] and code == 1 and kind(w) == 1:
+                sync_edit(w)
+                _notify(wm, w, 1)
+            return 0
+        if msg in (0x0201, 0x0203):
+            if not wm.enabled_chain(w):
+                return 0
+            if kind(w) == 3 and wm.focus != hwnd:
+                wm.set_focus(hwnd)
+            x, y = _xy_lparam(lp)
+            b = btn_rect(w)
+            if kind(w) == 3 or (b[0] <= x < b[2]):
+                drop(w, not s["dropped"])
+            return 0
+        if msg == 0x0400 + 0x77:                                 # list closed by a click
+            l_ = lb(w)
+            if not wp and l_ is not None:                        # clicked outside: cancel
+                l_.py["lb"]["cur"] = s["sel_on_drop"]
+            cur = l_.py["lb"]["cur"] if l_ is not None else -1
+            drop(w, False)
+            sync_edit(w)
+            wm.invalidate(w, None, True)
+            _notify(wm, w, 9 if wp else 10)                      # CBN_SELENDOK / CANCEL
+            if cur != s["sel_on_drop"]:
+                _notify(wm, w, 1)
+            if kind(w) == 3:
+                wm.set_focus(hwnd)
+            return 0
+        if msg in (0x0100,):
+            vk = wp & 0xFF
+            l_ = lb(w)
+            if l_ is None:
+                return 0
+            if vk == 0x73 or (vk in (0x26, 0x28) and wm.keys[0x12] & 0x80):   # F4 / Alt+arrow
+                drop(w, not s["dropped"])
+                return 0
+            if vk in (0x0D, 0x1B) and s["dropped"]:
+                if vk == 0x1B:
+                    select(w, s["sel_on_drop"], False)
+                drop(w, False)
+                _notify(wm, w, 9 if vk == 0x0D else 10)
+                return 0
+            if vk in (0x26, 0x28, 0x21, 0x22, 0x24, 0x23):
+                before = l_.py["lb"]["cur"]
+                wm.send(l_.hwnd, 0x0100, vk, lp)
+                if l_.py["lb"]["cur"] != before:
+                    sync_edit(w)
+                    wm.invalidate(w, None, True)
+                    _notify(wm, w, 1)
+            return 0
+        if msg == WM_CHAR and kind(w) == 3:
+            l_ = lb(w)
+            if l_ is not None:
+                before = l_.py["lb"]["cur"]
+                wm.send(l_.hwnd, WM_CHAR, wp, lp)
+                if l_.py["lb"]["cur"] != before:
+                    wm.invalidate(w, None, True)
+                    _notify(wm, w, 1)
+            return 0
+        if msg == WM_MOUSEWHEEL:
+            l_ = lb(w)
+            if l_ is not None and not s["dropped"]:
+                d = _s32(((wp >> 16) & 0xFFFF) << 16) >> 16
+                cur = l_.py["lb"]["cur"]
+                n = len(l_.py["lb"]["items"])
+                if n:
+                    new = max(0, min(n - 1, cur + (-1 if d > 0 else 1)))
+                    if new != cur:
+                        select(w, new)
+            return 0
+        if msg == WM_SETTEXT:
+            e = wm.wnd(s["edit"])
+            if e is not None:
+                return wm.send(e.hwnd, msg, wp, lp, wide)
+            if lp:
+                i = forward(w, 0x1A2, 0xFFFFFFFF, lp, wide)
+                if i != CB_ERR:
+                    select(w, i, False)
+            return 1
+        if msg in (WM_GETTEXT, WM_GETTEXTLENGTH):
+            e = wm.wnd(s["edit"])
+            if e is not None:
+                return wm.send(e.hwnd, msg, wp, lp, wide)
+            l_ = lb(w)
+            cur = l_.py["lb"]["cur"] if l_ is not None else -1
+            t = l_.py["lb"]["items"][cur].text if cur >= 0 else ""
+            if msg == WM_GETTEXTLENGTH:
+                return wm.str_len(t, wide)
+            return wm.put_str(lp, wp, t, wide)
+        if msg == WM_ENABLE:
+            for h in (s["edit"],):
+                if h:
+                    ew = wm.wnd(h)
+                    if ew is not None:
+                        if wp:
+                            ew.style &= ~WS_DISABLED
+                        else:
+                            ew.style |= WS_DISABLED
+                        wm.invalidate(ew, None, True)
+            wm.invalidate(w, None, True)
+            return 0
+        if msg == 0x0002:                                        # WM_DESTROY
+            l_ = lb(w)
+            if l_ is not None and not (l_.style & WS_CHILD):
+                wm.destroy(l_)
+            return 0
+        # -- CB_* ----------------------------------------------------------------------------
+        m = {0x143: 0x180, 0x144: 0x182, 0x146: 0x18B, 0x148: 0x189, 0x149: 0x18A,
+             0x14A: 0x181, 0x14B: 0x184, 0x14C: 0x18F, 0x150: 0x199, 0x151: 0x19A,
+             0x158: 0x1A2, 0x15B: 0x18E, 0x15C: 0x197, 0x161: 0x1A8}.get(msg)
+        if m is not None:
+            r = forward(w, m, wp, lp, wide)
+            if msg == 0x14B:
+                sync_edit(w)
+                wm.invalidate(w, None, True)
+            if msg in (0x143, 0x14A, 0x144) and kind(w) == 3:
+                wm.invalidate(w, None, True)
+            return r
+        if msg == 0x147:                                         # CB_GETCURSEL
+            l_ = lb(w)
+            cur = l_.py["lb"]["cur"] if l_ is not None else -1
+            return cur if cur >= 0 else CB_ERR
+        if msg == 0x14E:                                         # CB_SETCURSEL
+            l_ = lb(w)
+            if l_ is None:
+                return CB_ERR
+            idx = _s32(wp & 0xFFFFFFFF)
+            n = len(l_.py["lb"]["items"])
+            if idx >= n:
+                idx = -1
+            select(w, idx, False)
+            return idx if idx >= 0 else CB_ERR
+        if msg == 0x14D:                                         # CB_SELECTSTRING
+            i = forward(w, 0x18F, wp, lp, wide)
+            if i != CB_ERR:
+                select(w, i, False)
+            return i
+        if msg == 0x14F:                                         # CB_SHOWDROPDOWN
+            drop(w, bool(wp))
+            return 1
+        if msg == 0x157:
+            return 1 if s["dropped"] else 0
+        if msg == 0x152:                                         # CB_GETDROPPEDCONTROLRECT
+            sx, sy = wm.screen_origin(w)
+            _wr_rect(wm.mem, lp, (sx, sy, sx + w.w, sy + w.h + 100))
+            return 1
+        if msg == 0x153:                                         # CB_SETITEMHEIGHT
+            if _s32(wp & 0xFFFFFFFF) == -1:
+                return 0
+            l_ = lb(w)
+            if l_ is not None:
+                l_.py["lb"]["ih"] = max(1, lp)
+            return 0
+        if msg == 0x154:
+            l_ = lb(w)
+            if _s32(wp & 0xFFFFFFFF) == -1:
+                return field_h(w) - 6
+            return l_.py["lb"]["ih"] if l_ is not None else 0
+        if msg == 0x140:                                         # CB_GETEDITSEL
+            e = wm.wnd(s["edit"])
+            return wm.send(e.hwnd, 0xB0, wp, lp) if e is not None else CB_ERR
+        if msg == 0x142:                                         # CB_SETEDITSEL
+            e = wm.wnd(s["edit"])
+            if e is None:
+                return CB_ERR
+            a, b = lp & 0xFFFF, (lp >> 16) & 0xFFFF
+            a = 0xFFFFFFFF if a == 0xFFFF else a
+            b = 0xFFFFFFFF if b == 0xFFFF else b
+            wm.send(e.hwnd, 0xB1, a, b)
+            return 1
+        if msg == 0x141:                                         # CB_LIMITTEXT
+            e = wm.wnd(s["edit"])
+            if e is not None:
+                wm.send(e.hwnd, 0xC5, wp, 0)
+            return 1
+        if msg == 0x155:
+            s["ext"] = bool(wp)
+            return 0
+        if msg == 0x156:
+            return 1 if s["ext"] else 0
+        if msg in (0x159, 0x15A):
+            return 0x409
+        if msg == 0x15F:
+            return max(w.w, s["dropw"])
+        if msg == 0x160:
+            s["dropw"] = wp
+            return wp
+        if msg in (0x15D, 0x15E):
+            return 0
+        if msg == 0x145:
+            return CB_ERR
+        if msg == 0x164:                                         # CB_GETCOMBOBOXINFO
+            if lp:
+                W, H = w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]
+                ps = wm.ps
+                data = struct.pack("<I", 40 + 3 * ps + (4 if ps == 8 else 0)) + \
+                    struct.pack("<iiii", 3, 3, W - 19, field_h(w) - 3) + \
+                    struct.pack("<iiii", *btn_rect(w)) + struct.pack("<I", 0)
+                if ps == 8:
+                    data += struct.pack("<4xQQQ", hwnd, s["edit"], s["lb"])
+                else:
+                    data += struct.pack("<III", hwnd, s["edit"], s["lb"])
+                wm.mem.write(lp, data)
+            return 1
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+    return proc
+
+
+# == ScrollBar control ================================================================
+
+def _scrollbar_proc(wm):
+    def proc(hwnd, msg, wp, lp, wide):
+        w = wm.wnd(hwnd)
+        if w is None:
+            return 0
+        vert = bool(w.style & 1)
+        info = _sb_info(w, 2)
+        W, H = w.cl[2] - w.cl[0], w.cl[3] - w.cl[1]
+        if msg == 0x000F or msg == WM_PRINTCLIENT:
+            if w.style & 0x18:                                   # size box / grip
+                def draw(pt):
+                    pt.fill(0, 0, W, H, wm.gdi.sys_color(COLOR_BTNFACE))
+                    _draw_frame_control(pt, (0, 0, W, H), 3, 8)
+                _ctl_paint(wm, w, draw, wp)
+                return 0
+
+            def draw(pt):
+                _sb_paint(wm, w, pt, 2, (0, 0, W, H), vert)
+            _ctl_paint(wm, w, draw, wp)
+            return 0
+        if msg == 0x0014:
+            return 1
+        if msg in (0x0201, 0x0203):
+            if w.style & 0x18:
+                par = wm.top(w)
+                if par is not None and par.style & WS_THICKFRAME:
+                    sx, sy = wm.client_origin(w)
+                    x, y = _xy_lparam(lp)
+                    _move_size_loop(wm, par, HTBOTTOMRIGHT, sx + x, sy + y)
+                return 0
+            if w.style & WS_TABSTOP:
+                wm.set_focus(hwnd)
+            sx, sy = wm.client_origin(w)
+            x, y = _xy_lparam(lp)
+            par = w.parent
+            _sb_track(wm, w, 2, sx + x, sy + y, rect=(0, 0, W, H),
+                      notify=par.hwnd if par is not None else hwnd, vert=vert)
+            return 0
+        if msg == 0x0100:
+            code = {0x26: 0, 0x28: 1, 0x25: 0, 0x27: 1, 0x21: 2, 0x22: 3, 0x24: 6,
+                    0x23: 7}.get(wp & 0xFF)
+            if code is not None and w.parent is not None:
+                wm.send(w.parent.hwnd, WM_VSCROLL if vert else WM_HSCROLL, code, hwnd)
+                wm.send(w.parent.hwnd, WM_VSCROLL if vert else WM_HSCROLL, 8, hwnd)
+            return 0
+        if msg == WM_GETDLGCODE:
+            return DLGC_WANTARROWS
+        if msg == 0xE0:                                          # SBM_SETPOS
+            old = info[3]
+            _sb_set(wm, w, 2, 4, 0, 0, 0, _s32(wp & 0xFFFFFFFF), bool(lp))
+            return old
+        if msg == 0xE1:
+            return info[3] & 0xFFFFFFFF
+        if msg in (0xE2, 0xE6):                                  # SBM_SETRANGE(REDRAW)
+            _sb_set(wm, w, 2, 1, _s32(wp & 0xFFFFFFFF), _s32(lp & 0xFFFFFFFF), 0, 0, msg == 0xE6)
+            return info[3]
+        if msg == 0xE3:
+            if wp:
+                wm.mem.write32(wp, info[0] & 0xFFFFFFFF)
+            if lp:
+                wm.mem.write32(lp, info[1] & 0xFFFFFFFF)
+            return 0
+        if msg == 0xE4:                                          # SBM_ENABLE_ARROWS
+            info[5] = wp != 3
+            wm.invalidate(w, None, True)
+            return 1
+        if msg == 0xE9:                                          # SBM_SETSCROLLINFO
+            return _scrollinfo_set(wm, w, 2, lp, bool(wp))
+        if msg == 0xEA:
+            return _scrollinfo_get(wm, w, 2, lp)
+        if msg == 0xEB:
+            return 0
+        if msg == WM_ENABLE:
+            info[5] = bool(wp)
+            wm.invalidate(w, None, True)
+            return 0
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+    return proc
+
+
+def _scrollinfo_set(wm, w, bar, a, redraw):
+    mem = wm.mem
+    size, mask, mn, mx, page, pos = struct.unpack("<IIiiIi", mem.read(a, 24))
+    info = _sb_info(w, bar)
+    return _sb_set(wm, w, bar, mask, mn if mask & 1 else info[0], mx if mask & 1 else info[1],
+                   page if mask & 2 else info[2], pos if mask & 4 else info[3], redraw)
+
+
+def _scrollinfo_get(wm, w, bar, a):
+    mem = wm.mem
+    info = _sb_info(w, bar)
+    mask = mem.read32(a + 4)
+    if mask & 1:
+        mem.write(a + 8, struct.pack("<ii", info[0], info[1]))
+    if mask & 2:
+        mem.write32(a + 16, info[2])
+    if mask & 4:
+        mem.write32(a + 20, info[3] & 0xFFFFFFFF)
+    if mask & 0x10:
+        mem.write32(a + 24, info[4] & 0xFFFFFFFF)
+    return 1 if mask & 0x17 else 0
+
+
+# -- dialogs: templates, DefDlgProc, modal loop, IsDialogMessage, MessageBox -----------------------
+
+DS_ABSALIGN, DS_SYSMODAL, DS_SETFONT, DS_MODALFRAME, DS_NOIDLEMSG = 1, 2, 0x40, 0x80, 0x100
+DS_CONTROL, DS_CENTER, DS_CENTERMOUSE, DS_CONTEXTHELP, DS_SHELLFONT = 0x400, 0x800, 0x1000, \
+    0x2000, 0x48
+DM_GETDEFID, DM_SETDEFID, DM_REPOSITION = 0x400, 0x401, 0x402
+IDOK, IDCANCEL, IDABORT, IDRETRY, IDIGNORE, IDYES, IDNO, IDCLOSE, IDHELP = 1, 2, 3, 4, 5, 6, 7, 8, 9
+IDTRYAGAIN, IDCONTINUE = 10, 11
+
+_DLG_ATOM_CLASSES = {0x80: "Button", 0x81: "Edit", 0x82: "Static", 0x83: "ListBox",
+                     0x84: "ScrollBar", 0x85: "ComboBox"}
+
+
+class _TplReader:
+    def __init__(self, mem, addr):
+        self.mem, self.a = mem, addr
+
+    def u16(self):
+        v = self.mem.read16(self.a)
+        self.a += 2
+        return v
+
+    def u32(self):
+        v = self.mem.read32(self.a)
+        self.a += 4
+        return v
+
+    def s16(self):
+        v = self.u16()
+        return v - 0x10000 if v & 0x8000 else v
+
+    def align4(self):
+        self.a = (self.a + 3) & ~3
+
+    def sz_or_ord(self):
+        v = self.u16()
+        if v == 0xFFFF:
+            return self.u16()
+        if v == 0:
+            return ""
+        chars = [v]
+        while True:
+            c = self.u16()
+            if c == 0:
+                break
+            chars.append(c)
+        return struct.pack("<%dH" % len(chars), *chars).decode("utf-16-le", "replace")
+
+
+def _parse_dlg_template(mem, addr):
+    r = _TplReader(mem, addr)
+    ver, sig = mem.read16(addr), mem.read16(addr + 2)
+    d = {"ex": False}
+    if ver == 1 and sig == 0xFFFF:
+        r.a += 4
+        d["ex"] = True
+        d["help"] = r.u32()
+        d["exstyle"] = r.u32()
+        d["style"] = r.u32()
+    else:
+        d["style"] = r.u32()
+        d["exstyle"] = r.u32()
+    n = r.u16()
+    d["x"], d["y"], d["cx"], d["cy"] = r.s16(), r.s16(), r.s16(), r.s16()
+    d["menu"] = r.sz_or_ord()
+    d["class"] = r.sz_or_ord()
+    d["title"] = r.sz_or_ord()
+    d["font"] = None
+    if d["style"] & DS_SETFONT:
+        pt_ = r.u16()
+        weight, italic, charset = 400, 0, 1
+        if d["ex"]:
+            weight = r.u16()
+            italic = mem.read8(r.a)
+            charset = mem.read8(r.a + 1)
+            r.a += 2
+        face = r.sz_or_ord()
+        d["font"] = (pt_, weight, italic, charset, face)
+    items = []
+    for _ in range(n):
+        r.align4()
+        it = {}
+        if d["ex"]:
+            it["help"] = r.u32()
+            it["exstyle"] = r.u32()
+            it["style"] = r.u32()
+        else:
+            it["style"] = r.u32()
+            it["exstyle"] = r.u32()
+        it["x"], it["y"], it["cx"], it["cy"] = r.s16(), r.s16(), r.s16(), r.s16()
+        it["id"] = r.u32() if d["ex"] else r.u16()
+        it["class"] = r.sz_or_ord()
+        it["title"] = r.sz_or_ord()
+        extra = r.u16()
+        it["data"] = r.a if extra else 0
+        r.a += extra
+        items.append(it)
+    d["items"] = items
+    return d
+
+
+def _dlg_base_units(font):
+    """Average char width / height of the dialog font (for DLU conversion)."""
+    s = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    cx = (font.width(s) // 26 + 1) // 2
+    return max(1, cx), max(1, font.height)
+
+
+def _dlg_units(dlg_w):
+    return dlg_w.py.get("base", (6, 13))
+
+
+def _dlg_create(wm, inst, tpl_addr, owner, dlgproc, param, wide, modal=False):
+    p = wm.p
+    mem = wm.mem
+    try:
+        d = _parse_dlg_template(mem, tpl_addr)
+    except Exception as e:
+        p.log.warn("dialog template parse failed: %s" % e)
+        return 0
+    gdi = wm.gdi
+    hfont = 0
+    if d["font"] is not None:
+        pt_, weight, italic, charset, face = d["font"]
+        if face.lower() in ("ms shell dlg", "ms shell dlg 2"):
+            face = "MS Shell Dlg" if face.lower() == "ms shell dlg" else "Tahoma"
+        fo = _GFontObj(-((pt_ * 96 + 36) // 72), 0, 0, 0, weight or 400, italic, 0, 0,
+                       charset, 0, 0, 0, 0, face)
+        hfont = gdi.add(fo)
+        font = fo.realize()
+    else:
+        font = gdi.stock[13].realize()
+    bx, by = _dlg_base_units(font)
+    style = d["style"]
+    ex = d["exstyle"]
+    if style & DS_MODALFRAME:
+        ex |= WS_EX_DLGMODALFRAME
+    if style & DS_CONTEXTHELP:
+        ex |= 0x400
+    if style & DS_CONTROL:
+        style &= ~(WS_CAPTION | WS_SYSMENU)
+        style |= WS_CHILD
+        ex |= WS_EX_CONTROLPARENT
+    cls_name = d["class"] if d["class"] else "#32770"
+    if isinstance(cls_name, int):
+        cls = wm.find_class(cls_name)
+    else:
+        cls = wm.find_class(cls_name)
+    if cls is None:
+        cls = wm.find_class("#32770")
+    cw = d["cx"] * bx // 4
+    ch = d["cy"] * by // 8
+    # client size -> window size
+    tmp = _Wnd(0)
+    tmp.style, tmp.exstyle = style, ex
+    tmp.menu = 0
+    L = _nc_layout(wm, tmp)
+    fx = L["b"] * 2 + L["ce"] * 2 + L["vs"]
+    fy = L["b"] * 2 + L["cap"] + L["ce"] * 2 + L["hs"]
+    menu = 0
+    if d["menu"]:
+        data = _res_bytes(p, inst, 4, d["menu"] if isinstance(d["menu"], int) else d["menu"].upper())
+        if data:
+            menu = _parse_menu_res(wm, data)
+            fy += _M["menu"]
+    W, H = cw + fx, ch + fy
+    x = d["x"] * bx // 4
+    y = d["y"] * by // 8
+    ow = wm.wnd(owner)
+    if style & WS_CHILD:
+        pass
+    elif not (style & DS_ABSALIGN) and ow is not None:
+        ox, oy = wm.client_origin(ow)
+        x, y = x + ox, y + oy
+    if style & DS_CENTER or (not (style & WS_CHILD) and d["x"] == 0 and d["y"] == 0 and False):
+        if ow is not None and not (style & WS_CHILD):
+            t = wm.top(ow)
+            x = t.x + (t.w - W) // 2
+            y = t.y + (t.h - H) // 2
+        else:
+            x = (wm.gdi.screen.w - W) // 2
+            y = (wm.gdi.screen.h - H) // 2
+    if not (style & WS_CHILD):
+        x = max(0, min(x, wm.gdi.screen.w - W))
+        y = max(0, min(y, wm.gdi.screen.h - H))
+    visible = style & WS_VISIBLE
+    title = d["title"] if isinstance(d["title"], str) else ""
+    wm.dlg_pending = {"proc": dlgproc, "font": hfont, "base": (bx, by), "wide": wide}
+    hwnd = wm.create(ex, cls, title, style & ~WS_VISIBLE, x, y, W, H, owner, menu, inst,
+                     param, wide)
+    wm.dlg_pending = None
+    w = wm.wnd(hwnd)
+    if w is None:
+        return 0
+    w.py["dlg"] = True
+    w.py["base"] = (bx, by)
+    w.py["font"] = hfont
+    _dlg_set_proc(wm, w, dlgproc)
+    if hfont:
+        wm.send(hwnd, WM_SETFONT, hfont, 0)
+    # controls
+    for it in d["items"]:
+        cname = it["class"]
+        if isinstance(cname, int):
+            cname = _DLG_ATOM_CLASSES.get(cname, "Static")
+        ccls = wm.find_class(cname)
+        if ccls is None:
+            p.log.warn("dialog control class %r not registered" % (cname,))
+            continue
+        text = it["title"]
+        cstyle = it["style"] | WS_CHILD
+        cx_, cy_ = it["x"] * bx // 4, it["y"] * by // 8
+        cw_, ch_ = it["cx"] * bx // 4, it["cy"] * by // 8
+        mark = wm.scratch_mark()
+        try:
+            if isinstance(text, int):
+                # an ordinal title (icons in static controls): pass as MAKEINTRESOURCE via
+                # a 0xFFFF-prefixed string so the control can load it
+                tptr = text
+                tstr = ""
+            else:
+                tptr = 0
+                tstr = text
+            ch_hwnd = wm.create(it["exstyle"] | WS_EX_NOPARENTNOTIFY, ccls, tstr, cstyle, cx_, cy_,
+                                cw_, ch_, hwnd, it["id"], inst, it["data"], True,
+                                name_arg=tptr)
+            cw = wm.wnd(ch_hwnd)
+            if cw is not None and tptr and (cstyle & 0x1F) in (3, 0xE) and ccls.name.upper() == \
+                    "STATIC":
+                _static_load_image(wm, cw, inst, tptr)
+        finally:
+            wm.scratch_release(mark)
+        if ch_hwnd and hfont:
+            wm.send(ch_hwnd, WM_SETFONT, hfont, 0)
+        if not ch_hwnd:
+            p.log.warn("dialog control %r id %d failed to create" % (cname, it["id"]))
+    # default button + WM_INITDIALOG
+    first = _dlg_next_tab(wm, w, None, False)
+    focus_h = first.hwnd if first is not None else 0
+    r = wm.send(hwnd, WM_INITDIALOG, focus_h, param, wide)
+    if wm.wnd(hwnd) is None:
+        return 0
+    if r & 0xFFFFFFFF and focus_h and wm.wnd(focus_h) is not None:
+        _dlg_set_focus(wm, w, wm.wnd(focus_h))
+    if visible and wm.wnd(hwnd) is not None and not (w.style & WS_VISIBLE):
+        wm.show(w, 1 if not (style & WS_CHILD) else 5)
+    return hwnd
+
+
+def _static_load_image(wm, w, inst, name):
+    typ = w.style & 0x1F
+    if typ == 3:
+        ic = _load_icon_res(wm.p, inst, name, 32)
+        if ic is None and name in (32512, 32513, 32514, 32515, 32516):
+            ic = _stock_icon(name)
+        if ic is not None:
+            w.py["image"] = wm.gdi.add(ic)
+            if not (w.style & 0x240):
+                wm.set_pos(w, 0, 0, 0, ic.w, ic.ht, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)
+    else:
+        data = _res_bytes(wm.p, inst, 2, name)
+        if data:
+            bm = _bitmap_from_packed(wm.p, data)
+            if bm is not None:
+                w.py["image"] = wm.gdi.add(bm)
+                if not (w.style & 0x240):
+                    wm.set_pos(w, 0, 0, 0, bm.surf.w, bm.surf.h,
+                               SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)
+
+
+def _dlg_proc_off(wm):
+    return 8 if wm.ps == 8 else 4
+
+
+def _dlg_set_proc(wm, w, proc):
+    off = _dlg_proc_off(wm)
+    if len(w.extra) < off + wm.ps:
+        w.extra.extend(bytes(off + wm.ps - len(w.extra)))
+    w.extra[off:off + wm.ps] = struct.pack("<Q" if wm.ps == 8 else "<I", proc & (M64 if wm.ps == 8 else 0xFFFFFFFF))
+
+
+def _dlg_get(wm, w, off):
+    if len(w.extra) < off + wm.ps:
+        return 0
+    return struct.unpack_from("<Q" if wm.ps == 8 else "<I", w.extra, off)[0]
+
+
+def _dlg_set(wm, w, off, v):
+    if len(w.extra) < off + wm.ps:
+        w.extra.extend(bytes(off + wm.ps - len(w.extra)))
+    struct.pack_into("<Q" if wm.ps == 8 else "<I", w.extra, off,
+                     v & (M64 if wm.ps == 8 else 0xFFFFFFFF))
+
+
+def _def_dlg_proc(wm, hwnd, msg, wp, lp, wide):
+    w = wm.wnd(hwnd)
+    if w is None:
+        return 0
+    if msg == WM_NCCREATE and getattr(wm, "dlg_pending", None):
+        pend = wm.dlg_pending
+        w.py["dlg"] = True
+        w.py["base"] = pend["base"]
+        _dlg_set_proc(wm, w, pend["proc"])
+    proc = _dlg_get(wm, w, _dlg_proc_off(wm))
+    if proc:
+        _dlg_set(wm, w, 0, 0)
+        r = wm.call_proc(proc, hwnd, msg, wp, lp, wide, target_wide=w.py.get("dlgwide", wide))
+        if wm.wnd(hwnd) is None:
+            return r
+        r32 = r & 0xFFFFFFFF
+        if msg in (WM_CTLCOLORMSGBOX, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORBTN,
+                   WM_CTLCOLORDLG, WM_CTLCOLORSCROLLBAR, WM_CTLCOLORSTATIC, WM_COMPAREITEM,
+                   WM_VKEYTOITEM, WM_CHARTOITEM, 0x37, WM_INITDIALOG):
+            if r32 or msg == WM_INITDIALOG:
+                return r
+        elif r32:
+            return _dlg_get(wm, w, 0)
+    return _dlg_default(wm, w, msg, wp, lp, wide)
+
+
+def _dlg_default(wm, w, msg, wp, lp, wide):
+    hwnd = w.hwnd
+    if msg == 0x0014:                                      # WM_ERASEBKGND
+        dc = wm.gdi.get(wp, "dc")
+        if dc is None:
+            return 0
+        br = wm.send(hwnd, WM_CTLCOLORDLG, wp, hwnd)
+        if not br or wm.gdi.brush(br) is None:
+            br = wm.gdi.sys_brush(COLOR_BTNFACE).h
+        pt = _Painter(wm, w, dc=dc)
+        try:
+            r = wm.client_rect(w)
+            pt.fill_brush(r[0], r[1], r[2], r[3], br)
+        finally:
+            pt.done()
+        return 1
+    if msg == WM_SHOWWINDOW:
+        if not wp:
+            _dlg_save_focus(wm, w)
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+    if msg == WM_ACTIVATE:
+        if wp & 0xFFFF:
+            _dlg_restore_focus(wm, w)
+        else:
+            _dlg_save_focus(wm, w)
+        return 0
+    if msg == WM_SETFOCUS:
+        _dlg_restore_focus(wm, w)
+        return 0
+    if msg == 0x0010:                                      # WM_CLOSE
+        cancel = _find_child_id(wm, w, IDCANCEL)
+        if cancel is not None and not wm.enabled_chain(cancel):
+            wm.p.log.info("dialog close ignored: Cancel is disabled")
+            return 0
+        wm.post(hwnd, 0x0111, IDCANCEL, cancel.hwnd if cancel is not None else 0)
+        return 0
+    if msg == WM_NEXTDLGCTL:
+        if lp & 0xFFFF:
+            target = wm.wnd(wp)
+        else:
+            cur = wm.wnd(wm.focus)
+            target = _dlg_next_tab(wm, w, cur if cur is not None and wm.is_child_of(cur, w)
+                                   else None, bool(wp))
+        if target is not None:
+            _dlg_set_focus(wm, w, target)
+        return 0
+    if msg == DM_GETDEFID:
+        did = w.py.get("defid", 0)
+        if not did:
+            for c in w.children:
+                if (c.style & 0xF) == 1 and wm.find_class("Button") is c.cls:
+                    did = c.id
+                    break
+        return (0x534B << 16) | (did & 0xFFFF) if did else 0
+    if msg == DM_SETDEFID:
+        old = w.py.get("defid", 0)
+        w.py["defid"] = wp
+        for c in wm.descendants(w):
+            if c.cls is wm.find_class("Button") and (c.style & 0xF) in (0, 1):
+                want = 1 if c.id == wp else 0
+                if (c.style & 0xF) != want:
+                    wm.send(c.hwnd, 0xF4, want, 1)
+        return 1
+    if msg == DM_REPOSITION:
+        return 0
+    if msg == WM_GETDLGCODE:
+        return 0
+    if msg in (WM_CTLCOLORMSGBOX, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORBTN,
+               WM_CTLCOLORDLG, WM_CTLCOLORSCROLLBAR, WM_CTLCOLORSTATIC):
+        return _def_ctlcolor(wm, msg, wp)
+    if msg == 0x0002:
+        f = w.py.get("font")
+        return 0
+    if msg == WM_SETFONT:
+        w.font = wp
+        return 0
+    if msg == WM_GETFONT:
+        return w.font
+    if msg in (WM_ENTERMENULOOP, 0x0201, WM_NCLBUTTONDOWN):
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+    return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+
+
+def _find_child_id(wm, w, cid):
+    for c in w.children:
+        if c.id == cid and not c.dead:
+            return c
+    return None
+
+
+def _dlg_save_focus(wm, w):
+    f = wm.wnd(wm.focus)
+    if f is not None and wm.is_child_of(f, w):
+        w.py["saved_focus"] = f.hwnd
+
+
+def _dlg_restore_focus(wm, w):
+    f = wm.wnd(w.py.get("saved_focus", 0))
+    if f is None or not wm.visible(f) or not wm.enabled_chain(f):
+        f = _dlg_next_tab(wm, w, None, False)
+    if f is not None:
+        _dlg_set_focus(wm, w, f)
+
+
+def _dlg_set_focus(wm, dlg, c):
+    code = wm.send(c.hwnd, WM_GETDLGCODE, 0, 0)
+    if code & DLGC_HASSETSEL:
+        wm.send(c.hwnd, 0xB1, 0, 0xFFFFFFFF)
+    wm.set_focus(c.hwnd)
+    # a focused push button becomes the default button
+    btn = wm.find_class("Button")
+    if c.cls is btn and (c.style & 0xF) in (0, 1):
+        for o in wm.descendants(dlg):
+            if o.cls is btn and (o.style & 0xF) == 1 and o is not c:
+                wm.send(o.hwnd, 0xF4, 0, 1)
+        if (c.style & 0xF) != 1:
+            wm.send(c.hwnd, 0xF4, 1, 1)
+    else:
+        did = w_def = None
+        did = wm.send(dlg.hwnd, DM_GETDEFID, 0, 0) & 0xFFFF
+        for o in wm.descendants(dlg):
+            if o.cls is btn and (o.style & 0xF) in (0, 1):
+                want = 1 if (o.id == did and did) else 0
+                if (o.style & 0xF) != want:
+                    wm.send(o.hwnd, 0xF4, want, 1)
+
+
+def _dlg_tab_items(wm, dlg):
+    """Tab-order list (recursing into WS_EX_CONTROLPARENT children)."""
+    out = []
+    for c in dlg.children:
+        if c.dead:
+            continue
+        if c.exstyle & WS_EX_CONTROLPARENT and c.style & WS_VISIBLE:
+            out.extend(_dlg_tab_items(wm, c))
+        else:
+            out.append(c)
+    return out
+
+
+def _dlg_next_tab(wm, dlg, cur, prev):
+    items = [c for c in _dlg_tab_items(wm, dlg)
+             if c.style & WS_TABSTOP and c.style & WS_VISIBLE and not (c.style & WS_DISABLED)]
+    if not items:
+        return None
+    if cur is None or cur not in items:
+        allitems = _dlg_tab_items(wm, dlg)
+        if cur is None or cur not in allitems:
+            return items[-1] if prev else items[0]
+        i = allitems.index(cur)
+        seq = allitems[i + 1:] + allitems[:i] if not prev else list(reversed(allitems[:i])) + \
+            list(reversed(allitems[i + 1:]))
+        for c in seq:
+            if c in items:
+                return c
+        return None
+    i = items.index(cur)
+    # radio groups: tab to the checked button of the group
+    nxt = items[(i + (-1 if prev else 1)) % len(items)]
+    return _checked_in_group(wm, dlg, nxt) or nxt
+
+
+def _checked_in_group(wm, dlg, c):
+    if c.cls is not wm.find_class("Button") or (c.style & 0xF) not in (4, 9):
+        return None
+    for g in _dlg_group(wm, c.parent, c):
+        if g.cls is c.cls and (g.style & 0xF) in (4, 9) and g.py.get("check") and \
+                not (g.style & WS_DISABLED) and g.style & WS_VISIBLE:
+            return g
+    return None
+
+
+def _dlg_next_group(wm, dlg, cur, prev):
+    if cur is None or cur.parent is None:
+        return None
+    grp = [c for c in _dlg_group(wm, cur.parent, cur)
+           if c.style & WS_VISIBLE and not (c.style & WS_DISABLED)]
+    if cur not in grp or len(grp) < 2:
+        return cur
+    i = grp.index(cur)
+    return grp[(i + (-1 if prev else 1)) % len(grp)]
+
+
+def _is_dialog_message(wm, dlg, m):
+    """IsDialogMessage core: True if m was consumed (dispatched or handled)."""
+    hwnd = m["hwnd"]
+    tw = wm.wnd(hwnd)
+    if tw is None or (tw is not dlg and not wm.is_child_of(tw, dlg)):
+        return False
+    msg = m["msg"]
+    if msg in (0x100, WM_SYSKEYDOWN, WM_CHAR, WM_SYSCHAR):
+        ps = wm.ps
+        mark = wm.scratch_mark()
+        try:
+            if ps == 8:
+                ma = wm.scratch(struct.pack("<QI4xQQIii4x", hwnd, msg, m["w"] & M64,
+                                            m["l"] & M64, 0, 0, 0))
+            else:
+                ma = wm.scratch(struct.pack("<IIIIIii", hwnd, msg, m["w"] & 0xFFFFFFFF,
+                                            m["l"] & 0xFFFFFFFF, 0, 0, 0))
+            code = wm.send(hwnd, WM_GETDLGCODE, m["w"], ma) & 0xFFFFFFFF if tw is not dlg else 0
+        finally:
+            wm.scratch_release(mark)
+        vk = m["w"] & 0xFFFF
+        if msg == 0x100:
+            if code & (DLGC_WANTALLKEYS | DLGC_WANTMESSAGE) and vk not in ():
+                if not (vk == 0x09 and not (code & DLGC_WANTTAB) and not (code & DLGC_WANTALLKEYS)):
+                    _dispatch_py(wm, m)
+                    return True
+            if vk == 0x09 and not (code & DLGC_WANTTAB):
+                cur = wm.wnd(wm.focus)
+                nxt = _dlg_next_tab(wm, dlg, cur, bool(wm.keys[0x10] & 0x80))
+                if nxt is not None:
+                    _dlg_set_focus(wm, dlg, nxt)
+                    dlg.py["uistate"] = 0
+                return True
+            if vk in (0x25, 0x26, 0x27, 0x28) and not (code & DLGC_WANTARROWS):
+                cur = wm.wnd(wm.focus)
+                nxt = _dlg_next_group(wm, dlg, cur, vk in (0x25, 0x26))
+                if nxt is not None and nxt is not cur:
+                    _dlg_set_focus(wm, dlg, nxt)
+                    ncode = wm.send(nxt.hwnd, WM_GETDLGCODE, 0, 0)
+                    if ncode & DLGC_RADIOBUTTON:
+                        wm.send(nxt.hwnd, 0xF5, 0, 0)          # BM_CLICK
+                return True
+            if vk == 0x0D:
+                cur = wm.wnd(wm.focus)
+                if cur is not None and (code & DLGC_DEFPUSHBUTTON) and wm.is_child_of(cur, dlg):
+                    wm.send(dlg.hwnd, 0x0111, cur.id & 0xFFFF, cur.hwnd)
+                    return True
+                did = wm.send(dlg.hwnd, DM_GETDEFID, 0, 0)
+                did = did & 0xFFFF if (did >> 16) == 0x534B else IDOK
+                btn = _find_child_id(wm, dlg, did)
+                if btn is None or wm.enabled_chain(btn):
+                    wm.send(dlg.hwnd, 0x0111, did, btn.hwnd if btn is not None else 0)
+                return True
+            if vk == 0x1B:
+                btn = _find_child_id(wm, dlg, IDCANCEL)
+                if btn is None or wm.enabled_chain(btn):
+                    wm.send(dlg.hwnd, 0x0111, IDCANCEL, btn.hwnd if btn is not None else 0)
+                return True
+            _dispatch_py(wm, m)
+            return True
+        if msg in (WM_CHAR, WM_SYSCHAR):
+            if msg == WM_CHAR and (code & (DLGC_WANTCHARS | DLGC_WANTALLKEYS)):
+                _dispatch_py(wm, m)
+                return True
+            if vk in (0x09, 0x0D, 0x1B):
+                return True
+            ch = chr(vk).lower()
+            target = _dlg_mnemonic(wm, dlg, ch)
+            if target is not None:
+                dlg.py["uistate"] = 0
+                tcode = wm.send(target.hwnd, WM_GETDLGCODE, 0, 0)
+                if tcode & DLGC_STATIC:
+                    items = _dlg_tab_items(wm, dlg)
+                    i = items.index(target) if target in items else -1
+                    for c in items[i + 1:]:
+                        if c.style & WS_VISIBLE and not (c.style & WS_DISABLED) and \
+                                c.style & WS_TABSTOP:
+                            _dlg_set_focus(wm, dlg, c)
+                            break
+                elif tcode & DLGC_BUTTON or tcode & (DLGC_DEFPUSHBUTTON | DLGC_UNDEFPUSHBUTTON):
+                    _dlg_set_focus(wm, dlg, target)
+                    if not (tcode & DLGC_RADIOBUTTON) or True:
+                        wm.send(target.hwnd, 0xF5, 0, 0)
+                else:
+                    _dlg_set_focus(wm, dlg, target)
+                return True
+            if msg == WM_SYSCHAR:
+                _dispatch_py(wm, m)
+            return True
+    if msg in (0x101, WM_SYSKEYUP) and m["w"] in (0x09,):
+        return True
+    _dispatch_py(wm, m)
+    return True
+
+
+def _dlg_mnemonic(wm, dlg, ch):
+    for c in _dlg_tab_items(wm, dlg):
+        if not (c.style & WS_VISIBLE) or c.style & WS_DISABLED:
+            continue
+        if c.cls is wm.find_class("Static") and c.style & 0x80:
+            continue
+        vis, ul = _strip_prefix(c.text or "")
+        if 0 <= ul < len(vis) and vis[ul].lower() == ch:
+            return c
+    return None
+
+
+def _dialog_modal(wm, hwnd, owner):
+    """Run a modal dialog loop until EndDialog; returns the result."""
+    w = wm.wnd(hwnd)
+    if w is None:
+        return 0xFFFFFFFF
+    ow = wm.wnd(owner)
+    owner_top = wm.top(ow) if ow is not None else None
+    disabled_owner = False
+    if owner_top is not None and owner_top is not w and not (owner_top.style & WS_DISABLED):
+        owner_top.style |= WS_DISABLED
+        wm.send(owner_top.hwnd, WM_ENABLE, 0, 0)
+        disabled_owner = True
+    if not w.py.get("ended") and not (w.style & WS_VISIBLE):
+        wm.show(w, 1)
+    wm.modal.append(hwnd)
+    idle_sent = False
+    try:
+        while not w.py.get("ended") and wm.wnd(hwnd) is not None:
+            m = wm.peek(0, 0, 0, True)
+            if m is None:
+                if not idle_sent and ow is not None and not (w.style & DS_NOIDLEMSG):
+                    idle_sent = True
+                    wm.send(ow.hwnd, WM_ENTERIDLE, 0, hwnd)
+                    continue
+                tid = wm.cur_tid()
+                nt = wm.next_timer(tid)
+                wm.p.py_wait(lambda: w.py.get("ended") or wm.wnd(hwnd) is None or
+                             wm.wait_ready(tid, (0, 0, 0)), nt)
+                continue
+            idle_sent = False
+            if m["msg"] == 0x12:                             # WM_QUIT: repost, end the dialog
+                wm.post_quit(m["w"])
+                break
+            if wm.call_msg_hooks(-1, 0, 0):
+                continue
+            if not _is_dialog_message(wm, w, m):
+                _translate_py(wm, m)
+                _dispatch_py(wm, m)
+    finally:
+        wm.modal.remove(hwnd)
+        if disabled_owner and owner_top.hwnd in wm.wins:
+            owner_top.style &= ~WS_DISABLED
+            wm.send(owner_top.hwnd, WM_ENABLE, 1, 0)
+            wm.set_active(owner_top.hwnd)
+    res = w.py.get("result", 0xFFFFFFFF if not w.py.get("ended") else 0)
+    if wm.wnd(hwnd) is not None:
+        wm.destroy(w)
+    return res
+
+
+def _end_dialog(wm, hwnd, result):
+    w = wm.wnd(hwnd)
+    if w is None:
+        return 0
+    w.py["ended"] = True
+    w.py["result"] = result
+    wm.show(w, 0)
+    for q in wm.queues.values():
+        q.wake_seq += 1
+    return 1
+
+
+# -- MessageBox ------------------------------------------------------------------------------
+
+_MB_BUTTONS = {0: [("OK", IDOK)], 1: [("OK", IDOK), ("Cancel", IDCANCEL)],
+               2: [("&Abort", IDABORT), ("&Retry", IDRETRY), ("&Ignore", IDIGNORE)],
+               3: [("&Yes", IDYES), ("&No", IDNO), ("Cancel", IDCANCEL)],
+               4: [("&Yes", IDYES), ("&No", IDNO)],
+               5: [("&Retry", IDRETRY), ("Cancel", IDCANCEL)],
+               6: [("Cancel", IDCANCEL), ("&Try Again", IDTRYAGAIN), ("&Continue", IDCONTINUE)]}
+
+
+def _message_box(wm, owner, text, caption, style, lang=0):
+    p = wm.p
+    btype = style & 0xF
+    buttons = list(_MB_BUTTONS.get(btype, _MB_BUTTONS[0]))
+    if style & 0x4000:
+        buttons.append(("Help", IDHELP))
+    defidx = min((style >> 8) & 0xF, len(buttons) - 1)
+    icon_id = {0x10: 32513, 0x20: 32514, 0x30: 32515, 0x40: 32516}.get(style & 0xF0, 0)
+    caption = caption if caption is not None else "Error"
+    p.log.info('[GUI] MessageBox("%s", "%s")' % (caption, text.replace("\n", "\\n")))
+    disp = wm.ensure_display()
+    if disp is None or disp.auto_answer():
+        return buttons[defidx][1]
+    font = _GFont("sans", 11)
+    fo = _GFontObj(-11, face="MS Shell Dlg")
+    hfont = wm.gdi.add(fo)
+    # text size
+    maxw = max(200, wm.gdi.screen.w * 3 // 5)
+    tmpdc = _DC(wm.gdi, "mem")
+    tmpdc.font = hfont
+    th, rc = _draw_text_fmt(tmpdc, text, (0, 0, maxw, 10000), 0x400 | 0x10 | 0x40 | 0x800 |
+                            0x2000, draw=False)
+    tw = rc[2] - rc[0]
+    icon_w = 32 + 12 if icon_id else 0
+    bw, bh, gap = 75, 23, 6
+    btns_w = len(buttons) * bw + (len(buttons) - 1) * gap
+    cw = max(tw + icon_w + 24, btns_w + 24, 120)
+    content_h = max(th, 32 if icon_id else 0)
+    ch = 12 + content_h + 12 + bh + 12
+    tmp = _Wnd(0)
+    tmp.style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME
+    tmp.exstyle = WS_EX_DLGMODALFRAME
+    L = _nc_layout(wm, tmp)
+    W = cw + 2 * L["b"]
+    H = ch + 2 * L["b"] + L["cap"]
+    ow = wm.wnd(owner)
+    if ow is not None and ow.style & WS_VISIBLE:
+        t = wm.top(ow)
+        x, y = t.x + (t.w - W) // 2, t.y + (t.h - H) // 2
+    else:
+        x, y = (wm.gdi.screen.w - W) // 2, (wm.gdi.screen.h - H) // 2
+    x = max(0, min(x, wm.gdi.screen.w - W))
+    y = max(0, min(y, wm.gdi.screen.h - H))
+    cls = wm.find_class("#32770")
+    ex = WS_EX_DLGMODALFRAME | (WS_EX_TOPMOST if style & 0x41000 else 0)
+    wm.dlg_pending = {"proc": 0, "font": hfont, "base": (6, 13), "wide": True}
+    hwnd = wm.create(ex, cls, caption, WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME, x, y,
+                     W, H, owner if ow is not None else 0, 0, 0, 0, True)
+    wm.dlg_pending = None
+    w = wm.wnd(hwnd)
+    if w is None:
+        return buttons[defidx][1]
+    w.py["dlg"] = True
+    w.py["msgbox"] = True
+    has_cancel = any(b[1] == IDCANCEL for b in buttons) or btype == 0
+    if not has_cancel:
+        w.py["close_disabled"] = True
+    wm.send(hwnd, WM_SETFONT, hfont, 0)
+    if icon_id:
+        ih = wm.create(0, wm.find_class("Static"), "", WS_CHILD | WS_VISIBLE | 3, 12, 12, 32,
+                       32, hwnd, 0xFFFF, 0, 0, True)
+        iw = wm.wnd(ih)
+        if iw is not None:
+            ic = wm.std_icons.get(icon_id) if hasattr(wm, "std_icons") else 0
+            iw.py["image"] = ic
+    tx = 12 + icon_w
+    ty = 12 + max(0, (content_h - th) // 2)
+    sh = wm.create(0, wm.find_class("Static"), text, WS_CHILD | WS_VISIBLE | 0x80 | 0x2000,
+                   tx, ty, tw + 4, th, hwnd, 0xFFFF, 0, 0, True)
+    wm.send(sh, WM_SETFONT, hfont, 0)
+    bx = (cw - btns_w) // 2
+    by = ch - 12 - bh
+    first = None
+    for i, (label, bid) in enumerate(buttons):
+        bstyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP | (1 if i == defidx else 0) | \
+            (WS_GROUP if i == 0 else 0)
+        bh_ = wm.create(0, wm.find_class("Button"), label, bstyle, bx + i * (bw + gap), by, bw,
+                        bh, hwnd, bid, 0, 0, True)
+        wm.send(bh_, WM_SETFONT, hfont, 0)
+        if i == defidx:
+            first = bh_
+    w.py["defid"] = buttons[defidx][1]
+    w.py["mb_single"] = btype == 0
+
+    def mb_proc(h, msg, wp, lp, wide):
+        if msg == 0x0111 and (wp & 0xFFFF) in [b[1] for b in buttons] + \
+                ([IDCANCEL] if btype == 0 else []):
+            rid = wp & 0xFFFF
+            if rid == IDCANCEL and btype == 0:
+                rid = IDOK
+            _end_dialog(wm, h, rid)
+            return 1
+        if msg == 0x0111 and (wp & 0xFFFF) == IDCANCEL and not has_cancel:
+            return 1
+        return 0
+
+    addr = wm.register_pyproc(mb_proc)
+    _dlg_set_proc(wm, w, addr)
+    wm.show(w, 1)
+    if first:
+        _dlg_set_focus(wm, w, wm.wnd(first))
+    res = _dialog_modal(wm, hwnd, owner if ow is not None else 0)
+    wm.gdi.objs.pop(hfont, None)
+    wm.pyprocs.pop(addr, None)
+    return res
+
+
+# -- user32 API (part 1): WM helpers, classes, windows, messages, painting, input -----------------
+
+def _wm_begin_paint_py(self, w):
+    """BeginPaint for Python-side window procedures -> a clipped _DC with a handle."""
+    if w.ncdirty:
+        w.ncdirty = False
+        self.send(w.hwnd, WM_NCPAINT, 1, 0)
+    rects = list(w.update)
+    erase = w.erase
+    self.validate(w)
+    dc = _DC(self.gdi, "client", w.hwnd)
+    dc.paint = rects
+    self.gdi.add(dc)
+    if erase and not w.py.get("no_erase"):
+        pass
+    return dc
+
+
+def _wm_end_paint_py(self, w, dc):
+    self.gdi.objs.pop(dc.h, None)
+
+
+def _wm_begin_end_paint(self, w):
+    dc = _wm_begin_paint_py(self, w)
+    try:
+        if dc.paint and w.cls is not None and w.cls.brush:
+            self.send(w.hwnd, 0x0014, dc.h, 0)
+    finally:
+        _wm_end_paint_py(self, w, dc)
+
+
+def _wm_paint_dispatch(self, w):
+    if w.ncdirty and not w.update:
+        w.ncdirty = False
+        self.send(w.hwnd, WM_NCPAINT, 1, 0)
+        return 0
+    before = list(w.update)
+    r = self.send(w.hwnd, 0x000F, 0, 0, w.unicode)
+    return r
+
+
+def _wm_title_changed(self, w):
+    if self.display is not None:
+        self.display.title_changed(w)
+
+
+def _wm_register_pyproc(self, fn):
+    a = self.__dict__.setdefault("_pyproc_next", 0x7FF00010)
+    self._pyproc_next = a + 16
+    self.pyprocs[a] = fn
+    return a
+
+
+# carets are an overlay (the display composites them); the WM tracks geometry only
+def _wm_caret_create(self, hwnd, bmp, w, h):
+    c = self.caret
+    c.update({"hwnd": hwnd, "w": max(1, w or 1), "h": max(1, h or 16), "hidden": 1,
+              "bmp": bmp, "x": 0, "y": 0})
+    self.caret_rev = getattr(self, "caret_rev", 0) + 1
+    return 1
+
+
+def _wm_caret_destroy(self):
+    self.caret["hwnd"] = 0
+    self.caret["hidden"] = 1
+    self.caret_rev = getattr(self, "caret_rev", 0) + 1
+    return 1
+
+
+def _wm_caret_show(self, hwnd):
+    c = self.caret
+    if not c["hwnd"] or (hwnd and hwnd != c["hwnd"]):
+        return 0
+    if c["hidden"] > 0:
+        c["hidden"] -= 1
+    self.caret_rev = getattr(self, "caret_rev", 0) + 1
+    return 1
+
+
+def _wm_caret_hide(self, hwnd):
+    c = self.caret
+    if not c["hwnd"] or (hwnd and hwnd != c["hwnd"]):
+        return 0
+    c["hidden"] += 1
+    self.caret_rev = getattr(self, "caret_rev", 0) + 1
+    return 1
+
+
+def _wm_caret_set_pos(self, hwnd, x, y):
+    c = self.caret
+    if not c["hwnd"]:
+        return 0
+    c["x"], c["y"] = x, y
+    self.caret_rev = getattr(self, "caret_rev", 0) + 1
+    return 1
+
+
+def _wm_caret_info(self):
+    """-> (top-level hwnd, x, y, w, h) in top-level window coords, or None."""
+    c = self.caret
+    w = self.wnd(c["hwnd"])
+    if w is None or c["hidden"] > 0 or not self.visible(w):
+        return None
+    top = self.top(w)
+    ox, oy = self.surf_origin(w)
+    return (top.hwnd, ox + w.cl[0] + c["x"], oy + w.cl[1] + c["y"], c["w"], c["h"])
+
+
+def _wm_clip_set_text(self, text):
+    cb = self.clip
+    cb["data"] = {13: text, 1: text, 7: text}
+    cb["seq"] += 1
+    if self.display is not None:
+        self.display.clipboard_set(text)
+
+
+def _wm_clip_get_text(self):
+    cb = self.clip
+    if self.display is not None:
+        t = self.display.clipboard_get()
+        if t is not None and t != cb["data"].get(13):
+            cb["data"] = {13: t, 1: t, 7: t}
+            cb["seq"] += 1
+    t = cb["data"].get(13)
+    if t is None:
+        t = cb["data"].get(1)
+    if isinstance(t, bytes):
+        t = t.decode("utf-8", "replace")
+    return t
+
+
+def _wm_hook_call(self, hid, code, wp, lp, start=0):
+    hs = self.hooks.get(hid) or []
+    tid = self.cur_tid()
+    for i in range(start, len(hs)):
+        hk = hs[i]
+        if hk["tid"] in (0, tid) and not hk.get("dead"):
+            return self.p.call_guest(hk["proc"], [code & 0xFFFFFFFF, wp, lp]), True
+    return 0, False
+
+
+def _wm_cbt(self, code, wp, lp):
+    if not self.hooks.get(5):
+        return 0
+    r, called = _wm_hook_call(self, 5, code, wp, lp)
+    return 1 if (called and r & 0xFFFFFFFF) else 0
+
+
+def _wm_msg_hook(self, hid, code, m):
+    """Call a MSG-pointer hook chain (WH_GETMESSAGE / WH_MSGFILTER) on message dict m."""
+    if not self.hooks.get(hid):
+        return 0
+    mark = self.scratch_mark()
+    try:
+        a = self.scratch(40 if self.ps == 4 else 64)
+        _fill_msg_rec(self, a, m)
+        r, called = _wm_hook_call(self, hid, code, 1 if hid == 3 else 0, a)
+        if hid == 3:
+            nm = _read_msg_rec(self, a)
+            m.update(nm)
+        return r & 0xFFFFFFFF if called else 0
+    finally:
+        self.scratch_release(mark)
+
+
+def _wm_call_wndproc_hook(self, hid, hwnd, msg, wp, lp, wide, result=None):
+    if not self.hooks.get(hid):
+        return
+    mark = self.scratch_mark()
+    try:
+        ps = self.ps
+        if hid == 4:
+            data = struct.pack("<QQI4xQ", lp & M64, wp & M64, msg, hwnd) if ps == 8 else \
+                struct.pack("<IIII", lp & 0xFFFFFFFF, wp & 0xFFFFFFFF, msg, hwnd)
+        else:
+            r = result or 0
+            data = struct.pack("<QQQI4xQ", r & M64, lp & M64, wp & M64, msg, hwnd) if ps == 8 \
+                else struct.pack("<IIIII", r & 0xFFFFFFFF, lp & 0xFFFFFFFF, wp & 0xFFFFFFFF,
+                                 msg, hwnd)
+        a = self.scratch(data)
+        _wm_hook_call(self, hid, 0, 1, a)
+    finally:
+        self.scratch_release(mark)
+
+
+def _fill_msg_rec(wm, a, m):
+    pt = m.get("pt", (0, 0))
+    if wm.ps == 8:
+        wm.mem.write(a, struct.pack("<QI4xQQIii4x", m["hwnd"] & M64, m["msg"] & 0xFFFFFFFF,
+                                    m["w"] & M64, m["l"] & M64, m.get("time", 0) & 0xFFFFFFFF,
+                                    pt[0], pt[1]))
+    else:
+        wm.mem.write(a, struct.pack("<IIIIIii", m["hwnd"] & 0xFFFFFFFF, m["msg"] & 0xFFFFFFFF,
+                                    m["w"] & 0xFFFFFFFF, m["l"] & 0xFFFFFFFF,
+                                    m.get("time", 0) & 0xFFFFFFFF, pt[0], pt[1]))
+
+
+def _read_msg_rec(wm, a):
+    if wm.ps == 8:
+        h, msg, wp, lp, t, x, y = struct.unpack("<QI4xQQIii", wm.mem.read(a, 44))
+    else:
+        h, msg, wp, lp, t, x, y = struct.unpack("<IIIIIii", wm.mem.read(a, 28))
+    return {"hwnd": h & 0xFFFFFFFF, "msg": msg, "w": wp, "l": lp, "time": t, "pt": (x, y)}
+
+
+_WM.begin_paint_py = _wm_begin_paint_py
+_WM.end_paint_py = _wm_end_paint_py
+_WM.begin_end_paint = _wm_begin_end_paint
+_WM.paint_dispatch = _wm_paint_dispatch
+_WM.title_changed = _wm_title_changed
+_WM.register_pyproc = _wm_register_pyproc
+_WM.caret_create = _wm_caret_create
+_WM.caret_destroy = _wm_caret_destroy
+_WM.caret_show = _wm_caret_show
+_WM.caret_hide = _wm_caret_hide
+_WM.caret_set_pos = _wm_caret_set_pos
+_WM.caret_info = _wm_caret_info
+_WM.clip_set_text = _wm_clip_set_text
+_WM.clip_get_text = _wm_clip_get_text
+_WM._cbt = _wm_cbt
+_WM._call_wndproc_hook = _wm_call_wndproc_hook
+_WM.msg_hook = _wm_msg_hook
+_WM.hook_call = _wm_hook_call
+_WM.display = None
+
+
+def _user_install(k):
+    R = k.reg
+    p = k.p
+    M_ = p.mem
+    wm = p.wm = _WM(p, k)
+    gdi = p.gdi
+    U = ("user32.dll",)
+
+    def reg(names, sig="", ret="i", dlls=U):
+        return R(names, sig, ret, dlls=dlls)
+
+    def W(h):
+        return wm.wnd(h)
+
+    def err(e):
+        p.last_error = e
+        return 0
+
+    # ---- built-in classes & procs -----------------------------------------------------------
+    for nm_, fn_, wide_ in (("DefWindowProcA", _def_window_proc, False),
+                            ("DefWindowProcW", _def_window_proc, True),
+                            ("DefDlgProcA", _def_dlg_proc, False),
+                            ("DefDlgProcW", _def_dlg_proc, True)):
+        def handler(c, h, m, w_, l_, _fn=fn_, _wide=wide_):
+            return _fn(wm, h & 0xFFFFFFFF, m, w_, l_, _wide)
+        reg(nm_, "pupp", "p")(handler)
+        wm.pyprocs[p.api_thunk("user32.dll", nm_)] = \
+            (lambda h, m, w_, l_, wide, _fn=fn_: _fn(wm, h, m, w_, l_, wide))
+    dlg_extra = 48 if wm.ps == 8 else 30
+    c = wm.py_class("#32770", lambda h, m, w_, l_, wide: _def_dlg_proc(wm, h, m, w_, l_, wide),
+                    style=0x8 | 0x800, wnd_extra=dlg_extra)
+    wm.py_class("#32768", _popup_proc_factory(wm), style=0x8 | 0x20000)
+    btn = wm.py_class("Button", _button_proc(wm), style=0x8 | 0x40 | 1 | 2)
+    wm.py_class("Static", _static_proc(wm), style=0x40 | 1 | 2)
+    wm.py_class("Edit", _edit_proc(wm), style=0x8 | 0x40 | 1 | 2)
+    wm.py_class("ListBox", _listbox_proc(wm), style=0x8 | 0x40)
+    wm.py_class("ComboLBox", _listbox_proc(wm), style=0x8 | 0x40 | 0x20000)
+    wm.py_class("ComboBox", _combo_proc(wm), style=0x8 | 0x40 | 1 | 2)
+    wm.py_class("ScrollBar", _scrollbar_proc(wm), style=0x8 | 0x40 | 1 | 2)
+    wm.std_icons = {}
+    for iid in (32512, 32513, 32514, 32515, 32516, 32517, 32518):
+        ic = _stock_icon(iid)
+        ic.shared = True
+        wm.std_icons[iid] = gdi.add(ic)
+    wm.std_icons[32517] = wm.std_icons[32512]
+    wm.std_cursors = {}
+    for cid, css in _CURSOR_CSS.items():
+        cur = _GIcon(32, 32, cursor=True, css=css)
+        cur.shared = True
+        wm.std_cursors[cid] = gdi.add(cur)
+    wm.cursor = wm.std_cursors[32512]
+    for cls_ in wm.classes.values():
+        if cls_.name in ("Edit", "ComboBox"):
+            cls_.cursor = wm.std_cursors[32513]
+        elif cls_.cursor == 0:
+            cls_.cursor = wm.std_cursors[32512]
+
+    # ---- wait hook for GetMessage / WaitMessage / MsgWaitForMultipleObjects --------------
+    def msg_hook(t):
+        w_ = t.waiting_on
+        _k, ptr, hf, lo, hi, wide, _d = w_
+        m = wm.peek(hf, lo, hi, True)
+        if m is None:
+            return False
+        _deliver(t.cpu, ptr, m)
+        t.cpu.regs[RAX] = 0 if m["msg"] == 0x12 else 1
+        return True
+
+    def waitmsg_hook(t):
+        _k, mask, _d = t.waiting_on
+        if wm.wait_ready(t.tid, (0, 0, 0, mask)):
+            t.cpu.regs[RAX] = 1
+            return True
+        return False
+
+    def msgwait_hook(t):
+        _k, handles, wait_all, mask, deadline = t.waiting_on
+        r = k._try_wait(handles, wait_all, t.tid) if handles else None
+        if r is not None:
+            t.cpu.regs[RAX] = r
+            return True
+        if wm.wait_ready(t.tid, (0, 0, 0, mask)):
+            t.cpu.regs[RAX] = len(handles)
+            return True
+        if deadline is not None and time.monotonic() >= deadline:
+            t.cpu.regs[RAX] = 0x102
+            return True
+        return False
+
+    k.wait_hooks["msg"] = msg_hook
+    k.wait_hooks["waitmsg"] = waitmsg_hook
+    k.wait_hooks["msgwait"] = msgwait_hook
+
+    def _deliver(cpu, ptr, m):
+        if ptr:
+            _fill_msg_rec(wm, ptr, m)
+            if wm.hooks.get(3):
+                r = wm.msg_hook(3, 0, m)
+                _fill_msg_rec(wm, ptr, m)
+
+    def _block(c, kind, *args):
+        t = p.current_thread
+        tid = t.tid
+        nt = wm.next_timer(tid)
+        t.state = "guiwait"
+        t.waiting_on = (kind,) + args + (nt,)
+        c.regs[RAX] = 0
+        raise NOOYield()
+
+    # ---- classes --------------------------------------------------------------------------------
+    def _read_wndclass(a, ex, wide):
+        ps = wm.ps
+        if ex:
+            a += 4
+        if ps == 8:
+            style = M_.read32(a)
+            proc = M_.read64(a + 8)
+            ce, we = M_.read32(a + 16), M_.read32(a + 20)
+            inst, icon, cur, br, menu, name = (M_.read64(a + 24 + 8 * i) for i in range(6))
+            sm = M_.read64(a + 72) if ex else 0
+        else:
+            style, proc, ce, we, inst, icon, cur, br, menu, name = \
+                struct.unpack("<10I", M_.read(a, 40))
+            sm = M_.read32(a + 40) if ex else 0
+        return style, proc, _s32(ce), _s32(we), inst, icon, cur, br, menu, name, sm
+
+    def _register(c, a, ex, wide):
+        if not a:
+            return err(87)
+        style, proc, ce, we, inst, icon, cur, br, menu, name_p, sm = _read_wndclass(a, ex, wide)
+        if not name_p:
+            return err(87)
+        name = name_p if name_p < 0x10000 else wm.gstr(name_p, wide)
+        if isinstance(name, int):
+            name = "#%d" % name
+        existing = wm.find_class(name)
+        if existing is not None and not existing.system:
+            return err(1410)                                   # ERROR_CLASS_ALREADY_EXISTS
+        cls = _WClass(name, style, proc, ce, we, inst, icon, cur, br, menu, sm, wide)
+        if menu:
+            cls.menu_name = menu if menu < 0x10000 else wm.gstr(menu, wide).upper()
+            cls.menu = 0
+        if existing is not None and existing.system:
+            del wm.classes[name.upper()]
+        atom = wm.register_class(cls)
+        if not atom:
+            return err(1410)
+        p.log.ok("GUI: registered window class %r (wndproc %#x)" % (name, proc))
+        return atom
+
+    reg("RegisterClassA", "p")(lambda c, a: _register(c, a, False, False))
+    reg("RegisterClassW", "p")(lambda c, a: _register(c, a, False, True))
+    reg("RegisterClassExA", "p")(lambda c, a: _register(c, a, True, False))
+    reg("RegisterClassExW", "p")(lambda c, a: _register(c, a, True, True))
+
+    def _cls_arg(a, wide):
+        if not a:
+            return None
+        if a < 0x10000:
+            return wm.find_class(a)
+        return wm.find_class(wm.gstr(a, wide))
+
+    @reg("UnregisterClassA", "pp")
+    def _ucla(c, a, inst):
+        cls = _cls_arg(a, False)
+        if cls is None or cls.system:
+            return err(1411)
+        wm.classes.pop(cls.name.upper(), None)
+        wm.atoms.pop(cls.atom, None)
+        return 1
+
+    @reg("UnregisterClassW", "pp")
+    def _uclw(c, a, inst):
+        cls = _cls_arg(a, True)
+        if cls is None or cls.system:
+            return err(1411)
+        wm.classes.pop(cls.name.upper(), None)
+        wm.atoms.pop(cls.atom, None)
+        return 1
+
+    def _getclassinfo(c, inst, name, out, ex, wide):
+        cls = _cls_arg(name, wide)
+        if cls is None:
+            return err(1411)
+        ps = wm.ps
+        proc = cls.proc if (wide or not hasattr(cls, "proc_a")) else cls.proc_a
+        o = out + (4 if ex else 0)
+        menu = cls.menu_name if isinstance(cls.menu_name, int) else 0
+        if ps == 8:
+            M_.write(o, struct.pack("<I4xQiiQQQQQQ", cls.style, proc, len(cls.cls_extra),
+                                    cls.wnd_extra, cls.inst, cls.icon, cls.cursor, cls.brush,
+                                    menu, name if name < 0x10000 else name))
+            if ex:
+                M_.write64(out + 80 - 8, cls.icon_sm)
+        else:
+            M_.write(o, struct.pack("<IIiiIIIIII", cls.style, proc, len(cls.cls_extra),
+                                    cls.wnd_extra, cls.inst, cls.icon, cls.cursor, cls.brush,
+                                    menu, name))
+            if ex:
+                M_.write32(out + 44, cls.icon_sm)
+        return cls.atom
+
+    reg("GetClassInfoA", "ppp")(lambda c, i, n, o: _getclassinfo(c, i, n, o, False, False))
+    reg("GetClassInfoW", "ppp")(lambda c, i, n, o: _getclassinfo(c, i, n, o, False, True))
+    reg("GetClassInfoExA", "ppp")(lambda c, i, n, o: _getclassinfo(c, i, n, o, True, False))
+    reg("GetClassInfoExW", "ppp")(lambda c, i, n, o: _getclassinfo(c, i, n, o, True, True))
+
+    def _getclassname(c, h, buf, n, wide):
+        w = W(h)
+        if w is None or w.cls is None:
+            return err(1400)
+        return wm.put_str(buf, n, w.cls.name, wide)
+
+    reg("GetClassNameA RealGetWindowClassA RealGetWindowClass", "ppi")(
+        lambda c, h, b, n: _getclassname(c, h, b, n, False))
+    reg("GetClassNameW RealGetWindowClassW", "ppi")(
+        lambda c, h, b, n: _getclassname(c, h, b, n, True))
+
+    def _class_long(c, h, idx, val, set_, wide, ptr):
+        w = W(h)
+        if w is None or w.cls is None:
+            return err(1400)
+        cls = w.cls
+        fields = {-8: "menu_name", -10: "brush", -12: "cursor", -14: "icon", -16: "inst",
+                  -24: "proc", -26: "style", -34: "icon_sm"}
+        if idx >= 0:
+            size = 8 if ptr and wm.ps == 8 else 4
+            if idx + size > len(cls.cls_extra):
+                return err(1413)
+            old = int.from_bytes(cls.cls_extra[idx:idx + size], "little")
+            if set_:
+                cls.cls_extra[idx:idx + size] = (val & ((1 << (8 * size)) - 1)).to_bytes(size, "little")
+            return old
+        if idx == -32:
+            return cls.atom
+        if idx == -18:
+            old = cls.wnd_extra
+            if set_:
+                cls.wnd_extra = val
+            return old
+        if idx == -20:
+            return len(cls.cls_extra)
+        f = fields.get(idx)
+        if f is None:
+            return err(1413)
+        old = getattr(cls, f)
+        if f == "proc" and not wide and hasattr(cls, "proc_a"):
+            old = cls.proc_a
+        if isinstance(old, str):
+            old = 0
+        if set_:
+            setattr(cls, f, val)
+            if f == "proc" and hasattr(cls, "proc_a"):
+                cls.proc_a = val
+        return old
+
+    reg("GetClassLongA GetClassWord", "pi")(lambda c, h, i: _class_long(c, h, i, 0, False, False, False))
+    reg("GetClassLongW", "pi")(lambda c, h, i: _class_long(c, h, i, 0, False, True, False))
+    reg("GetClassLongPtrA", "pi", "p")(lambda c, h, i: _class_long(c, h, i, 0, False, False, True))
+    reg("GetClassLongPtrW", "pi", "p")(lambda c, h, i: _class_long(c, h, i, 0, False, True, True))
+    reg("SetClassLongA SetClassWord", "piu")(lambda c, h, i, v: _class_long(c, h, i, v, True, False, False))
+    reg("SetClassLongW", "piu")(lambda c, h, i, v: _class_long(c, h, i, v, True, True, False))
+    reg("SetClassLongPtrA", "pip", "p")(lambda c, h, i, v: _class_long(c, h, i, v, True, False, True))
+    reg("SetClassLongPtrW", "pip", "p")(lambda c, h, i, v: _class_long(c, h, i, v, True, True, True))
+
+    # ---- window creation --------------------------------------------------------------------
+    def _create(c, ex, cls_a, name_a, style, x, y, cw, ch, parent, menu, inst, param, wide):
+        cls = _cls_arg(cls_a, wide)
+        if cls is None:
+            cname = wm.gstr(cls_a, wide) if cls_a >= 0x10000 else "#%d" % cls_a
+            p.log.warn("CreateWindowEx: unknown class %r" % cname)
+            return err(1407)                                  # ERROR_CANNOT_FIND_WND_CLASS
+        name = ""
+        if name_a:
+            name = wm.gstr(name_a, wide) if name_a >= 0x10000 else ""
+        style &= 0xFFFFFFFF
+        if not (style & WS_CHILD) and not menu and cls.menu_name:
+            data = _res_bytes(p, cls.inst or inst, 4, cls.menu_name)
+            if data:
+                menu = _parse_menu_res(wm, data)
+        h = wm.create(ex, cls, name, style, x, y, cw, ch, parent & 0xFFFFFFFF, menu, inst, param,
+                      wide, cls_arg=cls_a, name_arg=name_a)
+        if h:
+            p.log.ok("GUI: CreateWindowEx class=%r title=%r -> hwnd %#x" % (cls.name, name, h))
+        return h
+
+    reg("CreateWindowExA", "uppuiiiippppp".replace("pppp", "pppp")[:12], "p")(
+        lambda c, ex, cl, nm, st, x, y, w_, h_, par, menu, inst, prm:
+        _create(c, ex, cl, nm, st, x, y, w_, h_, par, menu, inst, prm, False))
+    reg("CreateWindowExW", "uppuiiiipppp", "p")(
+        lambda c, ex, cl, nm, st, x, y, w_, h_, par, menu, inst, prm:
+        _create(c, ex, cl, nm, st, x, y, w_, h_, par, menu, inst, prm, True))
+
+    @reg("DestroyWindow", "p")
+    def _destroy(c, h):
+        w = W(h)
+        if w is None or w is wm.desktop:
+            return err(1400)
+        wm.destroy(w)
+        return 1
+
+    # ---- show / position -----------------------------------------------------------------------
+    @reg("ShowWindow ShowWindowAsync", "pi")
+    def _show(c, h, cmd):
+        w = W(h)
+        if w is None:
+            return err(1400)
+        return wm.show(w, cmd)
+
+    @reg("UpdateWindow", "p")
+    def _update(c, h):
+        w = W(h)
+        if w is None:
+            return err(1400)
+        # paint this window and its children synchronously
+        for x in [w] + wm.descendants(w):
+            if (x.update or x.ncdirty) and wm.visible(x):
+                _wm_paint_dispatch(wm, x)
+        return 1
+
+    def _rgn_rects(hr):
+        g = gdi.get(hr, "region") if hr else None
+        return None if g is None else list(g.rects)
+
+    @reg("InvalidateRect", "ppi")
+    def _invrect(c, h, r, erase):
+        w = W(h)
+        if w is None:
+            if not h:
+                for t in wm.desktop.children:
+                    wm.invalidate(t, None, bool(erase), True, True)
+                return 1
+            return err(1400)
+        wm.invalidate(w, [_rd_rect(M_, r)] if r else None, bool(erase))
+        return 1
+
+    @reg("InvalidateRgn", "ppi")
+    def _invrgn(c, h, hr, erase):
+        w = W(h)
+        if w is None:
+            return err(1400)
+        wm.invalidate(w, _rgn_rects(hr), bool(erase))
+        return 1
+
+    @reg("ValidateRect", "pp")
+    def _valrect(c, h, r):
+        w = W(h)
+        if w is None:
+            return 0
+        wm.validate(w, [_rd_rect(M_, r)] if r else None)
+        return 1
+
+    @reg("ValidateRgn", "pp")
+    def _valrgn(c, h, hr):
+        w = W(h)
+        if w is None:
+            return 0
+        wm.validate(w, _rgn_rects(hr))
+        return 1
+
+    @reg("RedrawWindow", "pppu")
+    def _redraw(c, h, r, hr, flags):
+        w = W(h) or (wm.desktop if not h else None)
+        if w is None:
+            return err(1400)
+        rects = [_rd_rect(M_, r)] if r else (_rgn_rects(hr) if hr else None)
+        targets = [w] if w is not wm.desktop else list(wm.desktop.children)
+        for t in targets:
+            children = True if flags & 0x80 else (False if flags & 0x40 else None)
+            if flags & 1 or flags & 0x100:                     # RDW_INVALIDATE / RDW_INTERNALPAINT
+                wm.invalidate(t, rects, bool(flags & 4), children, bool(flags & 0x400))
+            if flags & 8:                                      # RDW_VALIDATE
+                wm.validate(t, rects)
+            if flags & 0x400:
+                t.ncdirty = True
+            if flags & (0x200 | 0x100):                        # RDW_UPDATENOW / ERASENOW
+                for x in [t] + (wm.descendants(t) if flags & 0x80 or children is None else []):
+                    if (x.update or x.ncdirty) and wm.visible(x):
+                        _wm_paint_dispatch(wm, x)
+        return 1
+
+    @reg("GetUpdateRect", "ppi")
+    def _gur(c, h, r, erase):
+        w = W(h)
+        if w is None:
+            return 0
+        box = _GRgn(w.update).box() if w.update else (0, 0, 0, 0)
+        if r:
+            _wr_rect(M_, r, box)
+        if erase and w.update and w.erase:
+            dc = _wm_begin_paint_py(wm, w)
+            w.update = list(dc.paint)
+            _wm_end_paint_py(wm, w, dc)
+        return 1 if w.update else 0
+
+    @reg("GetUpdateRgn", "ppi")
+    def _gurgn(c, h, hr, erase):
+        w = W(h)
+        g = gdi.get(hr, "region")
+        if w is None or g is None:
+            return 0
+        g.rects = list(w.update)
+        return g.complexity()
+
+    @reg("ExcludeUpdateRgn", "pp")
+    def _eur(c, hdc, h):
+        w = W(h)
+        dc = gdi.get(hdc, "dc")
+        if w is None or dc is None:
+            return 0
+        if w.update:
+            cur = dc.clip if dc.clip is not None else [(-100000, -100000, 100000, 100000)]
+            for r in w.update:
+                cur = _rects_sub(cur, r)
+            dc.clip = cur
+            dc.changed()
+        return 2
+
+    @reg("LockWindowUpdate", "p")
+    def _lwu(c, h):
+        return 1
+
+    @reg("MoveWindow", "piiiii")
+    def _movewin(c, h, x, y, cw, ch, repaint):
+        w = W(h)
+        if w is None:
+            return err(1400)
+        wm.set_pos(w, 0, x, y, cw, ch, SWP_NOZORDER | SWP_NOACTIVATE | (0 if repaint else SWP_NOREDRAW))
+        return 1
+
+    @reg("SetWindowPos", "ppiiiiu")
+    def _swp(c, h, after, x, y, cw, ch, flags):
+        w = W(h)
+        if w is None:
+            return err(1400)
+        wm.set_pos(w, after, x, y, cw, ch, flags)
+        if not (flags & SWP_NOACTIVATE) and not (w.style & WS_CHILD) and w.style & WS_VISIBLE:
+            wm.set_active(w.hwnd)
+        return 1
+
+    @reg("BeginDeferWindowPos", "i", "p")
+    def _bdwp(c, n):
+        h = gdi.add(_GMisc("dwp", items=[]))
+        return h
+
+    @reg("DeferWindowPos", "pppiiiiu", "p")
+    def _dwp(c, hd, h, after, x, y, cw, ch, flags):
+        d = gdi.get(hd, "dwp")
+        if d is None:
+            return 0
+        d.items.append((h, after, x, y, cw, ch, flags))
+        return hd
+
+    @reg("EndDeferWindowPos", "p")
+    def _edwp(c, hd):
+        d = gdi.get(hd, "dwp")
+        if d is None:
+            return 0
+        for it in d.items:
+            _swp(c, *it)
+        gdi.objs.pop(hd & 0xFFFFFFFF, None)
+        return 1
+
+    @reg("BringWindowToTop", "p")
+    def _bwtt(c, h):
+        w = W(h)
+        if w is None:
+            return err(1400)
+        wm.set_pos(w, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
+        if not (w.style & WS_CHILD):
+            wm.set_active(w.hwnd)
+        return 1
+
+    @reg("SetForegroundWindow", "p")
+    def _sfw(c, h):
+        w = W(h)
+        if w is None:
+            return 0
+        wm.set_active(wm.top(w).hwnd)
+        return 1
+
+    @reg("GetForegroundWindow GetActiveWindow", "", "p")
+    def _gaw(c):
+        return wm.active
+
+    @reg("SetActiveWindow", "p", "p")
+    def _saw(c, h):
+        w = W(h)
+        if h and w is None:
+            return 0
+        return wm.set_active(h)
+
+    @reg("GetFocus", "", "p")
+    def _gfocus(c):
+        return wm.focus
+
+    @reg("SetFocus", "p", "p")
+    def _sfocus(c, h):
+        return wm.set_focus(h & 0xFFFFFFFF)
+
+    @reg("GetCapture", "", "p")
+    def _gcap(c):
+        return wm.capture
+
+    @reg("SetCapture", "p", "p")
+    def _scap(c, h):
+        return wm.set_capture(h & 0xFFFFFFFF)
+
+    @reg("ReleaseCapture", "")
+    def _rcap(c):
+        wm.set_capture(0)
+        return 1
+
+    @reg("EnableWindow", "pi")
+    def _enable(c, h, on):
+        w = W(h)
+        if w is None:
+            return 0
+        was_disabled = bool(w.style & WS_DISABLED)
+        if on and was_disabled:
+            w.style &= ~WS_DISABLED
+            wm.send(h, WM_ENABLE, 1, 0)
+        elif not on and not was_disabled:
+            wm.send(h, WM_CANCELMODE, 0, 0)
+            w.style |= WS_DISABLED
+            if wm.focus == h or wm.is_child_of(wm.wnd(wm.focus), w):
+                wm.set_focus(0)
+            wm.send(h, WM_ENABLE, 0, 0)
+        return 1 if was_disabled else 0
+
+    @reg("IsWindow", "p")
+    def _iswin(c, h):
+        return 1 if W(h) is not None else 0
+
+    @reg("IsWindowVisible", "p")
+    def _isvis(c, h):
+        w = W(h)
+        return 1 if w is not None and wm.visible(w) else 0
+
+    @reg("IsWindowEnabled", "p")
+    def _isen(c, h):
+        w = W(h)
+        return 1 if w is not None and not (w.style & WS_DISABLED) else 0
+
+    @reg("IsIconic", "p")
+    def _isicon(c, h):
+        w = W(h)
+        return 1 if w is not None and w.min_state == 1 else 0
+
+    @reg("IsZoomed", "p")
+    def _iszoom(c, h):
+        w = W(h)
+        return 1 if w is not None and w.min_state == 2 else 0
+
+    @reg("IsWindowUnicode", "p")
+    def _isuni(c, h):
+        w = W(h)
+        return 1 if w is not None and w.unicode else 0
+
+    @reg("IsChild", "pp")
+    def _ischild(c, par, h):
+        w, pw = W(h), W(par)
+        if w is None or pw is None:
+            return 0
+        x = w
+        while x is not None and x.style & WS_CHILD:
+            if x.parent is pw:
+                return 1
+            x = x.parent
+        return 0
+
+    @reg("GetDesktopWindow", "", "p")
+    def _gdw(c):
+        return _DESKTOP_HWND
+
+    @reg("GetShellWindow GetProgmanWindow GetTaskmanWindow", "", "p")
+    def _gshw(c):
+        return 0
+
+    @reg("GetParent", "p", "p")
+    def _gparent(c, h):
+        w = W(h)
+        if w is None:
+            return err(1400)
+        if w.style & WS_CHILD:
+            return w.parent.hwnd if w.parent is not None and w.parent is not wm.desktop else 0
+        return w.owner if w.style & WS_POPUP else 0
+
+    @reg("SetParent", "pp", "p")
+    def _sparent(c, h, par):
+        w = W(h)
+        np_ = W(par) if par else wm.desktop
+        if w is None or np_ is None:
+            return err(1400)
+        old = w.parent
+        oldh = old.hwnd if old is not None and old is not wm.desktop else _DESKTOP_HWND
+        if old is not None and w in old.children:
+            old.children.remove(w)
+            if old is not wm.desktop:
+                wm.invalidate(old, [(w.x, w.y, w.x + w.w, w.y + w.h)], True, True)
+        if np_ is wm.desktop:
+            w.style &= ~WS_CHILD
+            if w.surf is None:
+                w.surf = _Surf(max(1, w.w), max(1, w.h))
+        w.parent = np_
+        np_.children.insert(0, w)
+        wm.changed()
+        if w.style & WS_VISIBLE:
+            wm.invalidate(w, None, True, True, True)
+        return oldh
+
+    @reg("GetAncestor", "pu", "p")
+    def _ganc(c, h, flags):
+        w = W(h)
+        if w is None:
+            return 0
+        if w is wm.desktop:
+            return 0
+        if flags == 1:                                         # GA_PARENT
+            return w.parent.hwnd if w.parent is not None else 0
+        if flags == 2:                                         # GA_ROOT
+            return wm.top(w).hwnd
+        t = wm.top(w)                                          # GA_ROOTOWNER
+        while t.owner and W(t.owner) is not None:
+            t = wm.top(W(t.owner))
+        return t.hwnd
+
+    @reg("GetWindow", "pu", "p")
+    def _getwin(c, h, cmd):
+        w = W(h)
+        if w is None:
+            return err(1400)
+        par = w.parent
+        sib = par.children if par is not None else [w]
+        sib = [s for s in sib if not s.dead]
+        if cmd == 5:                                           # GW_CHILD
+            kids = [s for s in w.children if not s.dead]
+            return kids[0].hwnd if kids else 0
+        if cmd == 4:                                           # GW_OWNER
+            return w.owner
+        if w not in sib:
+            return 0
+        i = sib.index(w)
+        if cmd == 0:
+            return sib[0].hwnd
+        if cmd == 1:
+            return sib[-1].hwnd
+        if cmd == 2:
+            return sib[i + 1].hwnd if i + 1 < len(sib) else 0
+        if cmd == 3:
+            return sib[i - 1].hwnd if i > 0 else 0
+        if cmd == 6:                                           # GW_ENABLEDPOPUP
+            pop = wm._last_enabled_popup(wm.top(w))
+            return pop.hwnd if pop is not None and pop is not w else 0
+        return 0
+
+    @reg("GetTopWindow", "p", "p")
+    def _gtw(c, h):
+        w = W(h) if h else wm.desktop
+        if w is None:
+            return 0
+        kids = [s for s in w.children if not s.dead]
+        return kids[0].hwnd if kids else 0
+
+    @reg("GetNextWindow", "pu", "p")
+    def _gnw(c, h, cmd):
+        return _getwin(c, h, cmd)
+
+    @reg("GetLastActivePopup", "p", "p")
+    def _glap(c, h):
+        w = W(h)
+        if w is None:
+            return h
+        pop = wm._last_enabled_popup(w)
+        return pop.hwnd if pop is not None else h
+
+    @reg("GetWindowThreadProcessId", "pp")
+    def _gwtpi(c, h, pid):
+        w = W(h)
+        if w is None:
+            return 0
+        if pid:
+            M_.write32(pid, getattr(p, "pid", 0x1000))
+        return w.tid or p.current_thread.tid
+
+    # ---- enumeration / search ------------------------------------------------------------------
+    def _enum(c, lst, proc, lp):
+        for w in list(lst):
+            if w.dead:
+                continue
+            r = p.call_guest(proc, [w.hwnd, lp])
+            if not (r & 0xFFFFFFFF):
+                return 0
+        return 1
+
+    @reg("EnumWindows", "pp")
+    def _enumwins(c, proc, lp):
+        _enum(c, [w for w in wm.desktop.children if not getattr(w, "msg_only", False)], proc, lp)
+        return 1
+
+    @reg("EnumChildWindows", "ppp")
+    def _enumchild(c, h, proc, lp):
+        w = W(h) or wm.desktop
+        _enum(c, wm.descendants(w), proc, lp)
+        return 1
+
+    @reg("EnumThreadWindows", "upp")
+    def _enumthr(c, tid, proc, lp):
+        _enum(c, [w for w in wm.desktop.children if w.tid == tid], proc, lp)
+        return 1
+
+    @reg("EnumDesktopWindows", "ppp")
+    def _enumdesk(c, d, proc, lp):
+        _enum(c, list(wm.desktop.children), proc, lp)
+        return 1
+
+    def _find(par, after, cls_a, name_a, wide):
+        base = W(par) if par else wm.desktop
+        if base is None:
+            return 0
+        cls = _cls_arg(cls_a, wide) if cls_a else None
+        if cls_a and cls is None:
+            return 0
+        name = wm.gstr(name_a, wide) if name_a else None
+        kids = [w for w in base.children if not w.dead]
+        if after:
+            aw = W(after)
+            if aw in kids:
+                kids = kids[kids.index(aw) + 1:]
+        for w in kids:
+            if cls is not None and w.cls is not cls:
+                continue
+            if name is not None and w.text != name:
+                continue
+            return w.hwnd
+        return 0
+
+    reg("FindWindowA", "pp", "p")(lambda c, cl, nm: _find(0, 0, cl, nm, False))
+    reg("FindWindowW", "pp", "p")(lambda c, cl, nm: _find(0, 0, cl, nm, True))
+    reg("FindWindowExA", "pppp", "p")(lambda c, par, aft, cl, nm: _find(par, aft, cl, nm, False))
+    reg("FindWindowExW", "pppp", "p")(lambda c, par, aft, cl, nm: _find(par, aft, cl, nm, True))
+
+    @reg("WindowFromPoint", "Q", "p")
+    def _wfp(c, pt):
+        x, y = _s32(pt & 0xFFFFFFFF), _s32((pt >> 32) & 0xFFFFFFFF)
+        w = wm.window_from_point(x, y)
+        return w.hwnd if w is not None else 0
+
+    @reg("WindowFromPhysicalPoint", "Q", "p")
+    def _wfpp(c, pt):
+        return _wfp(c, pt)
+
+    def _child_from_point(h, pt, flags):
+        w = W(h)
+        if w is None:
+            return 0
+        x, y = _s32(pt & 0xFFFFFFFF), _s32((pt >> 32) & 0xFFFFFFFF)
+        if not (0 <= x < w.cl[2] - w.cl[0] and 0 <= y < w.cl[3] - w.cl[1]):
+            return 0
+        for ch in w.children:
+            if ch.dead:
+                continue
+            if flags & 1 and not (ch.style & WS_VISIBLE):
+                continue
+            if flags & 2 and ch.style & WS_DISABLED:
+                continue
+            if ch.x <= x < ch.x + ch.w and ch.y <= y < ch.y + ch.h:
+                return ch.hwnd
+        return w.hwnd
+
+    reg("ChildWindowFromPoint", "pQ", "p")(lambda c, h, pt: _child_from_point(h, pt, 0))
+    reg("ChildWindowFromPointEx", "pQu", "p")(lambda c, h, pt, f: _child_from_point(h, pt, f))
+    reg("RealChildWindowFromPoint", "pQ", "p")(lambda c, h, pt: _child_from_point(h, pt, 1))
+
+    # ---- geometry ---------------------------------------------------------------------------
+    @reg("GetClientRect", "pp")
+    def _gcr(c, h, r):
+        w = W(h)
+        if w is None or not r:
+            return err(1400)
+        _wr_rect(M_, r, wm.client_rect(w))
+        return 1
+
+    @reg("GetWindowRect", "pp")
+    def _gwr(c, h, r):
+        w = W(h)
+        if w is None or not r:
+            return err(1400)
+        x, y = wm.screen_origin(w)
+        _wr_rect(M_, r, (x, y, x + w.w, y + w.h))
+        return 1
+
+    @reg("ClientToScreen", "pp")
+    def _c2s(c, h, pt):
+        w = W(h)
+        if w is None:
+            return 0
+        x, y = struct.unpack("<ii", M_.read(pt, 8))
+        ox, oy = wm.client_origin(w)
+        M_.write(pt, struct.pack("<ii", x + ox, y + oy))
+        return 1
+
+    @reg("ScreenToClient", "pp")
+    def _s2c(c, h, pt):
+        w = W(h)
+        if w is None:
+            return 0
+        x, y = struct.unpack("<ii", M_.read(pt, 8))
+        ox, oy = wm.client_origin(w)
+        M_.write(pt, struct.pack("<ii", x - ox, y - oy))
+        return 1
+
+    reg("LogicalToPhysicalPoint PhysicalToLogicalPoint LogicalToPhysicalPointForPerMonitorDPI "
+        "PhysicalToLogicalPointForPerMonitorDPI", "pp")(lambda c, h, pt: 1)
+
+    @reg("MapWindowPoints", "pppu")
+    def _mwp(c, hf, ht, pts, n):
+        wf, wt = W(hf), W(ht)
+        fx, fy = wm.client_origin(wf) if wf is not None else (0, 0)
+        tx, ty = wm.client_origin(wt) if wt is not None else (0, 0)
+        dx, dy = fx - tx, fy - ty
+        for i in range(n):
+            x, y = struct.unpack("<ii", M_.read(pts + 8 * i, 8))
+            M_.write(pts + 8 * i, struct.pack("<ii", x + dx, y + dy))
+        return ((dy & 0xFFFF) << 16) | (dx & 0xFFFF)
+
+    def _adjust(c, r, style, menu, ex):
+        tmp = _Wnd(0)
+        tmp.style, tmp.exstyle = style & ~WS_VSCROLL & ~WS_HSCROLL, ex
+        tmp.menu = 0
+        L = _nc_layout(wm, tmp)
+        l, t, rr, b = _rd_rect(M_, r)
+        top = L["b"] + L["cap"] + (_M["menu"] if menu else 0) + L["ce"]
+        side = L["b"] + L["ce"]
+        _wr_rect(M_, r, (l - side, t - top, rr + side, b + side))
+        return 1
+
+    reg("AdjustWindowRect", "pui")(lambda c, r, s, m: _adjust(c, r, s, m, 0))
+    reg("AdjustWindowRectEx", "puiu")(lambda c, r, s, m, e: _adjust(c, r, s, m, e))
+    reg("AdjustWindowRectExForDpi", "puiuu")(lambda c, r, s, m, e, d: _adjust(c, r, s, m, e))
+
+    @reg("GetWindowPlacement", "pp")
+    def _gwpl(c, h, a):
+        w = W(h)
+        if w is None:
+            return 0
+        x, y = w.x, w.y
+        rest = w.restore or (w.x, w.y, w.w, w.h)
+        show = {0: 1, 1: 2, 2: 3}[w.min_state]
+        M_.write(a, struct.pack("<IIIiiiiiiii", 44, 0, show, -1, -1, -1, -1, rest[0], rest[1],
+                                rest[0] + rest[2], rest[1] + rest[3]))
+        return 1
+
+    @reg("SetWindowPlacement", "pp")
+    def _swpl(c, h, a):
+        w = W(h)
+        if w is None:
+            return 0
+        _len, fl, show, _a, _b, _c, _d, l, t, r, b = struct.unpack("<IIIiiiiiiii", M_.read(a, 44))
+        if w.min_state:
+            w.restore = (l, t, r - l, b - t)
+        else:
+            wm.set_pos(w, 0, l, t, r - l, b - t, SWP_NOZORDER | SWP_NOACTIVATE)
+        wm.show(w, show)
+        return 1
+
+    @reg("GetWindowInfo", "pp")
+    def _gwi(c, h, a):
+        w = W(h)
+        if w is None:
+            return 0
+        x, y = wm.screen_origin(w)
+        cx, cy = wm.client_origin(w)
+        L = _nc_layout(wm, w)
+        M_.write(a, struct.pack("<Iiiiiiiii", 60, x, y, x + w.w, y + w.h, cx, cy,
+                                cx + w.cl[2] - w.cl[0], cy + w.cl[3] - w.cl[1]) +
+                 struct.pack("<IIIII", w.style, w.exstyle, 1 if wm.active == h else 0,
+                             L["b"], L["b"]) +
+                 struct.pack("<HH", w.cls.atom if w.cls else 0, 0x0500))
+        return 1
+
+    @reg("GetTitleBarInfo", "pp")
+    def _gtbi(c, h, a):
+        w = W(h)
+        if w is None:
+            return 0
+        x, y = wm.screen_origin(w)
+        L = _nc_layout(wm, w)
+        cap = L["caption"] or (0, 0, 0, 0)
+        M_.write(a + 4, struct.pack("<iiii", x + cap[0], y + cap[1], x + cap[2], y + cap[3]) +
+                 bytes(24))
+        return 1
+
+    @reg("CloseWindow", "p")
+    def _closewin(c, h):
+        w = W(h)
+        if w is None:
+            return 0
+        wm.show(w, 6)
+        return 1
+
+    @reg("OpenIcon", "p")
+    def _openicon(c, h):
+        w = W(h)
+        if w is None:
+            return 0
+        wm.show(w, 9)
+        return 1
+
+    reg("ArrangeIconicWindows", "p")(lambda c, h: 0)
+    reg("TileWindows CascadeWindows", "puppp")(lambda c, *a: 0)
+    reg("FlashWindow", "pi")(lambda c, h, inv: 1)
+    reg("FlashWindowEx", "p")(lambda c, a: 1)
+
+    @reg("AnimateWindow", "puu")
+    def _animwin(c, h, t, flags):
+        w = W(h)
+        if w is None:
+            return 0
+        wm.show(w, 0 if flags & 0x10000 else (4 if flags & 0x20000 == 0 else 5))
+        return 1
+
+    @reg("SetWindowRgn", "ppi")
+    def _swrgn(c, h, hr, redraw):
+        w = W(h)
+        if w is None:
+            return 0
+        g = gdi.get(hr, "region")
+        w.rgn = list(g.rects) if g is not None else None
+        if g is not None:
+            gdi.objs.pop(hr & 0xFFFFFFFF, None)
+        if redraw:
+            wm.invalidate(w, None, True, True, True)
+        return 1
+
+    @reg("GetWindowRgn", "pp")
+    def _gwrgn(c, h, hr):
+        w = W(h)
+        g = gdi.get(hr, "region")
+        if w is None or g is None or w.rgn is None:
+            return 0
+        g.rects = list(w.rgn)
+        return g.complexity()
+
+    @reg("GetWindowRgnBox", "pp")
+    def _gwrgnbox(c, h, r):
+        w = W(h)
+        if w is None or w.rgn is None:
+            return 0
+        g = _GRgn(w.rgn)
+        _wr_rect(M_, r, g.box())
+        return g.complexity()
+
+    @reg("SetLayeredWindowAttributes", "puuu")
+    def _slwa(c, h, key, alpha, flags):
+        w = W(h)
+        if w is None:
+            return 0
+        w.layered = (key, alpha, flags)
+        wm.surface_dirty(h)
+        return 1
+
+    @reg("GetLayeredWindowAttributes", "pppp")
+    def _glwa(c, h, key, alpha, flags):
+        w = W(h)
+        if w is None or w.layered is None:
+            return 0
+        k_, a_, f_ = w.layered
+        if key:
+            M_.write32(key, k_)
+        if alpha:
+            M_.write8(alpha, a_)
+        if flags:
+            M_.write32(flags, f_)
+        return 1
+
+    @reg("UpdateLayeredWindow", "pppppppup")
+    def _ulw(c, h, hdst, pt, size, hsrc, ptsrc, key, blend, flags):
+        w = W(h)
+        if w is None:
+            return 0
+        if pt:
+            x, y = struct.unpack("<ii", M_.read(pt, 8))
+            wm.set_pos(w, 0, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+        if size:
+            cx, cy = struct.unpack("<ii", M_.read(size, 8))
+            wm.set_pos(w, 0, 0, 0, cx, cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)
+        src = gdi.get(hsrc, "dc")
+        if src is not None and w.surf is not None:
+            sx, sy = struct.unpack("<ii", M_.read(ptsrc, 8)) if ptsrc else (0, 0)
+            ssurf, sox, soy, _cl, sbm = gdi.begin(src)
+            for j in range(w.h):
+                yy = sy + soy + j
+                if 0 <= yy < ssurf.h:
+                    a0 = sx + sox
+                    n = max(0, min(w.w, ssurf.w - a0))
+                    w.surf.px[j * w.w * 4:(j * w.w + n) * 4] = \
+                        ssurf.px[(yy * ssurf.w + a0) * 4:(yy * ssurf.w + a0 + n) * 4]
+            w.surf.rev += 1
+            w.layered = (key, 255, 2)
+        return 1
+
+    reg("UpdateLayeredWindowIndirect", "pp")(lambda c, h, info: 1)
+
+    @reg("GetWindowModuleFileNameA", "ppu")
+    def _gwmfa(c, h, buf, n):
+        return wm.put_str(buf, n, p.vfs.to_guest_path(p.exe_host_path) if hasattr(p, "exe_host_path")
+                          else "C:\\app.exe", False)
+
+    @reg("GetWindowModuleFileNameW", "ppu")
+    def _gwmfw(c, h, buf, n):
+        return wm.put_str(buf, n, "C:\\app.exe", True)
+
+    # ---- window text -------------------------------------------------------------------------
+    @reg("SetWindowTextA", "pp")
+    def _swta(c, h, s):
+        w = W(h)
+        if w is None:
+            return err(1400)
+        wm.send(h, WM_SETTEXT, 0, s, False)
+        return 1
+
+    @reg("SetWindowTextW", "pp")
+    def _swtw(c, h, s):
+        w = W(h)
+        if w is None:
+            return err(1400)
+        wm.send(h, WM_SETTEXT, 0, s, True)
+        return 1
+
+    def _gwt(c, h, buf, n, wide):
+        w = W(h)
+        if w is None:
+            if buf and n > 0:
+                M_.write(buf, b"\0\0" if wide else b"\0")
+            return err(1400)
+        if w.tid != wm.cur_tid() and False:
+            return wm.put_str(buf, n, w.text, wide)
+        return wm.send(h, WM_GETTEXT, n, buf, wide) if n > 0 and buf else 0
+
+    reg("GetWindowTextA", "ppi")(lambda c, h, b, n: _gwt(c, h, b, n, False))
+    reg("GetWindowTextW", "ppi")(lambda c, h, b, n: _gwt(c, h, b, n, True))
+    reg("InternalGetWindowText", "ppi")(lambda c, h, b, n: wm.put_str(b, n, (W(h).text if W(h) else ""), True))
+
+    @reg("GetWindowTextLengthA", "p")
+    def _gwtla(c, h):
+        w = W(h)
+        return wm.send(h, WM_GETTEXTLENGTH, 0, 0, False) if w is not None else 0
+
+    @reg("GetWindowTextLengthW", "p")
+    def _gwtlw(c, h):
+        w = W(h)
+        return wm.send(h, WM_GETTEXTLENGTH, 0, 0, True) if w is not None else 0
+
+    # ---- window longs --------------------------------------------------------------------------
+    def _wlong(c, h, idx, val, set_, wide, ptr):
+        w = W(h)
+        if w is None:
+            return err(1400)
+        size = 8 if ptr and wm.ps == 8 else 4
+        if idx >= 0:
+            if idx + size > len(w.extra):
+                if w.py.get("dlg") and idx + size <= 64:
+                    w.extra.extend(bytes(idx + size - len(w.extra)))
+                else:
+                    return err(1413)                          # ERROR_INVALID_INDEX
+            old = int.from_bytes(w.extra[idx:idx + size], "little")
+            if set_:
+                w.extra[idx:idx + size] = (val & ((1 << (8 * size)) - 1)).to_bytes(size, "little")
+            return old
+        if idx == -4:                                         # GWLP_WNDPROC
+            old = w.proc
+            if set_:
+                w.proc = val
+                w.unicode = wide
+            return old
+        if idx == -6:
+            old = w.inst
+            if set_:
+                w.inst = val
+            return old
+        if idx == -8:
+            old = w.parent.hwnd if w.style & WS_CHILD and w.parent is not wm.desktop else w.owner
+            if set_ and not (w.style & WS_CHILD):
+                w.owner = val & 0xFFFFFFFF
+            return old
+        if idx == -12:
+            old = w.id if w.style & WS_CHILD else w.menu
+            if set_:
+                if w.style & WS_CHILD:
+                    w.id = val
+                else:
+                    w.menu = val
+            return old
+        if idx == -16:                                        # GWL_STYLE
+            old = w.style
+            if set_:
+                new = val & 0xFFFFFFFF
+                mark = wm.scratch_mark()
+                try:
+                    a = wm.scratch(struct.pack("<II", old, new))
+                    wm.send(h, WM_STYLECHANGING, 0xFFFFFFF0, a)
+                    new = M_.read32(a + 4)
+                    w.style = new
+                    if (old ^ new) & (WS_VSCROLL | WS_HSCROLL):
+                        wm.nc_calc(w)
+                    wm.changed()
+                    wm.send(h, WM_STYLECHANGED, 0xFFFFFFF0, a)
+                finally:
+                    wm.scratch_release(mark)
+            return old
+        if idx == -20:                                        # GWL_EXSTYLE
+            old = w.exstyle
+            if set_:
+                new = val & 0xFFFFFFFF
+                mark = wm.scratch_mark()
+                try:
+                    a = wm.scratch(struct.pack("<II", old, new))
+                    wm.send(h, WM_STYLECHANGING, 0xFFFFFFEC, a)
+                    w.exstyle = M_.read32(a + 4)
+                    wm.send(h, WM_STYLECHANGED, 0xFFFFFFEC, a)
+                finally:
+                    wm.scratch_release(mark)
+            return old
+        if idx == -21:                                        # GWLP_USERDATA
+            old = w.userdata
+            if set_:
+                w.userdata = val
+            return old
+        return err(1413)
+
+    reg("GetWindowLongA GetWindowWord", "pi")(lambda c, h, i: _wlong(c, h, i, 0, False, False, False))
+    reg("GetWindowLongW", "pi")(lambda c, h, i: _wlong(c, h, i, 0, False, True, False))
+    reg("GetWindowLongPtrA", "pi", "p")(lambda c, h, i: _wlong(c, h, i, 0, False, False, True))
+    reg("GetWindowLongPtrW", "pi", "p")(lambda c, h, i: _wlong(c, h, i, 0, False, True, True))
+    reg("SetWindowLongA SetWindowWord", "piu")(lambda c, h, i, v: _wlong(c, h, i, v, True, False, False))
+    reg("SetWindowLongW", "piu")(lambda c, h, i, v: _wlong(c, h, i, v, True, True, False))
+    reg("SetWindowLongPtrA", "pip", "p")(lambda c, h, i, v: _wlong(c, h, i, v, True, False, True))
+    reg("SetWindowLongPtrW", "pip", "p")(lambda c, h, i, v: _wlong(c, h, i, v, True, True, True))
+
+    # ---- properties --------------------------------------------------------------------------
+    def _prop_key(a, wide):
+        return a if a < 0x10000 else wm.gstr(a, wide).upper()
+
+    def _setprop(c, h, key, data, wide):
+        w = W(h)
+        if w is None:
+            return 0
+        w.props[_prop_key(key, wide)] = data
+        return 1
+
+    def _getprop(c, h, key, wide):
+        w = W(h)
+        return w.props.get(_prop_key(key, wide), 0) if w is not None else 0
+
+    def _remprop(c, h, key, wide):
+        w = W(h)
+        return w.props.pop(_prop_key(key, wide), 0) if w is not None else 0
+
+    reg("SetPropA", "ppp")(lambda c, h, k_, d: _setprop(c, h, k_, d, False))
+    reg("SetPropW", "ppp")(lambda c, h, k_, d: _setprop(c, h, k_, d, True))
+    reg("GetPropA", "pp", "p")(lambda c, h, k_: _getprop(c, h, k_, False))
+    reg("GetPropW", "pp", "p")(lambda c, h, k_: _getprop(c, h, k_, True))
+    reg("RemovePropA", "pp", "p")(lambda c, h, k_: _remprop(c, h, k_, False))
+    reg("RemovePropW", "pp", "p")(lambda c, h, k_: _remprop(c, h, k_, True))
+
+    def _enumprops(c, h, proc, lp, ex, wide):
+        w = W(h)
+        if w is None:
+            return -1
+        r = -1
+        for key, val in list(w.props.items()):
+            mark = wm.scratch_mark()
+            try:
+                if isinstance(key, int):
+                    ka = key
+                else:
+                    ka = wm.scratch((key.encode("utf-16-le") + b"\0\0") if wide else key.encode() + b"\0")
+                args = [h, ka, val, lp] if ex else [h, ka, val]
+                r = _s32(p.call_guest(proc, args) & 0xFFFFFFFF)
+            finally:
+                wm.scratch_release(mark)
+            if not r:
+                break
+        return r
+
+    reg("EnumPropsA", "pp")(lambda c, h, pr: _enumprops(c, h, pr, 0, False, False))
+    reg("EnumPropsW", "pp")(lambda c, h, pr: _enumprops(c, h, pr, 0, False, True))
+    reg("EnumPropsExA", "ppp")(lambda c, h, pr, lp: _enumprops(c, h, pr, lp, True, False))
+    reg("EnumPropsExW", "ppp")(lambda c, h, pr, lp: _enumprops(c, h, pr, lp, True, True))
+
+    # ---- messages -------------------------------------------------------------------------------
+    def _getmsg(c, ptr, hwnd, lo, hi, wide):
+        hwnd &= 0xFFFFFFFF
+        m = wm.peek(hwnd, lo, hi, True)
+        if m is None:
+            if not wm.wins or len(wm.wins) <= 1 and not wm.queue().posted and \
+                    wm.queue().quit is None and not wm.queue().timers:
+                # a message loop with no windows and nothing that could ever arrive
+                if getattr(p, "gui_no_window_quit", True) and not getattr(k, "threads_can_post", 0):
+                    if not any(t is not p.current_thread and t.state != "dead" for t in p.threads):
+                        m = {"hwnd": 0, "msg": 0x12, "w": 0, "l": 0, "time": wm.tick(),
+                             "pt": wm.cursor_pos}
+            if m is None:
+                _block(c, "msg", ptr, hwnd, lo, hi, wide)
+        _deliver(c, ptr, m)
+        if m["msg"] == 0x12:
+            return 0
+        return 1
+
+    reg("GetMessageA", "ppuu")(lambda c, pt, h, lo, hi: _getmsg(c, pt, h, lo, hi, False))
+    reg("GetMessageW", "ppuu")(lambda c, pt, h, lo, hi: _getmsg(c, pt, h, lo, hi, True))
+
+    def _peekmsg(c, ptr, hwnd, lo, hi, flags, wide):
+        disp = wm.display
+        if disp is not None:
+            disp.maybe_pump()
+        m = wm.peek(hwnd & 0xFFFFFFFF, lo, hi, bool(flags & 1), flags)
+        if m is None:
+            wm.idle_peeks = getattr(wm, "idle_peeks", 0) + 1
+            if wm.idle_peeks % 64 == 0:
+                p.yield_now()
+            return 0
+        wm.idle_peeks = 0
+        _deliver(c, ptr, m)
+        return 1
+
+    reg("PeekMessageA", "ppuuu")(lambda c, pt, h, lo, hi, f: _peekmsg(c, pt, h, lo, hi, f, False))
+    reg("PeekMessageW", "ppuuu")(lambda c, pt, h, lo, hi, f: _peekmsg(c, pt, h, lo, hi, f, True))
+
+    @reg("WaitMessage", "")
+    def _waitmsg(c):
+        if wm.wait_ready(wm.cur_tid(), (0, 0, 0, 0xFFFF)):
+            return 1
+        _block(c, "waitmsg", 0xFFFF)
+
+    def _msgwait(c, handles, wait_all, timeout, mask):
+        if handles:
+            r = k._try_wait(handles, wait_all, p.current_thread.tid)
+            if r is not None:
+                return r
+        if wm.wait_ready(wm.cur_tid(), (0, 0, 0, mask)):
+            return len(handles)
+        if timeout == 0:
+            return 0x102
+        deadline = None if timeout == INFINITE else time.monotonic() + timeout / 1000.0
+        t = p.current_thread
+        nt = wm.next_timer(t.tid)
+        dl = deadline if nt is None else (nt if deadline is None else min(deadline, nt))
+        t.state = "guiwait"
+        t.waiting_on = ("msgwait", handles, wait_all, mask, deadline if nt is None else dl)
+        if nt is not None and (deadline is None or nt < deadline):
+            t.waiting_on = ("msgwait", handles, wait_all, mask, deadline)
+        c.regs[RAX] = 0x102
+        raise NOOYield()
+
+    @reg("MsgWaitForMultipleObjects", "upiuu")
+    def _mwfmo(c, n, hs, wait_all, timeout, mask):
+        handles = [wm.rp(hs + wm.ps * i) for i in range(n)] if n else []
+        return _msgwait(c, handles, bool(wait_all), timeout, mask)
+
+    @reg("MsgWaitForMultipleObjectsEx", "upuuu")
+    def _mwfmoex(c, n, hs, timeout, mask, flags):
+        handles = [wm.rp(hs + wm.ps * i) for i in range(n)] if n else []
+        return _msgwait(c, handles, bool(flags & 1), timeout, mask)
+
+    @reg("GetQueueStatus", "u")
+    def _gqs(c, flags):
+        q = wm.queue()
+        wm.process_raw_input()
+        st = 0
+        if q.posted:
+            st |= 0x8
+        if q.input:
+            st |= 0x7
+        if wm.has_paint(q.tid):
+            st |= 0x20
+        if any(t["next"] <= time.monotonic() for t in q.timers):
+            st |= 0x10
+        st &= flags
+        return (st << 16) | st
+
+    @reg("GetInputState", "")
+    def _gis(c):
+        wm.process_raw_input()
+        return 1 if wm.queue().input else 0
+
+    @reg("PostMessageA", "pupp")
+    def _posta(c, h, m, w_, l_):
+        h &= 0xFFFFFFFF
+        if h == 0xFFFF:                                       # HWND_BROADCAST
+            for t in wm.desktop.children:
+                wm.post(t.hwnd, m, w_, l_)
+            return 1
+        if h and W(h) is None:
+            return err(1400)
+        if not h:
+            wm.post(0, m, w_, l_, wm.cur_tid())
+            return 1
+        return 1 if wm.post(h, m, w_, l_) else 0
+
+    reg("PostMessageW", "pupp")(lambda c, h, m, w_, l_: _posta(c, h, m, w_, l_))
+
+    @reg("PostThreadMessageA PostThreadMessageW", "uupp")
+    def _ptm(c, tid, m, w_, l_):
+        if not any(t.tid == tid and t.state != "dead" for t in p.threads):
+            return err(1444)
+        wm.post(0, m, w_, l_, tid)
+        return 1
+
+    @reg("PostQuitMessage", "i", "v")
+    def _pqm(c, code):
+        wm.post_quit(code)
+
+    def _send(c, h, m, w_, l_, wide):
+        h &= 0xFFFFFFFF
+        if h == 0xFFFF:
+            for t in list(wm.desktop.children):
+                wm.send(t.hwnd, m, w_, l_, wide)
+            return 0
+        w = W(h)
+        if w is None:
+            return err(1400)
+        return wm.send(h, m, w_, l_, wide)
+
+    reg("SendMessageA", "pupp", "p")(lambda c, h, m, w_, l_: _send(c, h, m, w_, l_, False))
+    reg("SendMessageW", "pupp", "p")(lambda c, h, m, w_, l_: _send(c, h, m, w_, l_, True))
+
+    def _send_timeout(c, h, m, w_, l_, fl, to, res, wide):
+        r = _send(c, h, m, w_, l_, wide)
+        if res:
+            wm.wp(res, r)
+        return 1 if W(h) is not None or (h & 0xFFFFFFFF) == 0xFFFF else 0
+
+    reg("SendMessageTimeoutA", "puppuup", "p")(lambda c, h, m, w_, l_, f, t, r: _send_timeout(c, h, m, w_, l_, f, t, r, False))
+    reg("SendMessageTimeoutW", "puppuup", "p")(lambda c, h, m, w_, l_, f, t, r: _send_timeout(c, h, m, w_, l_, f, t, r, True))
+    reg("SendNotifyMessageA", "pupp")(lambda c, h, m, w_, l_: (_send(c, h, m, w_, l_, False), 1)[1])
+    reg("SendNotifyMessageW", "pupp")(lambda c, h, m, w_, l_: (_send(c, h, m, w_, l_, True), 1)[1])
+
+    @reg("SendMessageCallbackA SendMessageCallbackW", "pupppp")
+    def _smcb(c, h, m, w_, l_, cb, data):
+        r = _send(c, h, m, w_, l_, True)
+        if cb:
+            p.call_guest(cb, [h, m, data, r])
+        return 1
+
+    reg("InSendMessage", "")(lambda c: 0)
+    reg("InSendMessageEx", "p")(lambda c, r: 0)
+    reg("ReplyMessage", "p")(lambda c, r: 0)
+
+    @reg("BroadcastSystemMessageA BroadcastSystemMessageW BroadcastSystemMessage", "uppp")
+    def _bsm(c, fl, recip, m, w_):
+        return 1
+
+    reg("BroadcastSystemMessageExA BroadcastSystemMessageExW", "upuppp")(lambda c, *a: 1)
+
+    @reg("GetMessagePos", "")
+    def _gmp(c):
+        x, y = wm.queue().last_pos
+        return _lparam_xy(x, y)
+
+    @reg("GetMessageTime", "")
+    def _gmt(c):
+        return wm.queue().last_msg_time
+
+    reg("GetMessageExtraInfo", "", "p")(lambda c: 0)
+    reg("SetMessageExtraInfo", "p", "p")(lambda c, v: 0)
+
+    def _regmsg(c, a, wide):
+        name = wm.gstr(a, wide).upper()
+        if not name:
+            return 0
+        v = wm.msg_names.get(name)
+        if v is None:
+            v = wm.msg_names[name] = wm.next_msg_id
+            wm.next_msg_id += 1
+        return v
+
+    reg("RegisterWindowMessageA", "p")(lambda c, a: _regmsg(c, a, False))
+    reg("RegisterWindowMessageW", "p")(lambda c, a: _regmsg(c, a, True))
+
+    @reg("TranslateMessage", "p")
+    def _translate(c, a):
+        if not a:
+            return 0
+        m = _read_msg_rec(wm, a)
+        return 1 if _translate_py(wm, m) else 0
+
+    reg("TranslateMessageEx", "pu")(lambda c, a, f: _translate(c, a))
+
+    def _dispatch(c, a, wide):
+        if not a:
+            return 0
+        m = _read_msg_rec(wm, a)
+        msg = m["msg"]
+        if msg in (0x113, 0x118) and m["l"]:
+            return wm.call_proc(m["l"], m["hwnd"], msg, m["w"], wm.tick(), wide, target_wide=wide)
+        w = W(m["hwnd"])
+        if w is None:
+            return 0
+        if msg == 0xF:
+            return _wm_paint_dispatch(wm, w)
+        return wm.send(w.hwnd, msg, m["w"], m["l"], wide)
+
+    reg("DispatchMessageA", "p", "p")(lambda c, a: _dispatch(c, a, False))
+    reg("DispatchMessageW", "p", "p")(lambda c, a: _dispatch(c, a, True))
+
+    def _callwndproc(c, proc, h, m, w_, l_, wide):
+        return wm.call_proc(proc, h & 0xFFFFFFFF, m, w_, l_, wide, target_wide=wide)
+
+    reg("CallWindowProcA", "ppupp", "p")(lambda c, pr, h, m, w_, l_: _callwndproc(c, pr, h, m, w_, l_, False))
+    reg("CallWindowProcW", "ppupp", "p")(lambda c, pr, h, m, w_, l_: _callwndproc(c, pr, h, m, w_, l_, True))
+
+    # ---- timers -----------------------------------------------------------------------------
+    def _settimer(c, h, tid_, elapse, proc, sys_=False):
+        h &= 0xFFFFFFFF
+        if h and W(h) is None:
+            return err(1400)
+        w = W(h)
+        q = wm.queue(w.tid if w is not None else None)
+        if not h:
+            ex = [t for t in q.timers if t["hwnd"] == 0 and t["id"] == tid_] if tid_ else []
+            if not ex:
+                wm.next_timer_id = getattr(wm, "next_timer_id", 0x7FFF) + 1
+                tid_ = wm.next_timer_id
+        interval = max(10, min(elapse & 0xFFFFFFFF, 0x7FFFFFFF)) / 1000.0
+        q.timers = [t for t in q.timers if not (t["hwnd"] == h and t["id"] == tid_)]
+        q.timers.append({"hwnd": h, "id": tid_, "interval": interval,
+                         "next": time.monotonic() + interval, "proc": proc, "sys": sys_})
+        return tid_ if tid_ else 1
+
+    reg("SetTimer", "ppup", "p")(lambda c, h, i, e, pr: _settimer(c, h, i, e, pr))
+    reg("SetCoalescableTimer", "ppupu", "p")(lambda c, h, i, e, pr, tol: _settimer(c, h, i, e, pr))
+    reg("SetSystemTimer", "ppup", "p")(lambda c, h, i, e, pr: _settimer(c, h, i, e, pr, True))
+
+    @reg("KillTimer KillSystemTimer", "pp")
+    def _killtimer(c, h, tid_):
+        h &= 0xFFFFFFFF
+        for q in wm.queues.values():
+            n = len(q.timers)
+            q.timers = [t for t in q.timers if not (t["hwnd"] == h and t["id"] == tid_)]
+            if len(q.timers) != n:
+                return 1
+        return err(1402)
+
+    # ---- painting / DCs -----------------------------------------------------------------------
+    def _window_dc(h, client):
+        w = W(h)
+        if h and w is None:
+            return 0
+        if not h or w is wm.desktop:
+            dc = gdi.new_dc("screen")
+            return dc.h
+        if client and w.cls is not None and w.cls.style & 0x20:    # CS_OWNDC
+            if w.own_dc and gdi.get(w.own_dc, "dc") is not None:
+                return w.own_dc
+            dc = gdi.new_dc("client", h)
+            w.own_dc = dc.h
+            return dc.h
+        dc = gdi.new_dc("client" if client else "window", h)
+        return dc.h
+
+    reg("GetDC", "p", "p")(lambda c, h: _window_dc(h & 0xFFFFFFFF, True))
+    reg("GetWindowDC", "p", "p")(lambda c, h: _window_dc(h & 0xFFFFFFFF, False))
+
+    @reg("GetDCEx", "ppu", "p")
+    def _getdcex(c, h, hr, flags):
+        hdc = _window_dc(h & 0xFFFFFFFF, not (flags & 1))
+        dc = gdi.get(hdc, "dc")
+        g = gdi.get(hr, "region") if hr and hr != 1 else None
+        if dc is not None and g is not None:
+            w = W(h)
+            if flags & 0x80:                                   # DCX_INTERSECTRGN
+                # the region is in screen coordinates for NC painting
+                ox, oy = wm.dc_screen_origin(h, not (flags & 1)) if w else (0, 0)
+                dc.clip = [(l - ox, t - oy, r - ox, b - oy) for (l, t, r, b) in g.rects]
+                dc.changed()
+            elif flags & 0x40:                                 # DCX_EXCLUDERGN
+                ox, oy = wm.dc_screen_origin(h, not (flags & 1)) if w else (0, 0)
+                cur = [(-100000, -100000, 100000, 100000)]
+                for (l, t, r, b) in g.rects:
+                    cur = _rects_sub(cur, (l - ox, t - oy, r - ox, b - oy))
+                dc.clip = cur
+                dc.changed()
+        return hdc
+
+    @reg("ReleaseDC", "pp")
+    def _releasedc(c, h, hdc):
+        dc = gdi.get(hdc, "dc")
+        if dc is None:
+            return 0
+        w = W(h)
+        if w is not None and w.own_dc == hdc:
+            return 1
+        if dc.dckind in ("client", "window", "screen"):
+            gdi.objs.pop(hdc & 0xFFFFFFFF, None)
+        return 1
+
+    @reg("WindowFromDC", "p", "p")
+    def _wfdc(c, hdc):
+        dc = gdi.get(hdc, "dc")
+        return dc.hwnd if dc is not None else 0
+
+    @reg("BeginPaint", "pp", "p")
+    def _beginpaint(c, h, ps):
+        w = W(h)
+        if w is None:
+            return err(1400)
+        wm.caret_hide(h)
+        w.py["paint_caret"] = True
+        if w.ncdirty:
+            w.ncdirty = False
+            wm.send(h, WM_NCPAINT, 1, 0)
+        rects = list(w.update)
+        erase = w.erase
+        wm.validate(w)
+        dc = gdi.new_dc("client", h)
+        dc.paint = rects
+        f_erase = 0
+        if erase and rects:
+            r = wm.send(h, 0x0014, dc.h, 0)
+            f_erase = 0 if (r & 0xFFFFFFFF) else 1
+        box = _GRgn(rects).box() if rects else (0, 0, 0, 0)
+        if ps:
+            if wm.ps == 8:
+                M_.write(ps, struct.pack("<QIiiii", dc.h, f_erase, *box) + bytes(40))
+            else:
+                M_.write(ps, struct.pack("<IIiiii", dc.h, f_erase, *box) + bytes(40))
+        return dc.h
+
+    @reg("EndPaint", "pp")
+    def _endpaint(c, h, ps):
+        hdc = wm.rp(ps) if ps else 0
+        gdi.objs.pop(hdc & 0xFFFFFFFF, None)
+        w = W(h)
+        if w is not None and w.py.pop("paint_caret", False):
+            wm.caret_show(h)
+        return 1
+
+    @reg("PrintWindow", "ppu")
+    def _printwin(c, h, hdc, flags):
+        w = W(h)
+        dc = gdi.get(hdc, "dc")
+        if w is None or dc is None:
+            return 0
+        top = wm.top(w)
+        if top.surf is None:
+            return 0
+        ox, oy = wm.surf_origin(w)
+        src = _DC(gdi, "window", h)
+        gdi.add(src)
+        try:
+            _blit(dc, 0, 0, w.w, w.h, src, 0, 0, 0xCC0020)
+        finally:
+            gdi.objs.pop(src.h, None)
+        return 1
+
+    # ---- scrolling ------------------------------------------------------------------------------
+    def _scroll_surface(w, dx, dy, rect, clip_rect):
+        """Move pixels of w's client area (scroll) and invalidate the exposed strip."""
+        cr = wm.client_rect(w)
+        area = rect or cr
+        if clip_rect:
+            area = _rect_and(area, clip_rect) or (0, 0, 0, 0)
+        l, t, r, b = area
+        if l >= r or t >= b:
+            return []
+        dc = _DC(gdi, "client", w.hwnd)
+        gdi.add(dc)
+        try:
+            if clip_rect:
+                dc.clip = [clip_rect]
+            dc.changed()
+            _blit(dc, l + dx, t + dy, r - l, b - t, dc, l, t, 0xCC0020)
+        finally:
+            gdi.objs.pop(dc.h, None)
+        exposed = _rects_sub([area], (l + dx, t + dy, r + dx, b + dy))
+        return exposed
+
+    @reg("ScrollWindow", "piipp")
+    def _scrollwin(c, h, dx, dy, r, clip):
+        w = W(h)
+        if w is None:
+            return 0
+        rect = _rd_rect(M_, r) if r else None
+        cr = _rd_rect(M_, clip) if clip else None
+        exposed = _scroll_surface(w, dx, dy, rect, cr)
+        if not r:
+            for ch in w.children:
+                wm.set_pos(ch, 0, ch.x + dx, ch.y + dy, 0, 0,
+                           SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW)
+                wm.invalidate(ch, None, True, True, True)
+        wm.caret_set_pos(wm.caret["hwnd"], wm.caret["x"] + dx, wm.caret["y"] + dy) \
+            if wm.caret["hwnd"] == h else None
+        wm.invalidate(w, exposed, True, False)
+        return 1
+
+    @reg("ScrollWindowEx", "piippppu")
+    def _scrollwinex(c, h, dx, dy, r, clip, hrgn, upd, flags):
+        w = W(h)
+        if w is None:
+            return 0
+        rect = _rd_rect(M_, r) if r else None
+        cr = _rd_rect(M_, clip) if clip else None
+        exposed = _scroll_surface(w, dx, dy, rect, cr)
+        if flags & 1:                                        # SW_SCROLLCHILDREN
+            for ch in w.children:
+                wm.set_pos(ch, 0, ch.x + dx, ch.y + dy, 0, 0,
+                           SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW)
+                wm.invalidate(ch, None, True, True, True)
+        g = gdi.get(hrgn, "region") if hrgn else None
+        if g is not None:
+            g.rects = list(exposed)
+        if upd:
+            _wr_rect(M_, upd, _GRgn(exposed).box())
+        if flags & 2:                                        # SW_INVALIDATE
+            wm.invalidate(w, exposed, bool(flags & 4), bool(flags & 1))
+        return 2 if exposed else 1
+
+    @reg("ScrollDC", "piipppp")
+    def _scrolldc(c, hdc, dx, dy, r, clip, hrgn, upd):
+        dc = gdi.get(hdc, "dc")
+        if dc is None:
+            return 0
+        surf, ox, oy, vis, bm = dc.target()
+        area = _rd_rect(M_, r) if r else (0, 0, surf.w - ox, surf.h - oy)
+        l, t, rr, b = area
+        _blit(dc, l + dx, t + dy, rr - l, b - t, dc, l, t, 0xCC0020)
+        exposed = _rects_sub([area], (l + dx, t + dy, rr + dx, b + dy))
+        g = gdi.get(hrgn, "region") if hrgn else None
+        if g is not None:
+            g.rects = exposed
+        if upd:
+            _wr_rect(M_, upd, _GRgn(exposed).box())
+        return 1
+
+    # ---- scroll bars -----------------------------------------------------------------------
+    @reg("SetScrollInfo", "pipi")
+    def _ssi(c, h, bar, a, redraw):
+        w = W(h)
+        if w is None or not a:
+            return 0
+        if bar == 2:
+            return wm.send(h, 0xE9, redraw, a)
+        return _scrollinfo_set(wm, w, bar, a, bool(redraw))
+
+    @reg("GetScrollInfo", "pip")
+    def _gsi(c, h, bar, a):
+        w = W(h)
+        if w is None or not a:
+            return 0
+        return _scrollinfo_get(wm, w, bar, a)
+
+    @reg("SetScrollPos", "piii")
+    def _ssp(c, h, bar, pos, redraw):
+        w = W(h)
+        if w is None:
+            return 0
+        info = _sb_info(w, bar)
+        old = info[3]
+        _sb_set(wm, w, bar, 4, 0, 0, 0, pos, bool(redraw))
+        return old
+
+    @reg("GetScrollPos", "pi")
+    def _gsp(c, h, bar):
+        w = W(h)
+        return _sb_info(w, bar)[3] if w is not None else 0
+
+    @reg("SetScrollRange", "piiii")
+    def _ssr(c, h, bar, mn, mx, redraw):
+        w = W(h)
+        if w is None:
+            return 0
+        _sb_set(wm, w, bar, 1, mn, mx, 0, 0, bool(redraw))
+        return 1
+
+    @reg("GetScrollRange", "pipp")
+    def _gsr(c, h, bar, mn, mx):
+        w = W(h)
+        if w is None:
+            return 0
+        info = _sb_info(w, bar)
+        if mn:
+            M_.write32(mn, info[0] & 0xFFFFFFFF)
+        if mx:
+            M_.write32(mx, info[1] & 0xFFFFFFFF)
+        return 1
+
+    @reg("ShowScrollBar", "pii")
+    def _showsb(c, h, bar, show):
+        w = W(h)
+        if w is None:
+            return 0
+        flags = {0: WS_HSCROLL, 1: WS_VSCROLL, 3: WS_HSCROLL | WS_VSCROLL}.get(bar, 0)
+        if bar == 2:
+            wm.show(w, 5 if show else 0)
+            return 1
+        new = (w.style | flags) if show else (w.style & ~flags)
+        if new != w.style:
+            w.style = new
+            wm.set_pos(w, 0, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER |
+                       SWP_NOACTIVATE | SWP_FRAMECHANGED)
+        return 1
+
+    @reg("EnableScrollBar", "puu")
+    def _esb(c, h, bar, arrows):
+        w = W(h)
+        if w is None:
+            return 0
+        for b in ((0, 1) if bar == 3 else (bar,)):
+            _sb_info(w, b)[5] = arrows != 3
+            _sb_redraw(wm, w, b)
+        return 1
+
+    @reg("GetScrollBarInfo", "pip")
+    def _gsbi(c, h, obj, a):
+        w = W(h)
+        if w is None:
+            return 0
+        M_.write(a + 4, bytes(56))
+        return 1
+
+    # ---- rectangles ------------------------------------------------------------------------
+    @reg("SetRect", "piiii")
+    def _setrect(c, r, l, t, rr, b):
+        if not r:
+            return 0
+        _wr_rect(M_, r, (l, t, rr, b))
+        return 1
+
+    @reg("SetRectEmpty", "p")
+    def _setrectempty(c, r):
+        if not r:
+            return 0
+        _wr_rect(M_, r, (0, 0, 0, 0))
+        return 1
+
+    @reg("CopyRect", "pp")
+    def _copyrect(c, d, s):
+        if not d or not s:
+            return 0
+        M_.write(d, M_.read(s, 16))
+        return 1
+
+    @reg("InflateRect", "pii")
+    def _inflate(c, r, dx, dy):
+        if not r:
+            return 0
+        l, t, rr, b = _rd_rect(M_, r)
+        _wr_rect(M_, r, (l - dx, t - dy, rr + dx, b + dy))
+        return 1
+
+    @reg("OffsetRect", "pii")
+    def _offset(c, r, dx, dy):
+        if not r:
+            return 0
+        l, t, rr, b = _rd_rect(M_, r)
+        _wr_rect(M_, r, (l + dx, t + dy, rr + dx, b + dy))
+        return 1
+
+    def _empty(r):
+        return r[0] >= r[2] or r[1] >= r[3]
+
+    @reg("IntersectRect", "ppp")
+    def _intersect(c, d, a, b):
+        ra, rb = _rd_rect(M_, a), _rd_rect(M_, b)
+        i = _rect_and(ra, rb)
+        _wr_rect(M_, d, i or (0, 0, 0, 0))
+        return 1 if i else 0
+
+    @reg("UnionRect", "ppp")
+    def _union(c, d, a, b):
+        ra, rb = _rd_rect(M_, a), _rd_rect(M_, b)
+        if _empty(ra) and _empty(rb):
+            _wr_rect(M_, d, (0, 0, 0, 0))
+            return 0
+        if _empty(ra):
+            u = rb
+        elif _empty(rb):
+            u = ra
+        else:
+            u = (min(ra[0], rb[0]), min(ra[1], rb[1]), max(ra[2], rb[2]), max(ra[3], rb[3]))
+        _wr_rect(M_, d, u)
+        return 1
+
+    @reg("SubtractRect", "ppp")
+    def _subtract(c, d, a, b):
+        ra, rb = _rd_rect(M_, a), _rd_rect(M_, b)
+        res = list(ra)
+        i = _rect_and(ra, rb)
+        if i:
+            if i[1] == ra[1] and i[3] == ra[3]:
+                if i[0] == ra[0]:
+                    res[0] = i[2]
+                elif i[2] == ra[2]:
+                    res[2] = i[0]
+            elif i[0] == ra[0] and i[2] == ra[2]:
+                if i[1] == ra[1]:
+                    res[1] = i[3]
+                elif i[3] == ra[3]:
+                    res[3] = i[1]
+        _wr_rect(M_, d, res)
+        return 0 if _empty(res) else 1
+
+    @reg("EqualRect", "pp")
+    def _equalrect(c, a, b):
+        return 1 if _rd_rect(M_, a) == _rd_rect(M_, b) else 0
+
+    @reg("IsRectEmpty", "p")
+    def _isrectempty(c, r):
+        return 1 if not r or _empty(_rd_rect(M_, r)) else 0
+
+    @reg("PtInRect", "pQ")
+    def _ptinrect(c, r, pt):
+        if not r:
+            return 0
+        x, y = _s32(pt & 0xFFFFFFFF), _s32((pt >> 32) & 0xFFFFFFFF)
+        l, t, rr, b = _rd_rect(M_, r)
+        return 1 if l <= x < rr and t <= y < b else 0
+
+    return wm
+
+
+# -- user32 API (part 2): drawing, icons, resources, menus, dialogs, input, system -------------
+
+def _user_install2(k):
+    R = k.reg
+    p = k.p
+    M_ = p.mem
+    wm = p.wm
+    gdi = p.gdi
+    U = ("user32.dll",)
+
+    def reg(names, sig="", ret="i", dlls=U):
+        return R(names, sig, ret, dlls=dlls)
+
+    def W(h):
+        return wm.wnd(h)
+
+    def err(e):
+        p.last_error = e
+        return 0
+
+    def DC(h):
+        return gdi.get(h, "dc")
+
+    # ---- drawing ----------------------------------------------------------------------------
+    @reg("FillRect", "ppp")
+    def _fillrect(c, hdc, r, hbr):
+        dc = DC(hdc)
+        br = gdi.brush(hbr)
+        if dc is None or not r or br is None:
+            return 0
+        l, t, rr, b = _rd_rect(M_, r)
+        surf, ox, oy, clip, bm = tg = gdi.begin(dc)
+        L, T, Rr, B = dc.rect(l, t, rr, b)
+        _fill_brush(dc, surf, clip, L + ox, T + oy, Rr + ox, B + oy, br, 13, ox, oy)
+        gdi.end(dc, tg)
+        return 1
+
+    @reg("FrameRect", "ppp")
+    def _framerect(c, hdc, r, hbr):
+        dc = DC(hdc)
+        br = gdi.brush(hbr)
+        if dc is None or not r or br is None:
+            return 0
+        l, t, rr, b = _rd_rect(M_, r)
+        if l >= rr or t >= b:
+            return 1
+        surf, ox, oy, clip, bm = tg = gdi.begin(dc)
+        L, T, Rr, B = dc.rect(l, t, rr, b)
+        for (a0, a1, a2, a3) in ((L, T, Rr, T + 1), (L, B - 1, Rr, B), (L, T, L + 1, B),
+                                 (Rr - 1, T, Rr, B)):
+            _fill_brush(dc, surf, clip, a0 + ox, a1 + oy, a2 + ox, a3 + oy, br, 13, ox, oy)
+        gdi.end(dc, tg)
+        return 1
+
+    @reg("InvertRect", "pp")
+    def _invertrect(c, hdc, r):
+        dc = DC(hdc)
+        if dc is None or not r:
+            return 0
+        l, t, rr, b = _rd_rect(M_, r)
+        return 1 if _blit(dc, l, t, rr - l, b - t, None, 0, 0, 0x550009) else 0
+
+    @reg("DrawFocusRect", "pp")
+    def _dfr(c, hdc, r):
+        dc = DC(hdc)
+        if dc is None or not r:
+            return 0
+        pt = _Painter(wm, dc=dc)
+        try:
+            _focus_rect(pt, *_rd_rect(M_, r))
+        finally:
+            pt.done()
+        return 1
+
+    @reg("DrawEdge", "ppuu")
+    def _drawedge(c, hdc, r, edge, flags):
+        dc = DC(hdc)
+        if dc is None or not r:
+            return 0
+        pt = _Painter(wm, dc=dc)
+        try:
+            inner = _draw_edge(pt, _rd_rect(M_, r), edge, flags)
+        finally:
+            pt.done()
+        if flags & 0x2000:
+            _wr_rect(M_, r, inner)
+        return 1
+
+    @reg("DrawFrameControl", "ppuu")
+    def _dfc(c, hdc, r, typ, state):
+        dc = DC(hdc)
+        if dc is None or not r:
+            return 0
+        pt = _Painter(wm, dc=dc)
+        try:
+            _draw_frame_control(pt, _rd_rect(M_, r), typ, state)
+        finally:
+            pt.done()
+        return 1
+
+    def _drawtext(c, hdc, s, n, r, fmt, params, wide):
+        dc = DC(hdc)
+        if dc is None or not r:
+            return 0
+        text = _gstr(M_, s, n, wide) if s else ""
+        rect = _rd_rect(M_, r)
+        tab = 8
+        margins = (0, 0)
+        if params:
+            _sz, tab_, lm, rm = struct.unpack("<Iiii", M_.read(params, 16))
+            tab = tab_ or 8
+            margins = (lm, rm)
+        h, nr = _draw_text_fmt(dc, text, rect, fmt, tab, margins)
+        if fmt & 0x400:
+            if fmt & 0x20 and fmt & (1 | 2):
+                w_ = nr[2] - nr[0]
+                if fmt & 1:
+                    cx = (rect[0] + rect[2]) // 2
+                    nr = (cx - w_ // 2, nr[1], cx - w_ // 2 + w_, nr[3])
+                else:
+                    nr = (rect[2] - w_, nr[1], rect[2], nr[3])
+            _wr_rect(M_, r, nr)
+        if params:
+            M_.write32(params + 16, len(text))
+        return h
+
+    reg("DrawTextA", "ppipu")(lambda c, h, s, n, r, f: _drawtext(c, h, s, n, r, f, 0, False))
+    reg("DrawTextW", "ppipu")(lambda c, h, s, n, r, f: _drawtext(c, h, s, n, r, f, 0, True))
+    reg("DrawTextExA", "ppipup")(lambda c, h, s, n, r, f, pr: _drawtext(c, h, s, n, r, f, pr, False))
+    reg("DrawTextExW", "ppipup")(lambda c, h, s, n, r, f, pr: _drawtext(c, h, s, n, r, f, pr, True))
+
+    def _tabbed(c, hdc, x, y, s, n, ntabs, tabs, org, wide, draw):
+        dc = DC(hdc)
+        if dc is None:
+            return 0
+        text = _gstr(M_, s, n, wide) if s else ""
+        f = dc.gfont()
+        stops = [_s32(M_.read32(tabs + 4 * i)) for i in range(ntabs)] if tabs and ntabs else []
+        if ntabs == 1 and stops:
+            step = abs(stops[0])
+            stops = []
+        else:
+            step = 8 * f.advance("x")
+        out_x = 0
+        parts = text.split("\t")
+        for i, part in enumerate(parts):
+            if draw and part:
+                _text_out(dc, x + out_x, y, part)
+            out_x += f.width(part)
+            if i < len(parts) - 1:
+                nxt = None
+                for st_ in stops:
+                    if abs(st_) - org > out_x:
+                        nxt = abs(st_) - org
+                        break
+                if nxt is None:
+                    nxt = ((out_x // max(1, step)) + 1) * max(1, step)
+                out_x = nxt
+        return (f.height << 16) | (out_x & 0xFFFF)
+
+    reg("TabbedTextOutA", "piipiipi")(lambda c, h, x, y, s, n, nt, t, o: _tabbed(c, h, x, y, s, n, nt, t, o, False, True))
+    reg("TabbedTextOutW", "piipiipi")(lambda c, h, x, y, s, n, nt, t, o: _tabbed(c, h, x, y, s, n, nt, t, o, True, True))
+    reg("GetTabbedTextExtentA", "ppiip")(lambda c, h, s, n, nt, t: _tabbed(c, h, 0, 0, s, n, nt, t, 0, False, False))
+    reg("GetTabbedTextExtentW", "ppiip")(lambda c, h, s, n, nt, t: _tabbed(c, h, 0, 0, s, n, nt, t, 0, True, False))
+
+    def _graystring(c, hdc, hbr, proc, data, n, x, y, cx, cy, wide):
+        dc = DC(hdc)
+        if dc is None:
+            return 0
+        if proc:
+            return 1 if p.call_guest(proc, [hdc, data, n]) & 0xFFFFFFFF else 0
+        text = _gstr(M_, data, n if n else -1, wide)
+        old = dc.text_color
+        dc.text_color = gdi.sys_color(COLOR_GRAYTEXT)
+        _text_out(dc, x, y, text)
+        dc.text_color = old
+        return 1
+
+    reg("GrayStringA", "ppppiiiii")(lambda c, *a: _graystring(c, *a, False))
+    reg("GrayStringW", "ppppiiiii")(lambda c, *a: _graystring(c, *a, True))
+
+    def _drawstate(c, hdc, hbr, proc, ldata, wdata, x, y, cx, cy, flags, wide):
+        dc = DC(hdc)
+        if dc is None:
+            return 0
+        typ = flags & 0xF
+        disabled = flags & 0x20
+        if typ in (1, 2):                                      # DST_TEXT / DST_PREFIXTEXT
+            text = _gstr(M_, ldata, wdata if wdata else -1, wide)
+            if typ == 1:
+                text = text.replace("&", "&&")
+            pt = _Painter(wm, dc=dc)
+            try:
+                hf = dc.font
+                r = (x, y, x + (cx or 10000), y + (cy or 1000))
+                if disabled:
+                    _grayed_text(pt, r, text, 0, hf, gdi.sys_color)
+                else:
+                    pt.draw_text(r, text, 0, hf, dc.text_color)
+            finally:
+                pt.done()
+        elif typ == 3:                                         # DST_ICON
+            ic = gdi.get(ldata)
+            if ic is not None:
+                pt = _Painter(wm, dc=dc)
+                try:
+                    pt.icon(x, y, ldata, cx or ic.w, cy or ic.ht)
+                finally:
+                    pt.done()
+        elif typ == 4:                                         # DST_BITMAP
+            bm = gdi.get(ldata, "bitmap")
+            if bm is not None:
+                src = gdi.new_dc("mem")
+                src.bitmap_h = bm.h
+                src.changed()
+                _blit(dc, x, y, cx or bm.surf.w, cy or bm.surf.h, src, 0, 0, 0xCC0020)
+                gdi.objs.pop(src.h, None)
+        elif typ == 0 and proc:                                # DST_COMPLEX
+            p.call_guest(proc, [hdc, ldata, wdata, cx, cy])
+        return 1
+
+    reg("DrawStateA", "pppppiiiiu")(lambda c, *a: _drawstate(c, *a, False))
+    reg("DrawStateW", "pppppiiiiu")(lambda c, *a: _drawstate(c, *a, True))
+
+    @reg("DrawCaption", "pppu")
+    def _drawcaption(c, h, hdc, r, flags):
+        return 1
+
+    reg("DrawAnimatedRects", "pipp")(lambda c, h, i, a, b: 1)
+
+    @reg("PaintDesktop", "p")
+    def _paintdesktop(c, hdc):
+        return _fillrect(c, hdc, 0, 0) if False else 1
+
+    @reg("GetSysColor", "i")
+    def _getsyscolor(c, i):
+        return gdi.sys_color(i)
+
+    @reg("GetSysColorBrush", "i", "p")
+    def _getsyscolorbrush(c, i):
+        if not 0 <= i < len(gdi.sys_colors):
+            return 0
+        return gdi.sys_brush(i).h
+
+    @reg("SetSysColors", "ipp")
+    def _setsyscolors(c, n, idx, vals):
+        for i in range(n):
+            e = _s32(M_.read32(idx + 4 * i))
+            if 0 <= e < len(gdi.sys_colors):
+                gdi.sys_colors[e] = M_.read32(vals + 4 * i) & 0xFFFFFF
+                b = gdi.sys_brushes.get(e)
+                if b is not None:
+                    b.color = gdi.sys_colors[e]
+        for t in wm.desktop.children:
+            wm.invalidate(t, None, True, True, True)
+        return 1
+
+    # ---- icons / cursors ---------------------------------------------------------------------
+    def _load_icon(inst, name_a, wide, cx=32, cursor=False):
+        if name_a < 0x10000 and (not inst or name_a >= 32512):
+            table = wm.std_cursors if cursor else wm.std_icons
+            h = table.get(name_a)
+            if h:
+                return h
+            if not inst:
+                return table.get(32512, 0)
+        key = _res_key(p, name_a, wide)
+        ic = _load_icon_res(p, inst, key, cx, cursor)
+        if ic is None:
+            return err(1812)                                  # ERROR_RESOURCE_DATA_NOT_FOUND
+        ic.shared = True
+        return gdi.add(ic)
+
+    reg("LoadIconA", "pp", "p")(lambda c, i, n: _load_icon(i, n, False))
+    reg("LoadIconW", "pp", "p")(lambda c, i, n: _load_icon(i, n, True))
+    reg("LoadCursorA", "pp", "p")(lambda c, i, n: _load_icon(i, n, False, 32, True))
+    reg("LoadCursorW", "pp", "p")(lambda c, i, n: _load_icon(i, n, True, 32, True))
+
+    def _load_from_file(path, typ, cx):
+        try:
+            hp = p.vfs.resolve(path)
+            with open(hp, "rb") as fh:
+                raw = fh.read()
+        except Exception:
+            return None
+        if typ == 0:                                           # IMAGE_BITMAP (.bmp)
+            if raw[:2] != b"BM":
+                return None
+            return _bitmap_from_packed(p, raw[14:])
+        return _read_icon_file(raw, cx or 32, typ == 2)
+
+    def _load_image(c, inst, name_a, typ, cx, cy, flags, wide):
+        if flags & 0x10:                                       # LR_LOADFROMFILE
+            path = wm.gstr(name_a, wide)
+            obj = _load_from_file(path, typ, cx)
+            if obj is None:
+                return err(2)
+            return gdi.add(obj)
+        if typ == 0:                                           # IMAGE_BITMAP
+            if not inst and name_a < 0x10000:
+                bm = _GBitmap(16, 16)
+                return gdi.add(bm)
+            data = _res_bytes(p, inst, 2, _res_key(p, name_a, wide))
+            if data is None:
+                return err(1814)
+            bm = _bitmap_from_packed(p, data)
+            if bm is None:
+                return 0
+            if flags & 0x2000:                                 # LR_CREATEDIBSECTION
+                w_, h_ = bm.surf.w, bm.surf.h
+                addr = M_.alloc(w_ * h_ * 4, MEM_READ | MEM_WRITE, tag="dibsection")
+                bm.dib = _DibSec(addr, w_, h_, 32, False, [], (0xFF0000, 0xFF00, 0xFF))
+                bm.bpp = 32
+                _dib_push(M_, bm)
+            if flags & 0x20:                                   # LR_LOADTRANSPARENT
+                s = bm.surf
+                key = bytes(s.px[0:3])
+                win = _cr_pix(gdi.sys_color(COLOR_WINDOW))[:3]
+                for i in range(0, len(s.px), 4):
+                    if s.px[i:i + 3] == key:
+                        s.px[i:i + 3] = win
+            if flags & 0x1000:                                 # LR_LOADMAP3DCOLORS
+                s = bm.surf
+                mp = {bytes((128, 128, 128)): _cr_pix(gdi.sys_color(COLOR_BTNSHADOW))[:3],
+                      bytes((192, 192, 192)): _cr_pix(gdi.sys_color(COLOR_BTNFACE))[:3],
+                      bytes((223, 223, 223)): _cr_pix(gdi.sys_color(COLOR_3DLIGHT))[:3]}
+                for i in range(0, len(s.px), 4):
+                    v = mp.get(bytes(s.px[i:i + 3]))
+                    if v is not None:
+                        s.px[i:i + 3] = v
+            return gdi.add(bm)
+        if typ in (1, 2):
+            want = cx or (16 if flags & 0x40 == 0 and cx == 16 else 32)
+            return _load_icon(inst, name_a, wide, cx or 32, typ == 2)
+        return 0
+
+    reg("LoadImageA", "ppuiiu", "p")(lambda c, i, n, t, x, y, f: _load_image(c, i, n, t, x, y, f, False))
+    reg("LoadImageW", "ppuiiu", "p")(lambda c, i, n, t, x, y, f: _load_image(c, i, n, t, x, y, f, True))
+
+    @reg("LoadBitmapA", "pp", "p")
+    def _lba(c, inst, name):
+        return _load_image(c, inst, name, 0, 0, 0, 0, False)
+
+    @reg("LoadBitmapW", "pp", "p")
+    def _lbw(c, inst, name):
+        return _load_image(c, inst, name, 0, 0, 0, 0, True)
+
+    @reg("LoadCursorFromFileA", "p", "p")
+    def _lcffa(c, a):
+        return _load_image(c, 0, a, 2, 0, 0, 0x10, False)
+
+    @reg("LoadCursorFromFileW", "p", "p")
+    def _lcffw(c, a):
+        return _load_image(c, 0, a, 2, 0, 0, 0x10, True)
+
+    @reg("CreateIconFromResourceEx", "puuuiiu", "p")
+    def _cifrex(c, bits, n, icon, ver, cx, cy, flags):
+        data = bytes(M_.read(bits, n))
+        ic = _icon_from_dib(data, not icon)
+        return gdi.add(ic) if ic is not None else 0
+
+    @reg("CreateIconFromResource", "puuu", "p")
+    def _cifr(c, bits, n, icon, ver):
+        return _cifrex(c, bits, n, icon, ver, 0, 0, 0)
+
+    @reg("LookupIconIdFromDirectoryEx", "piiiu")
+    def _liifde(c, a, icon, cx, cy, flags):
+        n = M_.read16(a + 4)
+        best, bs = 0, None
+        for i in range(n):
+            off = a + 6 + 14 * i
+            w_ = M_.read8(off) or 256
+            bpp = M_.read16(off + 6)
+            nid = M_.read16(off + 12)
+            score = abs(w_ - (cx or 32)) * 1000 - bpp
+            if bs is None or score < bs:
+                best, bs = nid, score
+        return best
+
+    @reg("LookupIconIdFromDirectory", "pi")
+    def _liifd(c, a, icon):
+        return _liifde(c, a, icon, 32, 32, 0)
+
+    def _icon_from_bitmaps(hmask, hcolor, is_icon, hot):
+        mb = gdi.get(hmask, "bitmap")
+        cb = gdi.get(hcolor, "bitmap") if hcolor else None
+        if mb is None:
+            return 0
+        if cb is not None:
+            w_, h_ = cb.surf.w, cb.surf.h
+        else:
+            w_, h_ = mb.surf.w, mb.surf.h // 2
+        ic = _GIcon(w_, h_, cursor=not is_icon, hot=hot)
+        if cb is not None:
+            if cb.dib is not None:
+                _dib_pull(M_, cb)
+            ic.color.px[:] = cb.surf.px[:w_ * h_ * 4]
+            if cb.bpp == 32 and (cb.dib is not None or getattr(cb, "has_alpha", False)):
+                a = cb.surf.px[3::4]
+                if any(a):
+                    ic.alpha = bytearray(a)
+        else:
+            ic.color.px[:] = mb.surf.px[w_ * h_ * 4:2 * w_ * h_ * 4]
+        ic.mask = bytearray(1 if mb.surf.px[i * 4] else 0 for i in range(w_ * h_))
+        return gdi.add(ic)
+
+    @reg("CreateIconIndirect", "p", "p")
+    def _cii(c, a):
+        if wm.ps == 8:
+            is_icon, hx, hy = struct.unpack("<III", M_.read(a, 12))
+            hmask, hcolor = M_.read64(a + 16), M_.read64(a + 24)
+        else:
+            is_icon, hx, hy, hmask, hcolor = struct.unpack("<IIIII", M_.read(a, 20))
+        return _icon_from_bitmaps(hmask, hcolor, is_icon, (hx, hy))
+
+    @reg("CreateIcon", "piiBBpp".replace("B", "u"), "p")
+    def _createicon(c, inst, w_, h_, planes, bpp, andbits, xorbits):
+        ic = _GIcon(w_, h_)
+        stride_m = ((w_ + 15) // 16) * 2
+        mask = bytearray(w_ * h_)
+        for y in range(h_):
+            row = bytes(M_.read(andbits + y * stride_m, stride_m))
+            mask[y * w_:(y + 1) * w_] = _expand_bits(row, w_)
+        ic.mask = mask
+        tb = planes * bpp
+        stride_c = ((w_ * tb + 15) // 16) * 2
+        for y in range(h_):
+            row = bytes(M_.read(xorbits + y * stride_c, stride_c))
+            ic.color.px[y * w_ * 4:(y + 1) * w_ * 4] = _row_to_bgrx(
+                row, w_, tb, [b"\0\0\0\0", b"\xff\xff\xff\0"] if tb == 1 else None)[:w_ * 4]
+        return gdi.add(ic)
+
+    @reg("CreateCursor", "piiiipp", "p")
+    def _createcursor(c, inst, hx, hy, w_, h_, andbits, xorbits):
+        h = _createicon(c, inst, w_, h_, 1, 1, andbits, xorbits)
+        ic = gdi.get(h)
+        if ic is not None:
+            ic.kind = "cursor"
+            ic.hot = (hx, hy)
+        return h
+
+    @reg("DestroyIcon DestroyCursor", "p")
+    def _destroyicon(c, h):
+        ic = gdi.get(h)
+        if ic is None or ic.kind not in ("icon", "cursor"):
+            return 0
+        if not ic.shared:
+            gdi.objs.pop(h & 0xFFFFFFFF, None)
+        return 1
+
+    @reg("CopyIcon", "p", "p")
+    def _copyicon(c, h):
+        ic = gdi.get(h)
+        if ic is None:
+            return 0
+        n = _GIcon(ic.w, ic.ht, cursor=ic.kind == "cursor", hot=ic.hot, css=ic.css)
+        n.color.px[:] = ic.color.px
+        n.mask = bytearray(ic.mask) if ic.mask is not None else None
+        n.alpha = bytearray(ic.alpha) if ic.alpha is not None else None
+        return gdi.add(n)
+
+    @reg("CopyImage", "puiiu", "p")
+    def _copyimage(c, h, typ, cx, cy, flags):
+        o = gdi.get(h)
+        if o is None:
+            return 0
+        if o.kind == "bitmap":
+            w_, h_ = cx or o.surf.w, cy or o.surf.h
+            bm = _GBitmap(w_, h_, o.bpp if o.bpp == 1 else 32)
+            if (w_, h_) == (o.surf.w, o.surf.h):
+                if o.dib is not None:
+                    _dib_pull(M_, o)
+                bm.surf.px[:] = o.surf.px
+            else:
+                for y in range(h_):
+                    sy = y * o.surf.h // h_
+                    for x in range(w_):
+                        sx = x * o.surf.w // w_
+                        so = (sy * o.surf.w + sx) * 4
+                        bm.surf.px[(y * w_ + x) * 4:(y * w_ + x) * 4 + 4] = o.surf.px[so:so + 4]
+            if flags & 8:                                      # LR_COPYDELETEORG
+                gdi.delete(h)
+            return gdi.add(bm)
+        if o.kind in ("icon", "cursor"):
+            return _copyicon(c, h)
+        return 0
+
+    @reg("GetIconInfo", "pp")
+    def _geticoninfo(c, h, out):
+        ic = gdi.get(h)
+        if ic is None or ic.kind not in ("icon", "cursor"):
+            return 0
+        color = _GBitmap(ic.w, ic.ht)
+        color.surf.px[:] = ic.color.px
+        mask = _GBitmap(ic.w, ic.ht, 1)
+        for i in range(ic.w * ic.ht):
+            if ic.mask is not None and ic.mask[i]:
+                mask.surf.px[i * 4:i * 4 + 4] = b"\xff\xff\xff\x00"
+        hc, hm = gdi.add(color), gdi.add(mask)
+        is_icon = 1 if ic.kind == "icon" else 0
+        if wm.ps == 8:
+            M_.write(out, struct.pack("<IIIIQQ", is_icon, ic.hot[0], ic.hot[1], 0, hm, hc))
+        else:
+            M_.write(out, struct.pack("<IIIII", is_icon, ic.hot[0], ic.hot[1], hm, hc))
+        return 1
+
+    reg("GetIconInfoExA GetIconInfoExW", "pp")(lambda c, h, out: _geticoninfo(c, h, out + 4))
+
+    def _drawicon(hdc, x, y, h, cx, cy, flags):
+        dc = DC(hdc)
+        ic = gdi.get(h)
+        if dc is None or ic is None or ic.kind not in ("icon", "cursor"):
+            return 0
+        surf, ox, oy, clip, bm = tg = gdi.begin(dc)
+        X, Y = dc.lp2dp(x, y)
+        _draw_icon(dc, surf, clip, (X + ox, Y + oy), ic, cx or ic.w, cy or ic.ht, flags or 3)
+        gdi.end(dc, tg)
+        return 1
+
+    reg("DrawIcon", "piip")(lambda c, hdc, x, y, h: _drawicon(hdc, x, y, h, 0, 0, 3))
+    reg("DrawIconEx", "piipiiupu")(lambda c, hdc, x, y, h, cx, cy, step, br, fl: _drawicon(hdc, x, y, h, cx, cy, fl & 3))
+
+    reg("PrivateExtractIconsA PrivateExtractIconsW", "piiiippuu")(lambda c, *a: 0)
+
+    # cursors: the display uses the CSS name of the current cursor
+    @reg("SetCursor", "p", "p")
+    def _setcursor(c, h):
+        old = wm.cursor
+        wm.cursor = h
+        return old
+
+    @reg("GetCursor", "", "p")
+    def _getcursor(c):
+        return wm.cursor
+
+    @reg("ShowCursor", "i")
+    def _showcursor(c, show):
+        wm.cursor_count = getattr(wm, "cursor_count", 0) + (1 if show else -1)
+        return wm.cursor_count
+
+    @reg("GetCursorPos GetPhysicalCursorPos", "p")
+    def _getcursorpos(c, a):
+        if not a:
+            return 0
+        M_.write(a, struct.pack("<ii", *wm.cursor_pos))
+        return 1
+
+    @reg("SetCursorPos SetPhysicalCursorPos", "ii")
+    def _setcursorpos(c, x, y):
+        wm.cursor_pos = (x, y)
+        return 1
+
+    @reg("GetCursorInfo", "p")
+    def _getcursorinfo(c, a):
+        M_.write(a + 4, struct.pack("<I", 1) + (struct.pack("<Q", wm.cursor) if wm.ps == 8
+                                                 else struct.pack("<I", wm.cursor)) +
+                 struct.pack("<ii", *wm.cursor_pos))
+        return 1
+
+    @reg("ClipCursor", "p")
+    def _clipcursor(c, r):
+        return 1
+
+    @reg("GetClipCursor", "p")
+    def _getclipcursor(c, r):
+        _wr_rect(M_, r, (0, 0, gdi.screen.w, gdi.screen.h))
+        return 1
+
+    reg("SetSystemCursor", "pu")(lambda c, h, i: 1)
+    reg("DestroyCaret", "")(lambda c: wm.caret_destroy())
+
+    # ---- carets --------------------------------------------------------------------------
+    @reg("CreateCaret", "ppii")
+    def _createcaret(c, h, bmp, w_, h_):
+        if not W(h):
+            return 0
+        if bmp and bmp not in (1,):
+            bm = gdi.get(bmp, "bitmap")
+            if bm is not None:
+                w_, h_ = bm.surf.w, bm.surf.h
+        return wm.caret_create(h, bmp, w_ or 2, h_ or 16)
+
+    reg("ShowCaret", "p")(lambda c, h: wm.caret_show(h))
+    reg("HideCaret", "p")(lambda c, h: wm.caret_hide(h))
+    reg("SetCaretPos", "ii")(lambda c, x, y: wm.caret_set_pos(wm.caret["hwnd"], x, y))
+
+    @reg("GetCaretPos", "p")
+    def _getcaretpos(c, a):
+        M_.write(a, struct.pack("<ii", wm.caret["x"], wm.caret["y"]))
+        return 1
+
+    reg("SetCaretBlinkTime", "u")(lambda c, t: (wm.caret.__setitem__("blink", t), 1)[1])
+    reg("GetCaretBlinkTime", "")(lambda c: wm.caret["blink"])
+
+    # ---- keyboard / mouse input state -----------------------------------------------------
+    @reg("GetKeyState", "i")
+    def _getkeystate(c, vk):
+        v = wm.keys[vk & 0xFF]
+        return (0xFF80 if v & 0x80 else 0) | (v & 1)
+
+    @reg("GetAsyncKeyState", "i")
+    def _getasynckeystate(c, vk):
+        vk &= 0xFF
+        v = wm.phys[vk]
+        a = wm.async_keys[vk]
+        wm.async_keys[vk] = 0
+        return (0x8000 if v & 0x80 else 0) | (1 if a & 1 else 0)
+
+    @reg("GetKeyboardState", "p")
+    def _getkeyboardstate(c, a):
+        M_.write(a, bytes(wm.keys))
+        return 1
+
+    @reg("SetKeyboardState", "p")
+    def _setkeyboardstate(c, a):
+        wm.keys[:] = M_.read(a, 256)
+        return 1
+
+    @reg("MapVirtualKeyA MapVirtualKeyW", "uu")
+    def _mapvk(c, code, typ):
+        if typ in (0, 4):                                      # VK -> scan
+            return _VK_SCAN.get(code & 0xFF, 0)
+        if typ in (1, 3):                                      # scan -> VK
+            for vk, sc in _VK_SCAN.items():
+                if sc == code:
+                    return vk
+            return 0
+        if typ == 2:                                           # VK -> char
+            if 0x41 <= code <= 0x5A or 0x30 <= code <= 0x39:
+                return code
+            s = _VK_CHARS.get(code)
+            return ord(s[0]) if s else 0
+        return 0
+
+    reg("MapVirtualKeyExA MapVirtualKeyExW", "uup")(lambda c, code, t, hkl: _mapvk(c, code, t))
+
+    def _vkscan(ch):
+        if "a" <= ch <= "z":
+            return ord(ch.upper())
+        if "A" <= ch <= "Z":
+            return ord(ch) | 0x100
+        if "0" <= ch <= "9":
+            return ord(ch)
+        if ch in _VK_SHIFT_DIGITS:
+            return (0x30 + _VK_SHIFT_DIGITS.index(ch)) | 0x100
+        for vk, s in _VK_CHARS.items():
+            if ch == s[0]:
+                return vk
+            if len(s) == 2 and ch == s[1]:
+                return vk | 0x100
+        return 0xFFFF
+
+    reg("VkKeyScanA VkKeyScanW", "u")(lambda c, ch: _vkscan(chr(ch & 0xFFFF)))
+    reg("VkKeyScanExA VkKeyScanExW", "up")(lambda c, ch, hkl: _vkscan(chr(ch & 0xFFFF)))
+
+    def _toascii(c, vk, scan, state, buf, n, wide):
+        saved = bytes(wm.keys)
+        if state:
+            wm.keys[:] = M_.read(state, 256)
+        try:
+            ch = _vk_to_char(wm, vk & 0xFF)
+        finally:
+            wm.keys[:] = saved
+        if ch is None or not buf:
+            return 0
+        if wide:
+            M_.write(buf, ch.encode("utf-16-le") + (b"\0\0" if n > 1 else b""))
+        else:
+            M_.write(buf, ch.encode("cp1252", "replace")[:1] + b"\0")
+        return 1
+
+    reg("ToAscii", "uuppu")(lambda c, vk, sc, st, b, f: _toascii(c, vk, sc, st, b, 2, False))
+    reg("ToAsciiEx", "uuppup")(lambda c, vk, sc, st, b, f, hkl: _toascii(c, vk, sc, st, b, 2, False))
+    reg("ToUnicode", "uuppiu")(lambda c, vk, sc, st, b, n, f: _toascii(c, vk, sc, st, b, n, True))
+    reg("ToUnicodeEx", "uuppiup")(lambda c, vk, sc, st, b, n, f, hkl: _toascii(c, vk, sc, st, b, n, True))
+
+    _KEYNAMES = {0x01: "Esc", 0x0E: "Backspace", 0x0F: "Tab", 0x1C: "Enter", 0x1D: "Ctrl",
+                 0x2A: "Shift", 0x38: "Alt", 0x39: "Space", 0x3A: "Caps Lock", 0x47: "Home",
+                 0x48: "Up", 0x49: "Page Up", 0x4B: "Left", 0x4D: "Right", 0x4F: "End",
+                 0x50: "Down", 0x51: "Page Down", 0x52: "Insert", 0x53: "Delete"}
+
+    def _getkeyname(c, lp, buf, n, wide):
+        sc = (lp >> 16) & 0xFF
+        name = _KEYNAMES.get(sc)
+        if name is None:
+            if 0x3B <= sc <= 0x44:
+                name = "F%d" % (sc - 0x3A)
+            else:
+                name = ""
+                for vk, s in _VK_SCAN.items():
+                    if s == sc and (0x30 <= vk <= 0x5A):
+                        name = chr(vk)
+                        break
+        return wm.put_str(buf, n, name, wide)
+
+    reg("GetKeyNameTextA", "ipi")(lambda c, lp, b, n: _getkeyname(c, lp, b, n, False))
+    reg("GetKeyNameTextW", "ipi")(lambda c, lp, b, n: _getkeyname(c, lp, b, n, True))
+    reg("GetKeyboardLayout", "u", "p")(lambda c, t: 0x04090409)
+
+    @reg("GetKeyboardLayoutList", "ip")
+    def _gkll(c, n, a):
+        if n and a:
+            wm.wp(a, 0x04090409)
+        return 1
+
+    reg("GetKeyboardLayoutNameA", "p")(lambda c, a: (M_.write(a, b"00000409\0"), 1)[1])
+    reg("GetKeyboardLayoutNameW", "p")(lambda c, a: (M_.write(a, "00000409\0".encode("utf-16-le")), 1)[1])
+    reg("LoadKeyboardLayoutA LoadKeyboardLayoutW", "pu", "p")(lambda c, a, f: 0x04090409)
+    reg("ActivateKeyboardLayout", "pu", "p")(lambda c, h, f: 0x04090409)
+    reg("UnloadKeyboardLayout", "p")(lambda c, h: 1)
+    reg("GetKeyboardType", "i")(lambda c, t: {0: 4, 1: 0, 2: 12}.get(t, 0))
+
+    @reg("keybd_event", "uuup", "v")
+    def _keybd_event(c, vk, scan, flags, extra):
+        wm.inject({"type": "key", "action": "up" if flags & 2 else "down", "vk": vk, "scan": scan})
+
+    @reg("mouse_event", "uiiup", "v")
+    def _mouse_event(c, flags, dx, dy, data, extra):
+        x, y = wm.cursor_pos
+        if flags & 1:
+            if flags & 0x8000:
+                x, y = dx * gdi.screen.w // 65536, dy * gdi.screen.h // 65536
+            else:
+                x, y = x + dx, y + dy
+            wm.cursor_pos = (x, y)
+            wm.deliver_mouse("move", 0, x, y)
+        for bit, act, btn in ((2, "down", 0), (4, "up", 0), (8, "down", 2), (0x10, "up", 2),
+                              (0x20, "down", 1), (0x40, "up", 1)):
+            if flags & bit:
+                vk = {0: 1, 1: 4, 2: 2}[btn]
+                if act == "down":
+                    wm.keys[vk] |= 0x80
+                else:
+                    wm.keys[vk] &= 0x7F
+                wm.deliver_mouse(act, btn, x, y)
+        if flags & 0x800:
+            wm.deliver_mouse("wheel", 0, x, y, _s32(data & 0xFFFFFFFF))
+
+    @reg("SendInput", "upi")
+    def _sendinput(c, n, a, size):
+        for i in range(n):
+            base = a + i * size
+            typ = M_.read32(base)
+            off = 8 if wm.ps == 8 else 4
+            if typ == 0:
+                dx, dy, data, flags = struct.unpack("<iiII", M_.read(base + off, 16))
+                _mouse_event(c, flags, dx, dy, data, 0)
+            elif typ == 1:
+                vk, scan, flags = struct.unpack("<HHI", M_.read(base + off, 8))
+                if flags & 4 and not vk:                       # KEYEVENTF_UNICODE
+                    if not (flags & 2):
+                        wm.inject({"type": "key", "action": "char", "char": chr(scan)})
+                else:
+                    _keybd_event(c, vk, scan, flags, 0)
+        return n
+
+    @reg("GetDoubleClickTime", "")
+    def _gdct(c):
+        return 500
+
+    reg("SetDoubleClickTime", "u")(lambda c, t: 1)
+    reg("SwapMouseButton", "i")(lambda c, s: 0)
+    reg("BlockInput", "i")(lambda c, b: 1)
+
+    @reg("TrackMouseEvent _TrackMouseEvent", "p", dlls=("user32.dll", "comctl32.dll"))
+    def _tme(c, a):
+        size, flags = struct.unpack("<II", M_.read(a, 8))
+        h = wm.rp(a + 8)
+        if flags & 0x40000000:                                 # TME_QUERY
+            return 1
+        if flags & 0x80000000:                                 # TME_CANCEL
+            wm.track_leave.pop(h, None)
+        else:
+            wm.track_leave[h] = flags
+            if flags & 2 and wm.mouse_over != h:
+                wm._queue_input(W(h), WM_MOUSELEAVE, 0, 0)
+                wm.track_leave.pop(h, None)
+        return 1
+
+    @reg("DragDetect", "pQ")
+    def _dragdetect(c, h, pt):
+        return 0
+
+    @reg("GetLastInputInfo", "p")
+    def _glii(c, a):
+        M_.write32(a + 4, wm.tick())
+        return 1
+
+    reg("RegisterHotKey", "piuu")(lambda c, h, i, m, v: 1)
+    reg("UnregisterHotKey", "pi")(lambda c, h, i: 1)
+    reg("GetMouseMovePointsEx", "upiu")(lambda c, *a: 0xFFFFFFFF)
+    reg("EnableMouseInPointer", "i")(lambda c, e: 1)
+
+    # ---- clipboard ------------------------------------------------------------------------------
+    cb = wm.clip
+    _CF_NAMES = {}
+
+    @reg("OpenClipboard", "p")
+    def _openclip(c, h):
+        if cb["open"] and cb["open"] != (h or 1):
+            return err(5)
+        cb["open"] = h or 1
+        return 1
+
+    @reg("CloseClipboard", "")
+    def _closeclip(c):
+        if not cb["open"]:
+            return err(1418)
+        cb["open"] = 0
+        return 1
+
+    @reg("EmptyClipboard", "")
+    def _emptyclip(c):
+        if not cb["open"]:
+            return err(1418)
+        cb["data"] = {}
+        cb["owner"] = cb["open"] if cb["open"] != 1 else 0
+        cb["seq"] += 1
+        return 1
+
+    @reg("SetClipboardData", "up", "p")
+    def _setclipdata(c, fmt, h):
+        if not cb["open"]:
+            return err(1418)
+        if fmt in (1, 7):
+            t = M_.read_cstring(h, 1 << 24).decode("utf-8", "replace") if h else ""
+            cb["data"][13] = cb["data"][1] = t
+            wm.clip_set_text(t)
+        elif fmt == 13:
+            t = M_.read_wstring(h, 1 << 23).decode("utf-16-le", "replace") if h else ""
+            wm.clip_set_text(t)
+        else:
+            try:
+                n = p.heap_size(p.process_heap_handle, h) if h else 0
+                cb["data"][fmt] = bytes(M_.read(h, n)) if n else b""
+            except Exception:
+                cb["data"][fmt] = b""
+        cb["seq"] += 1
+        return h or 1
+
+    @reg("GetClipboardData", "u", "p")
+    def _getclipdata(c, fmt):
+        if fmt in (1, 7, 13):
+            t = wm.clip_get_text()
+            if t is None:
+                return 0
+            data = (t.encode("utf-16-le") + b"\0\0") if fmt == 13 else (t.encode("utf-8") + b"\0")
+        else:
+            data = cb["data"].get(fmt)
+            if data is None:
+                return 0
+        h = p.heap_alloc(p.process_heap_handle, len(data) + 2)
+        M_.write(h, data)
+        return h
+
+    @reg("IsClipboardFormatAvailable", "u")
+    def _icfa(c, fmt):
+        if fmt in (1, 7, 13):
+            return 1 if wm.clip_get_text() is not None else 0
+        return 1 if fmt in cb["data"] else 0
+
+    @reg("CountClipboardFormats", "")
+    def _ccf(c):
+        n = len([f for f in cb["data"] if f not in (1, 7, 13)])
+        return n + (3 if wm.clip_get_text() is not None else 0)
+
+    @reg("EnumClipboardFormats", "u")
+    def _ecf(c, fmt):
+        fmts = sorted(set(list(cb["data"].keys()) + ([13, 1, 7] if wm.clip_get_text() is not None
+                                                      else [])))
+        if fmt == 0:
+            return fmts[0] if fmts else 0
+        for f in fmts:
+            if f > fmt:
+                return f
+        return 0
+
+    def _regfmt(c, a, wide):
+        name = wm.gstr(a, wide)
+        for k_, v in _CF_NAMES.items():
+            if v.lower() == name.lower():
+                return k_
+        nid = 0xC000 + len(_CF_NAMES) + 0x100
+        _CF_NAMES[nid] = name
+        return nid
+
+    reg("RegisterClipboardFormatA", "p")(lambda c, a: _regfmt(c, a, False))
+    reg("RegisterClipboardFormatW", "p")(lambda c, a: _regfmt(c, a, True))
+    reg("GetClipboardFormatNameA", "upi")(lambda c, f, b, n: wm.put_str(b, n, _CF_NAMES.get(f, ""), False) if f in _CF_NAMES else 0)
+    reg("GetClipboardFormatNameW", "upi")(lambda c, f, b, n: wm.put_str(b, n, _CF_NAMES.get(f, ""), True) if f in _CF_NAMES else 0)
+    reg("GetClipboardOwner", "", "p")(lambda c: cb["owner"])
+    reg("GetOpenClipboardWindow", "", "p")(lambda c: cb["open"] if cb["open"] != 1 else 0)
+    reg("GetClipboardViewer", "", "p")(lambda c: 0)
+    reg("SetClipboardViewer", "p", "p")(lambda c, h: 0)
+    reg("ChangeClipboardChain", "pp")(lambda c, a, b: 1)
+    reg("AddClipboardFormatListener RemoveClipboardFormatListener", "p")(lambda c, h: 1)
+    reg("GetClipboardSequenceNumber", "")(lambda c: cb["seq"])
+
+    @reg("GetPriorityClipboardFormat", "pi")
+    def _gpcf(c, a, n):
+        for i in range(n):
+            f = M_.read32(a + 4 * i)
+            if _icfa(c, f):
+                return f
+        return 0xFFFFFFFF if cb["data"] or wm.clip_get_text() else 0
+
+    reg("GetUpdatedClipboardFormats", "pup")(lambda c, a, n, out: (M_.write32(out, 0), 1)[1])
+
+    # ---- hooks ----------------------------------------------------------------------------
+    def _sethook(c, hid, proc, hmod, tid):
+        hid = _s32(hid & 0xFFFFFFFF)
+        h = wm.next_hook
+        wm.next_hook += 4
+        wm.hooks.setdefault(hid, []).insert(0, {"h": h, "proc": proc, "tid": tid, "id": hid})
+        return h
+
+    reg("SetWindowsHookExA SetWindowsHookExW", "ippu", "p")(lambda c, i, pr, m, t: _sethook(c, i, pr, m, t))
+    reg("SetWindowsHookA SetWindowsHookW", "ip", "p")(lambda c, i, pr: _sethook(c, i, pr, 0, wm.cur_tid()))
+
+    @reg("UnhookWindowsHookEx", "p")
+    def _unhook(c, h):
+        for hid, lst in wm.hooks.items():
+            for hk in lst:
+                if hk["h"] == h:
+                    lst.remove(hk)
+                    hk["dead"] = True
+                    return 1
+        return 0
+
+    @reg("UnhookWindowsHook", "ip")
+    def _unhookold(c, hid, proc):
+        lst = wm.hooks.get(hid, [])
+        for hk in lst:
+            if hk["proc"] == proc:
+                lst.remove(hk)
+                return 1
+        return 0
+
+    @reg("CallNextHookEx", "pipp", "p")
+    def _callnext(c, h, code, w_, l_):
+        for hid, lst in wm.hooks.items():
+            for i, hk in enumerate(lst):
+                if hk["h"] == h:
+                    r, called = _wm_hook_call(wm, hid, code, w_, l_, i + 1)
+                    return r
+        return 0
+
+    reg("CallMsgFilterA CallMsgFilterW CallMsgFilter", "pi")(lambda c, a, code: 0)
+    reg("SetWinEventHook", "uupppuu", "p")(lambda c, *a: 0x00061000)
+    reg("UnhookWinEvent", "p")(lambda c, h: 1)
+    reg("NotifyWinEvent", "upii", "v")(lambda c, *a: None)
+    reg("IsWinEventHookInstalled", "u")(lambda c, e: 0)
+
+    # ---- system metrics / parameters -------------------------------------------------------
+    def _metrics(i):
+        sw, sh = gdi.screen.w, gdi.screen.h
+        return {0: sw, 1: sh, 2: 16, 3: 16, 4: 19, 5: 1, 6: 1, 7: 3, 8: 3, 9: 16, 10: 16,
+                11: 32, 12: 32, 13: 32, 14: 32, 15: 19, 16: sw, 17: sh - 30 - 19, 19: 1,
+                20: 16, 21: 16, 23: 0, 28: 112, 29: 27, 30: 18, 31: 18, 32: 4, 33: 4, 34: 112,
+                35: 27, 36: 4, 37: 4, 38: 75, 39: 75, 40: 0, 41: 0, 42: 0, 43: 3, 44: 0,
+                45: 2, 46: 2, 47: 160, 48: 24, 49: 16, 50: 16, 51: 12, 52: 15, 53: 18, 54: 18,
+                55: 18, 56: 3, 57: 160, 58: 24, 59: sw + 8, 60: sh + 8, 61: sw + 8, 62: sh - 22,
+                63: 0x3, 67: 0, 68: 4, 69: 4, 70: 0, 71: 13, 72: 13, 73: 0, 74: 0, 75: 1,
+                76: 0, 77: 0, 78: sw, 79: sh, 80: 1, 81: 1, 82: 0, 83: 0, 84: 1, 86: 0,
+                87: 0, 89: 0, 90: 0, 91: 0, 92: 1, 93: 0, 94: 0, 95: 0,
+                0x1000: 0, 0x1001: 0, 0x1002: 0, 0x2003: 0, 0x2004: 0}.get(i, 0)
+
+    reg("GetSystemMetrics", "i")(lambda c, i: _metrics(i))
+    reg("GetSystemMetricsForDpi", "iu")(lambda c, i, d: _metrics(i))
+
+    def _write_logfont_face(a, height, weight, face, wide):
+        fo = _GFontObj(height, weight=weight, face=face)
+        _write_logfont(M_, a, fo.lf, wide)
+        return 92 if wide else 60
+
+    def _ncmetrics(a, wide):
+        size = M_.read32(a)
+        lf = 92 if wide else 60
+        M_.write(a + 4, struct.pack("<iiiiii", 1, 16, 16, 18, 18, 0))
+        off = 4 + 24
+        M_.write32(a + 4, 1)
+        M_.write(a + 4, struct.pack("<iiiiii", 1, 16, 16, 18, 18, 0)[:4])
+        # iBorderWidth, iScrollWidth, iScrollHeight, iCaptionWidth, iCaptionHeight
+        M_.write(a + 4, struct.pack("<iiiii", 1, 16, 16, 18, 18))
+        off = 4 + 20
+        _write_logfont_face(a + off, -11, 700, "Tahoma", wide)
+        off += lf
+        M_.write(a + off, struct.pack("<ii", 12, 15))
+        off += 8
+        _write_logfont_face(a + off, -11, 700, "Tahoma", wide)
+        off += lf
+        M_.write(a + off, struct.pack("<ii", 18, 18))
+        off += 8
+        _write_logfont_face(a + off, -11, 400, "Tahoma", wide)
+        off += lf
+        _write_logfont_face(a + off, -11, 400, "Tahoma", wide)
+        off += lf
+        _write_logfont_face(a + off, -11, 400, "Tahoma", wide)
+        off += lf
+        if size >= off + 4:
+            M_.write32(a + off, 0)
+        return 1
+
+    def _spi(c, action, uparam, pv, winini, wide):
+        sw, sh = gdi.screen.w, gdi.screen.h
+        if action == 0x30:                                     # SPI_GETWORKAREA
+            _wr_rect(M_, pv, (0, 0, sw, sh - 30))
+            return 1
+        if action == 0x29:                                     # SPI_GETNONCLIENTMETRICS
+            return _ncmetrics(pv, wide)
+        if action == 0x1F:                                     # SPI_GETICONTITLELOGFONT
+            _write_logfont_face(pv, -11, 400, "Tahoma", wide)
+            return 1
+        if action == 0x2C:                                     # SPI_GETICONMETRICS
+            M_.write(pv + 4, struct.pack("<iii", 75, 75, 1))
+            _write_logfont_face(pv + 16, -11, 400, "Tahoma", wide)
+            return 1
+        if action == 0x2A:                                     # SPI_GETMINIMIZEDMETRICS
+            return 1
+        if action in (0x10, 0x68, 0x6A, 0x1042, 0x1024, 0x1002, 0x1006, 0x1008, 0x100A,
+                      0x1016, 0x1018, 0x101A, 0x101C, 0x101E, 0x1012, 0x103E, 0x1022, 0x1004,
+                      0x1026, 0x1028, 0x2000, 0x2002, 0x1014, 0x105A, 0x0048, 0x004A):
+            # boolean "is enabled?" queries: animation/effects off, keyboard cues shown
+            if pv:
+                M_.write32(pv, 1 if action in (0x100A, 0x1022, 0x1042, 0x1014, 0x0048) else 0)
+            return 1
+        if action == 0x68:                                     # SPI_GETWHEELSCROLLLINES
+            M_.write32(pv, 3)
+            return 1
+        if action == 0x6C:                                     # SPI_GETWHEELSCROLLCHARS
+            M_.write32(pv, 3)
+            return 1
+        if action in (0x0A, 0x16, 0x1B, 0x70):                 # keyboard speed/delay etc
+            if pv:
+                M_.write32(pv, {0x0A: 31, 0x16: 1, 0x1B: 0, 0x70: 10}[action])
+            return 1
+        if action == 0x2002:                                   # SPI_GETFOCUSBORDERWIDTH
+            M_.write32(pv, 1)
+            return 1
+        if action == 0x200E:
+            M_.write32(pv, 1)
+            return 1
+        if action == 0x0003:                                   # SPI_GETBEEP
+            M_.write32(pv, 1)
+            return 1
+        if action == 0x0059:                                   # SPI_GETSCREENREADER
+            M_.write32(pv, 0)
+            return 1
+        if action == 0x0038:                                   # SPI_GETANIMATION
+            M_.write32(pv + 4, 0)
+            return 1
+        if action == 0x000E or action == 0x0042 or action == 0x004E:
+            if pv:
+                M_.write32(pv, 0)
+            return 1
+        if action == 0x0019:                                   # SPI_GETGRIDGRANULARITY
+            M_.write32(pv, 1)
+            return 1
+        if action == 0x0026:                                   # SPI_GETMENUDROPALIGNMENT
+            M_.write32(pv, 0)
+            return 1
+        if action == 0x2012:                                   # SPI_GETMOUSEHOVERTIME
+            M_.write32(pv, 400)
+            return 1
+        if action in (0x0062, 0x0064, 0x0066):                 # hover width/height
+            M_.write32(pv, 4)
+            return 1
+        if action == 0x0014:                                   # SPI_SETDESKWALLPAPER
+            return 1
+        if action == 0x0073:                                   # SPI_GETDESKWALLPAPER
+            if pv and uparam:
+                M_.write(pv, b"\0\0" if wide else b"\0")
+            return 1
+        if action == 0x1000 + 0x44 or action == 0x2010:        # SPI_GETCLEARTYPE / contrast
+            if pv:
+                M_.write32(pv, 1 if action != 0x2010 else 1400)
+            return 1
+        if action == 0x004A or action == 0x200C:               # font smoothing
+            if pv:
+                M_.write32(pv, 0 if action == 0x004A else 1)
+            return 1
+        if action == 0x0100 + 0x6E:
+            return 1
+        if action >= 0x1000 and pv:                            # other BOOL queries: FALSE
+            M_.write32(pv, 0)
+            return 1
+        if pv and action & 1 == 0 and action < 0x100:
+            M_.write32(pv, 0)
+        return 1
+
+    reg("SystemParametersInfoA", "uupu")(lambda c, a, u, pv, w_: _spi(c, a, u, pv, w_, False))
+    reg("SystemParametersInfoW", "uupu")(lambda c, a, u, pv, w_: _spi(c, a, u, pv, w_, True))
+    reg("SystemParametersInfoForDpi", "uupuu")(lambda c, a, u, pv, w_, d: _spi(c, a, u, pv, w_, True))
+
+    # DPI awareness (we render at 96 DPI)
+    reg("SetProcessDPIAware", "")(lambda c: 1)
+    reg("IsProcessDPIAware", "")(lambda c: 1)
+    reg("SetProcessDpiAwarenessContext", "p")(lambda c, v: 1)
+    reg("SetProcessDpiAwarenessInternal", "u")(lambda c, v: 1)
+    reg("GetDpiForWindow GetDpiForSystem GetSystemDpiForProcess", "p")(lambda c, h: 96)
+    reg("GetDpiFromDpiAwarenessContext", "p")(lambda c, v: 96)
+    reg("GetAwarenessFromDpiAwarenessContext", "p")(lambda c, v: 1)
+    reg("GetThreadDpiAwarenessContext GetWindowDpiAwarenessContext", "p", "p")(lambda c, *a: 0x11)
+    reg("SetThreadDpiAwarenessContext", "p", "p")(lambda c, v: 0x11)
+    reg("AreDpiAwarenessContextsEqual", "pp")(lambda c, a, b: 1)
+    reg("IsValidDpiAwarenessContext", "p")(lambda c, v: 1)
+    reg("EnableNonClientDpiScaling", "p")(lambda c, h: 1)
+    reg("GetDpiForMonitorInternal", "puppp")(lambda c, *a: 1)
+    reg("SetThreadDpiHostingBehavior", "i")(lambda c, v: 0)
+
+    # monitors & display settings
+    _HMON = 0x00010001
+
+    reg("MonitorFromWindow", "pu", "p")(lambda c, h, f: _HMON)
+    reg("MonitorFromPoint", "Qu", "p")(lambda c, pt, f: _HMON)
+    reg("MonitorFromRect", "pu", "p")(lambda c, r, f: _HMON)
+
+    def _gmi(c, h, a, wide):
+        size = M_.read32(a)
+        sw, sh = gdi.screen.w, gdi.screen.h
+        M_.write(a + 4, struct.pack("<iiiiiiiiI", 0, 0, sw, sh, 0, 0, sw, sh - 30, 1))
+        if size > 40:
+            name = "\\\\.\\DISPLAY1"
+            M_.write(a + 40, (name.encode("utf-16-le") if wide else name.encode()) +
+                     (b"\0\0" if wide else b"\0"))
+        return 1
+
+    reg("GetMonitorInfoA", "pp")(lambda c, h, a: _gmi(c, h, a, False))
+    reg("GetMonitorInfoW", "pp")(lambda c, h, a: _gmi(c, h, a, True))
+
+    @reg("EnumDisplayMonitors", "pppp")
+    def _edm(c, hdc, clip, proc, data):
+        mark = wm.scratch_mark()
+        try:
+            r = wm.scratch(struct.pack("<iiii", 0, 0, gdi.screen.w, gdi.screen.h))
+            p.call_guest(proc, [_HMON, hdc, r, data])
+        finally:
+            wm.scratch_release(mark)
+        return 1
+
+    def _eds(c, dev, mode, dm, wide):
+        if mode not in (0xFFFFFFFF, 0xFFFFFFFE, 0) and mode > 0:
+            return 0
+        name_len = 64 if wide else 32
+        base = dm + name_len
+        # DEVMODE: dmSpecVersion.. dmSize at +name_len+4
+        M_.write(base, struct.pack("<HHHHI", 0x401, 0, 156 if not wide else 220, 0, 0x5C0000))
+        off = dm + (68 if not wide else 102)
+        # dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency
+        pos = dm + (104 if wide else 72) if False else None
+        o = (dm + 168) if wide else (dm + 104)
+        M_.write(o, struct.pack("<IIIII", 32, gdi.screen.w, gdi.screen.h, 0, 60))
+        return 1
+
+    reg("EnumDisplaySettingsA", "pup")(lambda c, d, m, dm: _eds(c, d, m, dm, False))
+    reg("EnumDisplaySettingsW", "pup")(lambda c, d, m, dm: _eds(c, d, m, dm, True))
+    reg("EnumDisplaySettingsExA", "pupu")(lambda c, d, m, dm, f: _eds(c, d, m, dm, False))
+    reg("EnumDisplaySettingsExW", "pupu")(lambda c, d, m, dm, f: _eds(c, d, m, dm, True))
+
+    def _edd(c, dev, i, a, flags, wide):
+        if i > 0:
+            return 0
+        cs = 2 if wide else 1
+        name = "\\\\.\\DISPLAY1"
+        desc = "NOO Virtual Display"
+        M_.write(a + 4, (name.encode("utf-16-le") if wide else name.encode()).ljust(32 * cs, b"\0"))
+        M_.write(a + 4 + 32 * cs, (desc.encode("utf-16-le") if wide else desc.encode()).ljust(128 * cs, b"\0"))
+        M_.write32(a + 4 + 160 * cs, 5)                         # ATTACHED | PRIMARY
+        return 1
+
+    reg("EnumDisplayDevicesA", "pupu")(lambda c, d, i, a, f: _edd(c, d, i, a, f, False))
+    reg("EnumDisplayDevicesW", "pupu")(lambda c, d, i, a, f: _edd(c, d, i, a, f, True))
+    reg("ChangeDisplaySettingsA ChangeDisplaySettingsW", "pu")(lambda c, dm, f: 0)
+    reg("ChangeDisplaySettingsExA ChangeDisplaySettingsExW", "ppupp")(lambda c, *a: 0)
+    reg("GetDisplayConfigBufferSizes", "upp")(lambda c, f, a, b: (M_.write32(a, 0), M_.write32(b, 0), 0)[2])
+    reg("QueryDisplayConfig", "uppppp")(lambda c, *a: 50)
+    reg("DisplayConfigGetDeviceInfo", "p")(lambda c, a: 50)
+
+    # ---- window stations, desktops, misc session objects ------------------------------------
+    reg("GetProcessWindowStation", "", "p")(lambda c: 0x00000F0)
+    reg("GetThreadDesktop", "u", "p")(lambda c, t: 0x00000F4)
+    reg("OpenDesktopA OpenDesktopW", "puiu", "p")(lambda c, n, f, i, a: 0x00000F4)
+    reg("OpenInputDesktop", "uiu", "p")(lambda c, f, i, a: 0x00000F4)
+    reg("CreateDesktopA CreateDesktopW", "ppppuu".replace("uu", "up"), "p")(lambda c, *a: 0x00000F4)
+    reg("CloseDesktop CloseWindowStation SwitchDesktop SetThreadDesktop SetProcessWindowStation",
+        "p")(lambda c, h: 1)
+    reg("OpenWindowStationA OpenWindowStationW", "piu", "p")(lambda c, n, i, a: 0x00000F0)
+    reg("CreateWindowStationA CreateWindowStationW", "pupp", "p")(lambda c, *a: 0x00000F0)
+
+    def _guoi(c, h, idx, buf, n, needed, wide):
+        if idx == 2:                                           # UOI_NAME
+            name = "WinSta0" if h == 0xF0 else "Default"
+            data = (name.encode("utf-16-le") + b"\0\0") if wide else name.encode() + b"\0"
+        elif idx == 1:                                         # UOI_FLAGS
+            data = struct.pack("<III", 0, 0, 1)
+        elif idx == 3:
+            name = "WindowStation" if h == 0xF0 else "Desktop"
+            data = (name.encode("utf-16-le") + b"\0\0") if wide else name.encode() + b"\0"
+        else:
+            data = b"\0" * 4
+        if needed:
+            M_.write32(needed, len(data))
+        if n < len(data) or not buf:
+            return err(122)
+        M_.write(buf, data)
+        return 1
+
+    reg("GetUserObjectInformationA", "pippp")(lambda c, h, i, b, n, nd: _guoi(c, h, i, b, n, nd, False))
+    reg("GetUserObjectInformationW", "pippp")(lambda c, h, i, b, n, nd: _guoi(c, h, i, b, n, nd, True))
+    reg("SetUserObjectInformationA SetUserObjectInformationW", "pipu")(lambda c, *a: 1)
+    reg("GetUserObjectSecurity", "ppppp")(lambda c, *a: 0)
+    reg("RegisterDeviceNotificationA RegisterDeviceNotificationW", "ppu", "p")(lambda c, *a: 0x00061234)
+    reg("UnregisterDeviceNotification", "p")(lambda c, h: 1)
+    reg("RegisterRawInputDevices", "puu")(lambda c, a, n, s: 1)
+    reg("GetRawInputData", "pupppu".replace("pppu", "ppu"), "u")(lambda c, *a: 0xFFFFFFFF)
+    reg("GetRawInputDeviceList", "ppu")(lambda c, a, n, s: (M_.write32(n, 0), 0)[1] if n else 0)
+    reg("GetRawInputDeviceInfoA GetRawInputDeviceInfoW", "pupp")(lambda c, *a: 0xFFFFFFFF)
+    reg("GetRegisteredRawInputDevices", "ppu")(lambda c, a, n, s: (M_.write32(n, 0), 0)[1] if n else 0)
+    reg("GetRawInputBuffer", "ppu")(lambda c, a, n, s: 0)
+    reg("DefRawInputProc", "pii", "p")(lambda c, a, n, s: 0)
+
+    @reg("WaitForInputIdle", "pu", dlls=("user32.dll",))
+    def _wfii(c, h, ms):
+        return 0
+
+    @reg("GetGUIThreadInfo", "up")
+    def _ggti(c, tid, a):
+        ps = wm.ps
+        cr = wm.caret
+        vals = (wm.active, wm.focus, wm.capture, 0, 0, cr["hwnd"])
+        if ps == 8:
+            M_.write(a + 4, struct.pack("<I", 0) + struct.pack("<6Q", *vals) +
+                     struct.pack("<iiii", cr["x"], cr["y"], cr["x"] + cr["w"], cr["y"] + cr["h"]))
+        else:
+            M_.write(a + 4, struct.pack("<I", 0) + struct.pack("<6I", *vals) +
+                     struct.pack("<iiii", cr["x"], cr["y"], cr["x"] + cr["w"], cr["y"] + cr["h"]))
+        return 1
+
+    reg("AttachThreadInput", "uui")(lambda c, a, b, f: 1)
+    reg("IsHungAppWindow", "p")(lambda c, h: 0)
+    reg("GetWindowContextHelpId", "p")(lambda c, h: W(h).help_id if W(h) else 0)
+
+    @reg("SetWindowContextHelpId", "pu")
+    def _swchi(c, h, v):
+        w = W(h)
+        if w is None:
+            return 0
+        w.help_id = v
+        return 1
+
+    reg("ShowOwnedPopups", "pi")(lambda c, h, s: 1)
+    reg("ExitWindowsEx", "uu")(lambda c, f, r: 0)
+    reg("LockWorkStation", "")(lambda c: 0)
+    reg("MessageBeep", "u")(lambda c, t: 1)
+    reg("ChangeWindowMessageFilter", "uu")(lambda c, m, f: 1)
+    reg("ChangeWindowMessageFilterEx", "puup")(lambda c, h, m, f, a: 1)
+    reg("RegisterTouchWindow", "pu")(lambda c, h, f: 1)
+    reg("UnregisterTouchWindow IsTouchWindow", "p")(lambda c, h: 0)
+    reg("RegisterShellHookWindow DeregisterShellHookWindow", "p")(lambda c, h: 1)
+    reg("SetWindowDisplayAffinity", "pu")(lambda c, h, a: 1)
+    reg("GetWindowDisplayAffinity", "pp")(lambda c, h, a: (M_.write32(a, 0), 1)[1])
+    reg("SetGestureConfig", "puupu")(lambda c, *a: 1)
+    reg("GetGestureInfo CloseGestureInfoHandle", "pp")(lambda c, *a: 0)
+    reg("RegisterPointerInputTarget", "pu")(lambda c, h, t: 0)
+    reg("IsImmersiveProcess", "p")(lambda c, h: 0)
+    reg("GetWindowFeedbackSetting SetWindowFeedbackSetting", "puupp")(lambda c, *a: 0)
+    reg("WinHelpA WinHelpW", "ppup")(lambda c, *a: 1)
+    reg("SetDebugErrorLevel", "u", "v")(lambda c, v: None)
+    reg("GetComboBoxInfo", "pp")(lambda c, h, a: wm.send(h, 0x164, 0, a))
+    reg("GetListBoxInfo", "p")(lambda c, h: wm.send(h, 0x1B2, 0, 0))
+    reg("GetAltTabInfoA GetAltTabInfoW", "pippu")(lambda c, *a: 0)
+    reg("SoundSentry", "")(lambda c: 1)
+    reg("DisableProcessWindowsGhosting", "", "v")(lambda c: None)
+    reg("UserHandleGrantAccess", "ppi")(lambda c, *a: 1)
+    reg("SetProcessDefaultLayout", "u")(lambda c, v: 1)
+    reg("GetProcessDefaultLayout", "p")(lambda c, a: (M_.write32(a, 0), 1)[1])
+    reg("SetShellWindow SetTaskmanWindow SetProgmanWindow", "p")(lambda c, h: 1)
+    reg("ShutdownBlockReasonCreate", "pp")(lambda c, h, r: 1)
+    reg("ShutdownBlockReasonDestroy", "p")(lambda c, h: 1)
+    reg("CalcMenuBar", "puuup")(lambda c, *a: 0)
+    reg("GetInternalWindowPos", "ppp")(lambda c, *a: 0)
+    reg("IsTopLevelWindow", "p")(lambda c, h: 1 if W(h) is not None and wm.is_top(W(h)) else 0)
+    reg("IsServerSideWindow", "p")(lambda c, h: 0)
+    reg("GhostWindowFromHungWindow HungWindowFromGhostWindow", "p", "p")(lambda c, h: 0)
+
+    return wm
+
+
+# -- user32 API (part 3): menus, accelerators, dialogs, MessageBox, resources ------------------------
+
+def _user_install3(k):
+    R = k.reg
+    p = k.p
+    M_ = p.mem
+    wm = p.wm
+    gdi = p.gdi
+    U = ("user32.dll",)
+
+    def reg(names, sig="", ret="i", dlls=U):
+        return R(names, sig, ret, dlls=dlls)
+
+    def W(h):
+        return wm.wnd(h)
+
+    def err(e):
+        p.last_error = e
+        return 0
+
+    def MENU(h):
+        return _menu_obj(wm, h)
+
+    def redraw_bar(menu):
+        for w in list(wm.wins.values()):
+            if w.menu and w.menu == menu.h and not w.dead:
+                wm.set_pos(w, 0, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER |
+                           SWP_NOACTIVATE | SWP_FRAMECHANGED)
+
+    # ---- menus -------------------------------------------------------------------------------
+    @reg("CreateMenu", "", "p")
+    def _createmenu(c):
+        return gdi.add(_Menu(False))
+
+    @reg("CreatePopupMenu", "", "p")
+    def _createpopup(c):
+        return gdi.add(_Menu(True))
+
+    @reg("DestroyMenu", "p")
+    def _destroymenu(c, h):
+        m = MENU(h)
+        if m is None:
+            return err(1401)
+        for it in m.items:
+            if it.sub:
+                _destroymenu(c, it.sub)
+        gdi.objs.pop(h & 0xFFFFFFFF, None)
+        return 1
+
+    @reg("IsMenu", "p")
+    def _ismenu(c, h):
+        return 1 if MENU(h) is not None else 0
+
+    def _item_from_flags(flags, idnew, data, wide):
+        it = _MItem()
+        it.type = flags & (MF_BITMAP | MF_OWNERDRAW | MF_SEPARATOR | MF_MENUBARBREAK |
+                           MF_MENUBREAK | MF_RIGHTJUSTIFY | MFT_RADIOCHECK)
+        it.state = flags & (MF_GRAYED | MF_DISABLED | MF_CHECKED | MF_HILITE | MF_DEFAULT)
+        if flags & MF_POPUP:
+            it.sub = idnew
+            it.id = idnew
+        else:
+            it.id = idnew & 0xFFFFFFFF
+        if flags & MF_BITMAP:
+            it.bmp = data
+        elif flags & MF_OWNERDRAW:
+            it.data = data
+        elif not (flags & MF_SEPARATOR):
+            it.text = wm.gstr(data, wide) if data else ""
+        return it
+
+    def _append(c, h, flags, idnew, data, wide):
+        m = MENU(h)
+        if m is None:
+            return err(1401)
+        m.items.append(_item_from_flags(flags, idnew, data, wide))
+        redraw_bar(m)
+        return 1
+
+    reg("AppendMenuA", "pupp")(lambda c, h, f, i, d: _append(c, h, f, i, d, False))
+    reg("AppendMenuW", "pupp")(lambda c, h, f, i, d: _append(c, h, f, i, d, True))
+
+    def _insert(c, h, pos, flags, idnew, data, wide):
+        m = MENU(h)
+        if m is None:
+            return err(1401)
+        it = _item_from_flags(flags, idnew, data, wide)
+        if flags & MF_BYPOSITION:
+            idx = pos if 0 <= _s32(pos & 0xFFFFFFFF) <= len(m.items) else len(m.items)
+            m.items.insert(idx, it)
+        else:
+            mm, i = _menu_find(wm, m, pos, False)
+            if mm is None:
+                m.items.append(it)
+            else:
+                mm.items.insert(i, it)
+        redraw_bar(m)
+        return 1
+
+    reg("InsertMenuA", "puupp")(lambda c, h, pos, f, i, d: _insert(c, h, pos, f, i, d, False))
+    reg("InsertMenuW", "puupp")(lambda c, h, pos, f, i, d: _insert(c, h, pos, f, i, d, True))
+
+    def _modify(c, h, pos, flags, idnew, data, wide):
+        m = MENU(h)
+        mm, i = _menu_find(wm, m, pos, bool(flags & MF_BYPOSITION))
+        if mm is None:
+            return err(1456)
+        mm.items[i] = _item_from_flags(flags, idnew, data, wide)
+        redraw_bar(m)
+        return 1
+
+    reg("ModifyMenuA", "puupp")(lambda c, h, pos, f, i, d: _modify(c, h, pos, f, i, d, False))
+    reg("ModifyMenuW", "puupp")(lambda c, h, pos, f, i, d: _modify(c, h, pos, f, i, d, True))
+
+    def _remove(c, h, pos, flags, destroy):
+        m = MENU(h)
+        mm, i = _menu_find(wm, m, pos, bool(flags & MF_BYPOSITION))
+        if mm is None:
+            return err(1456)
+        it = mm.items.pop(i)
+        if destroy and it.sub:
+            _destroymenu(c, it.sub)
+        redraw_bar(m)
+        return 1
+
+    reg("RemoveMenu", "puu")(lambda c, h, pos, f: _remove(c, h, pos, f, False))
+    reg("DeleteMenu", "puu")(lambda c, h, pos, f: _remove(c, h, pos, f, True))
+
+    @reg("SetMenu", "pp")
+    def _setmenu(c, h, hm):
+        w = W(h)
+        if w is None or w.style & WS_CHILD:
+            return err(1400)
+        w.menu = hm
+        wm.set_pos(w, 0, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE |
+                   SWP_FRAMECHANGED)
+        return 1
+
+    @reg("GetMenu", "p", "p")
+    def _getmenu(c, h):
+        w = W(h)
+        return w.menu if w is not None and not (w.style & WS_CHILD) else 0
+
+    @reg("DrawMenuBar", "p")
+    def _drawmenubar(c, h):
+        w = W(h)
+        if w is None:
+            return 0
+        wm.set_pos(w, 0, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE |
+                   SWP_FRAMECHANGED)
+        return 1
+
+    @reg("GetSubMenu", "pi", "p")
+    def _getsubmenu(c, h, pos):
+        m = MENU(h)
+        if m is None or not 0 <= pos < len(m.items):
+            return 0
+        return m.items[pos].sub
+
+    @reg("GetMenuItemCount", "p")
+    def _gmic(c, h):
+        m = MENU(h)
+        return len(m.items) if m is not None else 0xFFFFFFFF
+
+    @reg("GetMenuItemID", "pi")
+    def _gmiid(c, h, pos):
+        m = MENU(h)
+        if m is None or not 0 <= pos < len(m.items):
+            return 0xFFFFFFFF
+        it = m.items[pos]
+        return 0xFFFFFFFF if it.sub else it.id
+
+    @reg("GetMenuState", "puu")
+    def _gms(c, h, pos, flags):
+        m = MENU(h)
+        mm, i = _menu_find(wm, m, pos, bool(flags & MF_BYPOSITION))
+        if mm is None:
+            return 0xFFFFFFFF
+        it = mm.items[i]
+        st = it.type | it.state
+        if it.sub:
+            sub = MENU(it.sub)
+            st = (st & 0xFF) | MF_POPUP | ((len(sub.items) if sub else 0) << 8)
+        return st
+
+    @reg("CheckMenuItem", "puu")
+    def _checkmenu(c, h, pos, flags):
+        m = MENU(h)
+        mm, i = _menu_find(wm, m, pos, bool(flags & MF_BYPOSITION))
+        if mm is None:
+            return 0xFFFFFFFF
+        it = mm.items[i]
+        old = MF_CHECKED if it.state & MF_CHECKED else 0
+        if flags & MF_CHECKED:
+            it.state |= MF_CHECKED
+        else:
+            it.state &= ~MF_CHECKED
+        return old
+
+    @reg("EnableMenuItem", "puu")
+    def _enablemenu(c, h, pos, flags):
+        m = MENU(h)
+        mm, i = _menu_find(wm, m, pos, bool(flags & MF_BYPOSITION))
+        if mm is None:
+            return 0xFFFFFFFF
+        it = mm.items[i]
+        old = it.state & (MF_GRAYED | MF_DISABLED)
+        it.state = (it.state & ~(MF_GRAYED | MF_DISABLED)) | (flags & (MF_GRAYED | MF_DISABLED))
+        if mm is m and not m.popup:
+            redraw_bar(m) if False else None
+            for w in list(wm.wins.values()):
+                if w.menu == m.h and not w.dead:
+                    _nc_paint(wm, w)
+        if m.sysmenu or (pos == SC_CLOSE and not (flags & MF_BYPOSITION)):
+            for w in list(wm.wins.values()):
+                if w.py.get("sysmenu") == h:
+                    w.py["close_disabled"] = bool(it.state & (MF_GRAYED | MF_DISABLED)) \
+                        if it.id == SC_CLOSE else w.py.get("close_disabled")
+                    _nc_paint(wm, w)
+        return old
+
+    @reg("CheckMenuRadioItem", "puuuu")
+    def _cmri(c, h, first, last, check, flags):
+        m = MENU(h)
+        if m is None:
+            return 0
+        byp = bool(flags & MF_BYPOSITION)
+        mm, i0 = _menu_find(wm, m, first, byp)
+        mm2, i1 = _menu_find(wm, m, last, byp)
+        mm3, ic = _menu_find(wm, m, check, byp)
+        if mm is None or mm2 is not mm:
+            return 0
+        for i in range(min(i0, i1), max(i0, i1) + 1):
+            it = mm.items[i]
+            if i == ic and mm3 is mm:
+                it.state |= MF_CHECKED
+                it.type |= MFT_RADIOCHECK
+            else:
+                it.state &= ~MF_CHECKED
+        return 1
+
+    def _gmstr(c, h, pos, buf, n, flags, wide):
+        m = MENU(h)
+        mm, i = _menu_find(wm, m, pos, bool(flags & MF_BYPOSITION))
+        if mm is None:
+            return 0
+        t = mm.items[i].text
+        if not buf:
+            return wm.str_len(t, wide)
+        return wm.put_str(buf, n, t, wide)
+
+    reg("GetMenuStringA", "pupiu")(lambda c, h, pos, b, n, f: _gmstr(c, h, pos, b, n, f, False))
+    reg("GetMenuStringW", "pupiu")(lambda c, h, pos, b, n, f: _gmstr(c, h, pos, b, n, f, True))
+
+    def _mii_layout():
+        ps = wm.ps
+        # cbSize fMask fType fState wID hSubMenu hbmpChecked hbmpUnchecked dwItemData
+        # dwTypeData cch hbmpItem
+        if ps == 8:
+            return {"fMask": 4, "fType": 8, "fState": 12, "wID": 16, "hSubMenu": 24,
+                    "hbmpChecked": 32, "hbmpUnchecked": 40, "dwItemData": 48, "dwTypeData": 56,
+                    "cch": 64, "hbmpItem": 72}
+        return {"fMask": 4, "fType": 8, "fState": 12, "wID": 16, "hSubMenu": 20,
+                "hbmpChecked": 24, "hbmpUnchecked": 28, "dwItemData": 32, "dwTypeData": 36,
+                "cch": 40, "hbmpItem": 44}
+
+    def _get_mii(c, h, item, bypos, a, wide):
+        m = MENU(h)
+        mm, i = _menu_find(wm, m, item, bool(bypos))
+        if mm is None:
+            return err(1456)
+        it = mm.items[i]
+        L = _mii_layout()
+        size = M_.read32(a)
+        mask = M_.read32(a + L["fMask"])
+        if mask & 0x100:                                         # MIIM_FTYPE
+            M_.write32(a + L["fType"], it.type)
+        if mask & 1:                                             # MIIM_STATE
+            M_.write32(a + L["fState"], it.state)
+        if mask & 2:                                             # MIIM_ID
+            M_.write32(a + L["wID"], it.id & 0xFFFFFFFF)
+        if mask & 4:                                             # MIIM_SUBMENU
+            wm.wp(a + L["hSubMenu"], it.sub)
+        if mask & 8:                                             # MIIM_CHECKMARKS
+            wm.wp(a + L["hbmpChecked"], it.chk)
+            wm.wp(a + L["hbmpUnchecked"], it.unchk)
+        if mask & 0x20:                                          # MIIM_DATA
+            wm.wp(a + L["dwItemData"], it.data)
+        if mask & 0x80 and size > L["hbmpItem"]:                 # MIIM_BITMAP
+            wm.wp(a + L["hbmpItem"], it.bmp)
+        if mask & (0x40 | 0x10):                                 # MIIM_STRING / MIIM_TYPE
+            if mask & 0x10:
+                M_.write32(a + L["fType"], it.type)
+            buf = wm.rp(a + L["dwTypeData"])
+            cch = M_.read32(a + L["cch"])
+            if it.type & (MF_SEPARATOR | MF_BITMAP | MF_OWNERDRAW) and mask & 0x10:
+                if it.type & MF_OWNERDRAW:
+                    wm.wp(a + L["dwTypeData"], it.data)
+                elif it.type & MF_BITMAP:
+                    wm.wp(a + L["dwTypeData"], it.bmp)
+                M_.write32(a + L["cch"], 0)
+            elif buf and cch:
+                n = wm.put_str(buf, cch + 1 if False else cch, it.text, wide)
+                M_.write32(a + L["cch"], n)
+            else:
+                M_.write32(a + L["cch"], wm.str_len(it.text, wide))
+        return 1
+
+    def _set_mii(c, h, item, bypos, a, wide, insert=False):
+        m = MENU(h)
+        if m is None:
+            return err(1401)
+        if insert:
+            it = _MItem()
+            if bypos:
+                idx = item if 0 <= _s32(item & 0xFFFFFFFF) <= len(m.items) else len(m.items)
+                target, idx_ = m, idx
+            else:
+                target, idx_ = _menu_find(wm, m, item, False)
+                if target is None:
+                    target, idx_ = m, len(m.items)
+            target.items.insert(idx_, it)
+        else:
+            mm, i = _menu_find(wm, m, item, bool(bypos))
+            if mm is None:
+                return err(1456)
+            it = mm.items[i]
+        L = _mii_layout()
+        size = M_.read32(a)
+        mask = M_.read32(a + L["fMask"])
+        if mask & 0x10:                                          # MIIM_TYPE
+            it.type = M_.read32(a + L["fType"])
+            data = wm.rp(a + L["dwTypeData"])
+            if it.type & MF_BITMAP:
+                it.bmp = data
+            elif it.type & MF_OWNERDRAW:
+                it.data = data
+            elif not (it.type & MF_SEPARATOR):
+                it.text = wm.gstr(data, wide) if data else ""
+        if mask & 0x100:
+            it.type = (it.type & MF_BITMAP) | M_.read32(a + L["fType"])
+        if mask & 1:
+            it.state = M_.read32(a + L["fState"])
+        if mask & 2:
+            it.id = M_.read32(a + L["wID"])
+        if mask & 4:
+            it.sub = wm.rp(a + L["hSubMenu"])
+        if mask & 8:
+            it.chk = wm.rp(a + L["hbmpChecked"])
+            it.unchk = wm.rp(a + L["hbmpUnchecked"])
+        if mask & 0x20:
+            it.data = wm.rp(a + L["dwItemData"])
+        if mask & 0x40:
+            data = wm.rp(a + L["dwTypeData"])
+            it.text = wm.gstr(data, wide) if data else ""
+        if mask & 0x80 and size > L["hbmpItem"]:
+            it.bmp = wm.rp(a + L["hbmpItem"])
+        redraw_bar(m)
+        return 1
+
+    reg("GetMenuItemInfoA", "puip")(lambda c, h, i, b, a: _get_mii(c, h, i, b, a, False))
+    reg("GetMenuItemInfoW", "puip")(lambda c, h, i, b, a: _get_mii(c, h, i, b, a, True))
+    reg("SetMenuItemInfoA", "puip")(lambda c, h, i, b, a: _set_mii(c, h, i, b, a, False))
+    reg("SetMenuItemInfoW", "puip")(lambda c, h, i, b, a: _set_mii(c, h, i, b, a, True))
+    reg("InsertMenuItemA", "puip")(lambda c, h, i, b, a: _set_mii(c, h, i, b, a, False, True))
+    reg("InsertMenuItemW", "puip")(lambda c, h, i, b, a: _set_mii(c, h, i, b, a, True, True))
+
+    @reg("SetMenuDefaultItem", "puu")
+    def _smdi(c, h, item, bypos):
+        m = MENU(h)
+        if m is None:
+            return 0
+        for it in m.items:
+            it.state &= ~MF_DEFAULT
+        if _s32(item & 0xFFFFFFFF) == -1:
+            return 1
+        mm, i = _menu_find(wm, m, item, bool(bypos), deep=False)
+        if mm is None:
+            return 0
+        mm.items[i].state |= MF_DEFAULT
+        return 1
+
+    @reg("GetMenuDefaultItem", "puu")
+    def _gmdi(c, h, bypos, flags):
+        m = MENU(h)
+        if m is None:
+            return 0xFFFFFFFF
+        for i, it in enumerate(m.items):
+            if it.state & MF_DEFAULT:
+                return i if bypos else it.id
+        return 0xFFFFFFFF
+
+    @reg("HiliteMenuItem", "ppuu")
+    def _hmi(c, h, hm, item, flags):
+        return 1
+
+    @reg("GetMenuItemRect", "ppup")
+    def _gmir(c, h, hm, item, r):
+        m = MENU(hm)
+        w = W(h)
+        if m is None or not 0 <= item < len(m.items):
+            return 0
+        it = m.items[item]
+        if w is not None and w.menu == hm:
+            _wr_rect(M_, r, _menubar_item_screen_rect(wm, w, item))
+        else:
+            _wr_rect(M_, r, it.rect)
+        return 1
+
+    @reg("MenuItemFromPoint", "ppQ")
+    def _mifp(c, h, hm, pt):
+        w = W(h)
+        if w is None:
+            return 0xFFFFFFFF
+        x, y = _s32(pt & 0xFFFFFFFF), _s32((pt >> 32) & 0xFFFFFFFF)
+        i = _menubar_item_at(wm, w, x, y)
+        return i if i >= 0 else 0xFFFFFFFF
+
+    @reg("SetMenuInfo", "pp")
+    def _smi(c, h, a):
+        m = MENU(h)
+        if m is None:
+            return 0
+        mask = M_.read32(a + 4)
+        if mask & 0x10:
+            m.style = M_.read32(a + 8)
+        if mask & 1:
+            m.max_h = M_.read32(a + 12)
+        if mask & 2:
+            m.brush = wm.rp(a + 16)
+        if mask & 4:
+            m.help = M_.read32(a + 16 + wm.ps)
+        if mask & 8:
+            m.data = wm.rp(a + 16 + wm.ps + 4 + (4 if wm.ps == 8 else 0))
+        return 1
+
+    @reg("GetMenuInfo", "pp")
+    def _gmi(c, h, a):
+        m = MENU(h)
+        if m is None:
+            return 0
+        M_.write32(a + 8, m.style)
+        M_.write32(a + 12, m.max_h)
+        wm.wp(a + 16, m.brush)
+        return 1
+
+    @reg("SetMenuItemBitmaps", "puupp")
+    def _smib(c, h, pos, flags, unchk, chk):
+        m = MENU(h)
+        mm, i = _menu_find(wm, m, pos, bool(flags & MF_BYPOSITION))
+        if mm is None:
+            return 0
+        mm.items[i].chk, mm.items[i].unchk = chk, unchk
+        return 1
+
+    reg("GetMenuCheckMarkDimensions", "")(lambda c: (13 << 16) | 13)
+    reg("GetMenuContextHelpId", "p")(lambda c, h: MENU(h).help if MENU(h) else 0)
+    reg("SetMenuContextHelpId", "pu")(lambda c, h, v: 1)
+    reg("GetMenuBarInfo", "piip")(lambda c, *a: 0)
+
+    @reg("EndMenu", "")
+    def _endmenu(c):
+        if wm.menu_state is not None:
+            wm.menu_state["cancel"] = True
+        return 1
+
+    @reg("GetSystemMenu", "pi", "p")
+    def _getsysmenu(c, h, revert):
+        w = W(h)
+        if w is None:
+            return 0
+        if revert:
+            w.py.pop("sysmenu", None)
+            return 0
+        return _system_menu(wm, w).h
+
+    def _track(c, hm, flags, x, y, h, excl):
+        w = W(h)
+        m = MENU(hm)
+        if w is None or m is None:
+            return 0
+        r = _menu_track(wm, h, hm, x, y, flags, exclude=excl)
+        return r if flags & 0x100 else (1 if r else 0)
+
+    reg("TrackPopupMenu", "puiiipp")(lambda c, hm, f, x, y, res, h, r: _track(c, hm, f, x, y, h, None))
+
+    @reg("TrackPopupMenuEx", "puiipp")
+    def _tpmex(c, hm, f, x, y, h, params):
+        excl = _rd_rect(M_, params + 4) if params else None
+        return _track(c, hm, f, x, y, h, excl)
+
+    def _loadmenu(c, inst, name, wide):
+        data = _res_bytes(p, inst, 4, _res_key(p, name, wide))
+        if data is None:
+            return err(1812)
+        return _parse_menu_res(wm, data)
+
+    reg("LoadMenuA", "pp", "p")(lambda c, i, n: _loadmenu(c, i, n, False))
+    reg("LoadMenuW", "pp", "p")(lambda c, i, n: _loadmenu(c, i, n, True))
+    reg("LoadMenuIndirectA LoadMenuIndirectW", "p", "p")(lambda c, a: _menu_from_template(wm, a))
+
+    # ---- accelerators ---------------------------------------------------------------------------
+    @reg("LoadAcceleratorsA LoadAcceleratorsW", "pp", "p")
+    def _loadaccel(c, inst, name):
+        key = _res_key(p, name, True) if name >= 0x10000 else name
+        if name >= 0x10000:
+            try:
+                key = _res_key(p, name, M_.read16(name) < 0x100 and M_.read8(name + 1) == 0)
+            except Exception:
+                pass
+        data = _res_bytes(p, inst, 9, key)
+        if data is None and name >= 0x10000:
+            data = _res_bytes(p, inst, 9, _res_key(p, name, False))
+        if data is None:
+            return err(1814)
+        ents = []
+        for i in range(0, len(data) - 7, 8):
+            fl, key_, cmd, _pad = struct.unpack_from("<HHHH", data, i)
+            ents.append((fl & 0x7F, key_, cmd))
+            if fl & 0x80:
+                break
+        return gdi.add(_GMisc("accel", ents=ents))
+
+    def _create_accel(c, a, n, wide):
+        ents = []
+        for i in range(n):
+            fl, key_, cmd = struct.unpack("<BxHH", M_.read(a + 6 * i, 6))
+            ents.append((fl & 0x7F, key_, cmd))
+        return gdi.add(_GMisc("accel", ents=ents))
+
+    reg("CreateAcceleratorTableA", "pi", "p")(lambda c, a, n: _create_accel(c, a, n, False))
+    reg("CreateAcceleratorTableW", "pi", "p")(lambda c, a, n: _create_accel(c, a, n, True))
+
+    @reg("DestroyAcceleratorTable", "p")
+    def _destroyaccel(c, h):
+        return 1 if gdi.objs.pop(h & 0xFFFFFFFF, None) is not None else 0
+
+    @reg("CopyAcceleratorTableA CopyAcceleratorTableW", "ppi")
+    def _copyaccel(c, h, a, n):
+        t = gdi.get(h, "accel")
+        if t is None:
+            return 0
+        if not a:
+            return len(t.ents)
+        for i, (fl, key_, cmd) in enumerate(t.ents[:n]):
+            M_.write(a + 6 * i, struct.pack("<BxHH", fl, key_, cmd))
+        return min(n, len(t.ents))
+
+    def _translate_accel(c, h, haccel, a):
+        t = gdi.get(haccel, "accel")
+        w = W(h)
+        if t is None or w is None or not a:
+            return 0
+        m = _read_msg_rec(wm, a)
+        msg = m["msg"]
+        if msg not in (0x100, WM_SYSKEYDOWN, WM_CHAR, WM_SYSCHAR):
+            return 0
+        key = m["w"] & 0xFFFF
+        shift = bool(wm.keys[0x10] & 0x80)
+        ctrl = bool(wm.keys[0x11] & 0x80)
+        alt = bool(wm.keys[0x12] & 0x80) or bool(m["l"] & (1 << 29))
+        for (fl, k_, cmd) in t.ents:
+            if fl & 1:                                           # FVIRTKEY
+                if msg not in (0x100, WM_SYSKEYDOWN) or k_ != key:
+                    continue
+                if bool(fl & 4) != shift or bool(fl & 8) != ctrl or bool(fl & 0x10) != alt:
+                    continue
+            else:
+                if msg not in (WM_CHAR, WM_SYSCHAR) or k_ != key:
+                    continue
+                if bool(fl & 0x10) != alt:
+                    continue
+            top = wm.top(w)
+            menu = MENU(top.menu) if top is not None else None
+            if menu is not None:
+                mm, i = _menu_find(wm, menu, cmd, False)
+                if mm is not None and mm.items[i].state & (MF_GRAYED | MF_DISABLED):
+                    return 1
+                if menu is not None and not (fl & 2):
+                    wm.send(h, WM_INITMENU, menu.h, 0)
+            if wm.capture:
+                return 1
+            wm.send(h, 0x0111, (cmd & 0xFFFF) | (1 << 16), 0)
+            return 1
+        return 0
+
+    reg("TranslateAcceleratorA TranslateAcceleratorW TranslateAccelerator", "ppp")(_translate_accel)
+
+    # ---- dialogs ---------------------------------------------------------------------------
+    def _find_dlg_template(inst, name, wide):
+        key = _res_key(p, name, wide) if name >= 0x10000 else name
+        r = _res_find(p, inst, 5, key)
+        if r is None and inst:
+            r = _res_find(p, 0, 5, key)
+        return r[0] if r else 0
+
+    def _create_dialog(c, inst, tpl, owner, proc, param, wide, modal, indirect):
+        addr = tpl if indirect else _find_dlg_template(inst, tpl, wide)
+        if not addr:
+            p.log.warn("dialog template %r not found" % (tpl,))
+            return err(1813) if not modal else 0xFFFFFFFF
+        h = _dlg_create(wm, inst, addr, owner & 0xFFFFFFFF, proc, param, wide, modal)
+        w = W(h)
+        if w is not None:
+            w.py["dlgwide"] = wide
+        if not modal:
+            return h
+        if not h:
+            return 0xFFFFFFFF
+        return _dialog_modal(wm, h, owner & 0xFFFFFFFF)
+
+    reg("CreateDialogParamA", "ppppp", "p")(lambda c, i, t, o, pr, prm: _create_dialog(c, i, t, o, pr, prm, False, False, False))
+    reg("CreateDialogParamW", "ppppp", "p")(lambda c, i, t, o, pr, prm: _create_dialog(c, i, t, o, pr, prm, True, False, False))
+    reg("CreateDialogIndirectParamA", "ppppp", "p")(lambda c, i, t, o, pr, prm: _create_dialog(c, i, t, o, pr, prm, False, False, True))
+    reg("CreateDialogIndirectParamW", "ppppp", "p")(lambda c, i, t, o, pr, prm: _create_dialog(c, i, t, o, pr, prm, True, False, True))
+    reg("CreateDialogIndirectParamAorW", "pppppu", "p")(lambda c, i, t, o, pr, prm, f: _create_dialog(c, i, t, o, pr, prm, True, False, True))
+    reg("DialogBoxParamA", "ppppp", "p")(lambda c, i, t, o, pr, prm: _create_dialog(c, i, t, o, pr, prm, False, True, False))
+    reg("DialogBoxParamW", "ppppp", "p")(lambda c, i, t, o, pr, prm: _create_dialog(c, i, t, o, pr, prm, True, True, False))
+    reg("DialogBoxIndirectParamA", "ppppp", "p")(lambda c, i, t, o, pr, prm: _create_dialog(c, i, t, o, pr, prm, False, True, True))
+    reg("DialogBoxIndirectParamW", "ppppp", "p")(lambda c, i, t, o, pr, prm: _create_dialog(c, i, t, o, pr, prm, True, True, True))
+    reg("DialogBoxIndirectParamAorW", "pppppu", "p")(lambda c, i, t, o, pr, prm, f: _create_dialog(c, i, t, o, pr, prm, True, True, True))
+
+    @reg("EndDialog", "pp")
+    def _enddialog(c, h, res):
+        return _end_dialog(wm, h, res)
+
+    def _dlgitem(h, cid):
+        w = W(h)
+        if w is None:
+            return None
+        cid &= 0xFFFFFFFF
+        for ch in w.children:
+            if (ch.id & 0xFFFFFFFF) == cid and not ch.dead:
+                return ch
+        for ch in w.children:
+            if (ch.id & 0xFFFF) == (cid & 0xFFFF) and not ch.dead:
+                return ch
+        return None
+
+    @reg("GetDlgItem", "pi", "p")
+    def _getdlgitem(c, h, cid):
+        ch = _dlgitem(h, cid)
+        if ch is None:
+            return err(1421)
+        return ch.hwnd
+
+    @reg("GetDlgCtrlID", "p")
+    def _getdlgctrlid(c, h):
+        w = W(h)
+        return w.id & 0xFFFFFFFF if w is not None and w.style & WS_CHILD else 0
+
+    def _setdlgtext(c, h, cid, s, wide):
+        ch = _dlgitem(h, cid)
+        if ch is None:
+            return 0
+        wm.send(ch.hwnd, WM_SETTEXT, 0, s, wide)
+        return 1
+
+    reg("SetDlgItemTextA", "pip")(lambda c, h, i, s: _setdlgtext(c, h, i, s, False))
+    reg("SetDlgItemTextW", "pip")(lambda c, h, i, s: _setdlgtext(c, h, i, s, True))
+
+    def _getdlgtext(c, h, cid, buf, n, wide):
+        ch = _dlgitem(h, cid)
+        if ch is None:
+            if buf and n > 0:
+                M_.write(buf, b"\0\0" if wide else b"\0")
+            return 0
+        return wm.send(ch.hwnd, WM_GETTEXT, n, buf, wide) if buf and n > 0 else 0
+
+    reg("GetDlgItemTextA", "pipi")(lambda c, h, i, b, n: _getdlgtext(c, h, i, b, n, False))
+    reg("GetDlgItemTextW", "pipi")(lambda c, h, i, b, n: _getdlgtext(c, h, i, b, n, True))
+
+    @reg("SetDlgItemInt", "piui")
+    def _setdlgint(c, h, cid, v, signed):
+        s = str(_s32(v) if signed else v)
+        mark = wm.scratch_mark()
+        try:
+            return _setdlgtext(c, h, cid, wm.scratch(s.encode("utf-16-le") + b"\0\0"), True)
+        finally:
+            wm.scratch_release(mark)
+
+    @reg("GetDlgItemInt", "pipi")
+    def _getdlgint(c, h, cid, ok, signed):
+        ch = _dlgitem(h, cid)
+        text = ch.text.strip() if ch is not None else ""
+        val, good = 0, False
+        try:
+            val = int(text)
+            good = (not signed and 0 <= val <= 0xFFFFFFFF) or (signed and -2 ** 31 <= val < 2 ** 31)
+        except ValueError:
+            good = False
+        if ok:
+            M_.write32(ok, 1 if good else 0)
+        return (val & 0xFFFFFFFF) if good else 0
+
+    @reg("CheckDlgButton", "piu")
+    def _checkdlgbtn(c, h, cid, state):
+        ch = _dlgitem(h, cid)
+        if ch is None:
+            return 0
+        wm.send(ch.hwnd, 0xF1, state, 0)
+        return 1
+
+    @reg("IsDlgButtonChecked", "pi")
+    def _isdlgbtnchecked(c, h, cid):
+        ch = _dlgitem(h, cid)
+        if ch is None:
+            return 0
+        return wm.send(ch.hwnd, 0xF0, 0, 0)
+
+    @reg("CheckRadioButton", "piii")
+    def _checkradio(c, h, first, last, check):
+        w = W(h)
+        if w is None:
+            return 0
+        for ch in w.children:
+            if min(first, last) <= ch.id <= max(first, last):
+                wm.send(ch.hwnd, 0xF1, 1 if ch.id == check else 0, 0)
+        return 1
+
+    def _senddlgitem(c, h, cid, m, w_, l_, wide):
+        ch = _dlgitem(h, cid)
+        if ch is None:
+            return 0
+        return wm.send(ch.hwnd, m, w_, l_, wide)
+
+    reg("SendDlgItemMessageA", "piupp", "p")(lambda c, h, i, m, w_, l_: _senddlgitem(c, h, i, m, w_, l_, False))
+    reg("SendDlgItemMessageW", "piupp", "p")(lambda c, h, i, m, w_, l_: _senddlgitem(c, h, i, m, w_, l_, True))
+
+    @reg("GetNextDlgTabItem", "ppi", "p")
+    def _gndti(c, h, ctl, prev):
+        w = W(h)
+        if w is None:
+            return 0
+        n = _dlg_next_tab(wm, w, W(ctl), bool(prev))
+        return n.hwnd if n is not None else 0
+
+    @reg("GetNextDlgGroupItem", "ppi", "p")
+    def _gndgi(c, h, ctl, prev):
+        w = W(h)
+        cw = W(ctl)
+        if w is None:
+            return 0
+        if cw is None:
+            items = _dlg_tab_items(wm, w)
+            return items[0].hwnd if items else 0
+        n = _dlg_next_group(wm, w, cw, bool(prev))
+        return n.hwnd if n is not None else ctl
+
+    @reg("MapDialogRect", "pp")
+    def _mapdlgrect(c, h, r):
+        w = W(h)
+        if w is None:
+            return 0
+        bx, by = w.py.get("base", (6, 13))
+        l, t, rr, b = _rd_rect(M_, r)
+        _wr_rect(M_, r, (l * bx // 4, t * by // 8, rr * bx // 4, b * by // 8))
+        return 1
+
+    @reg("GetDialogBaseUnits", "")
+    def _gdbu(c):
+        return (16 << 16) | 8
+
+    def _isdlgmsg(c, h, a, wide):
+        w = W(h)
+        if w is None or not a:
+            return 0
+        m = _read_msg_rec(wm, a)
+        return 1 if _is_dialog_message(wm, w, m) else 0
+
+    reg("IsDialogMessageA IsDialogMessage", "pp")(lambda c, h, a: _isdlgmsg(c, h, a, False))
+    reg("IsDialogMessageW", "pp")(lambda c, h, a: _isdlgmsg(c, h, a, True))
+    reg("DlgDirListA DlgDirListW", "ppiiu")(lambda c, *a: 0)
+    reg("DlgDirListComboBoxA DlgDirListComboBoxW", "ppiiu")(lambda c, *a: 0)
+    reg("DlgDirSelectExA DlgDirSelectExW DlgDirSelectComboBoxExA DlgDirSelectComboBoxExW",
+        "ppii")(lambda c, *a: 0)
+
+    # ---- MessageBox ---------------------------------------------------------------------------
+    def _msgbox(c, h, text_a, cap_a, style, wide):
+        text = wm.gstr(text_a, wide) if text_a else ""
+        cap = wm.gstr(cap_a, wide) if cap_a else None
+        return _message_box(wm, h & 0xFFFFFFFF, text, cap, style)
+
+    reg("MessageBoxA", "pppu")(lambda c, h, t, cp, s: _msgbox(c, h, t, cp, s, False))
+    reg("MessageBoxW", "pppu")(lambda c, h, t, cp, s: _msgbox(c, h, t, cp, s, True))
+    reg("MessageBoxExA", "pppuu")(lambda c, h, t, cp, s, l: _msgbox(c, h, t, cp, s, False))
+    reg("MessageBoxExW", "pppuu")(lambda c, h, t, cp, s, l: _msgbox(c, h, t, cp, s, True))
+    reg("MessageBoxTimeoutA", "pppuuu")(lambda c, h, t, cp, s, l, ms: _msgbox(c, h, t, cp, s, False))
+    reg("MessageBoxTimeoutW", "pppuuu")(lambda c, h, t, cp, s, l, ms: _msgbox(c, h, t, cp, s, True))
+
+    def _msgbox_ind(c, a, wide):
+        ps = wm.ps
+        if ps == 8:
+            h = M_.read64(a + 8)
+            text, cap = M_.read64(a + 24), M_.read64(a + 32)
+            style = M_.read32(a + 40)
+        else:
+            h, _inst, text, cap, style = struct.unpack("<IIIII", M_.read(a + 4, 20))
+        return _msgbox(c, h, text, cap, style, wide)
+
+    reg("MessageBoxIndirectA", "p")(lambda c, a: _msgbox_ind(c, a, False))
+    reg("MessageBoxIndirectW", "p")(lambda c, a: _msgbox_ind(c, a, True))
+
+    # ---- resources (module aware) -------------------------------------------------------------
+    rsrc = {}
+
+    def _findres(c, hmod, name, typ, wide, lang=None):
+        n = _res_key(p, name, wide)
+        t = _res_key(p, typ, wide)
+        r = _res_find(p, hmod, t, n, lang)
+        if r is None:
+            return err(1812 if lang is None else 1815)
+        h = gdi.add(_GMisc("hrsrc", addr=r[0], size=r[1], mod=r[2].base))
+        return h
+
+    K32 = ("kernel32.dll", "kernelbase.dll")
+    R("FindResourceA", "ppp", "p", dlls=K32)(lambda c, m, n, t: _findres(c, m, n, t, False))
+    R("FindResourceW", "ppp", "p", dlls=K32)(lambda c, m, n, t: _findres(c, m, n, t, True))
+    R("FindResourceExA", "pppu", "p", dlls=K32)(lambda c, m, t, n, l: _findres(c, m, n, t, False, l & 0xFFFF))
+    R("FindResourceExW", "pppu", "p", dlls=K32)(lambda c, m, t, n, l: _findres(c, m, n, t, True, l & 0xFFFF))
+
+    @R("LoadResource", "pp", "p", dlls=K32)
+    def _loadres(c, hmod, h):
+        r = gdi.get(h, "hrsrc")
+        return r.addr if r is not None else err(6)
+
+    @R("SizeofResource", "pp", dlls=K32)
+    def _sizeofres(c, hmod, h):
+        r = gdi.get(h, "hrsrc")
+        return r.size if r is not None else err(6)
+
+    R("LockResource", "p", "p", dlls=K32)(lambda c, h: h)
+    R("FreeResource", "p", dlls=K32)(lambda c, h: 0)
+
+    def _enumres(c, hmod, typ, proc, lp, what, wide):
+        m = _res_module(p, hmod)
+        if m is None or m.pe is None:
+            return err(1812)
+        seen = []
+        t_key = _res_key(p, typ, wide) if what != "types" else None
+        for ent in m.pe.resources:
+            path = ent["path"]
+            if len(path) < 2:
+                continue
+            if what == "types":
+                v = path[0]
+            else:
+                tn = path[0].upper() if isinstance(path[0], str) else path[0]
+                if tn != t_key:
+                    continue
+                v = path[1]
+            if v in seen:
+                continue
+            seen.append(v)
+        for v in seen:
+            mark = wm.scratch_mark()
+            try:
+                if isinstance(v, str):
+                    va = wm.scratch((v.encode("utf-16-le") + b"\0\0") if wide else v.encode() + b"\0")
+                else:
+                    va = v
+                args = [hmod, va, lp] if what == "types" else [hmod, typ, va, lp]
+                r = p.call_guest(proc, args)
+            finally:
+                wm.scratch_release(mark)
+            if not (r & 0xFFFFFFFF):
+                break
+        return 1
+
+    R("EnumResourceNamesA", "pppp", dlls=K32)(lambda c, m, t, pr, lp: _enumres(c, m, t, pr, lp, "names", False))
+    R("EnumResourceNamesW", "pppp", dlls=K32)(lambda c, m, t, pr, lp: _enumres(c, m, t, pr, lp, "names", True))
+    R("EnumResourceTypesA", "ppp", dlls=K32)(lambda c, m, pr, lp: _enumres(c, m, 0, pr, lp, "types", False))
+    R("EnumResourceTypesW", "ppp", dlls=K32)(lambda c, m, pr, lp: _enumres(c, m, 0, pr, lp, "types", True))
+
+    def _loadstring(c, inst, sid, buf, n, wide):
+        sid &= 0xFFFF
+        data = _res_bytes(p, inst, 6, (sid >> 4) + 1)
+        if data is None and inst:
+            data = _res_bytes(p, 0, 6, (sid >> 4) + 1)
+        s = None
+        if data is not None:
+            pos = 0
+            for i in range(16):
+                if pos + 2 > len(data):
+                    break
+                ln = struct.unpack_from("<H", data, pos)[0]
+                pos += 2
+                if i == (sid & 15):
+                    s = data[pos:pos + 2 * ln].decode("utf-16-le", "replace")
+                    break
+                pos += 2 * ln
+        if not s:
+            if buf and n > 0:
+                M_.write(buf, b"\0\0" if wide else b"\0")
+            return err(1814) if s is None else 0
+        if wide and n == 0 and buf:
+            # returns a read-only pointer to the resource string itself
+            r = _res_find(p, inst, 6, (sid >> 4) + 1)
+            if r is not None:
+                off = 0
+                pos = 0
+                for i in range(16):
+                    ln = struct.unpack_from("<H", data, pos)[0]
+                    if i == (sid & 15):
+                        wm.wp(buf, r[0] + pos + 2)
+                        return ln
+                    pos += 2 + 2 * ln
+            return 0
+        return wm.put_str(buf, n, s, wide)
+
+    reg("LoadStringA", "pupi")(lambda c, i, s, b, n: _loadstring(c, i, s, b, n, False))
+    reg("LoadStringW", "pupi")(lambda c, i, s, b, n: _loadstring(c, i, s, b, n, True))
+    R("LoadStringA", "pupi", dlls=K32)(lambda c, i, s, b, n: _loadstring(c, i, s, b, n, False))
+    R("LoadStringW", "pupi", dlls=K32)(lambda c, i, s, b, n: _loadstring(c, i, s, b, n, True))
+
+    return wm
+
+
+def _gui_install(k):
+    """Install GDI + USER (window manager, controls, dialogs, menus)."""
+    _gdi_install(k)
+    _user_install(k)
+    _user_install2(k)
+    _user_install3(k)
+
+
+# -- displays: headless (PNG dump / scripted input), Tk, AetherOS web sessions ----------------------
+
+def _window_frame(wm, w):
+    """Area inside the border + caption (menu bar and client) in window coordinates."""
+    L = _nc_layout(wm, w)
+    b = L["b"]
+    return (b, b + L["cap"], w.w - b, w.h - b)
+
+
+def _composite(wm, surf=None, include_caret=True):
+    """Compose all visible top-level windows (z-order) onto a screen-sized surface."""
+    gdi = wm.gdi
+    s = surf or _Surf(gdi.screen.w, gdi.screen.h, _cr_pix(gdi.sys_color(COLOR_BACKGROUND)))
+    for w in reversed(wm.desktop.children):
+        if w.dead or not (w.style & WS_VISIBLE) or w.surf is None or w.min_state == 1:
+            continue
+        ws = w.surf
+        for j in range(min(w.h, ws.h)):
+            y = w.y + j
+            if not 0 <= y < s.h:
+                continue
+            a, b = max(0, w.x), min(s.w, w.x + min(w.w, ws.w))
+            if a >= b:
+                continue
+            s.px[(y * s.w + a) * 4:(y * s.w + b) * 4] = \
+                ws.px[(j * ws.w + (a - w.x)) * 4:(j * ws.w + (b - w.x)) * 4]
+    if include_caret:
+        ci = wm.caret_info()
+        if ci is not None:
+            top = wm.wnd(ci[0])
+            if top is not None:
+                _fill(s, [(0, 0, s.w, s.h)], top.x + ci[1], top.y + ci[2],
+                      top.x + ci[1] + ci[3], top.y + ci[2] + ci[4], b"\xff\xff\xff\x00", 7)
+    return s
+
+
+class NOODisplay:
+    """Base display: owns the input inbox and the idle/present protocol."""
+
+    kind = "headless"
+
+    def __init__(self, p):
+        self.p = p
+        self.wm = None
+        self.inbox = []
+        self.cv = _py_threading.Condition()
+        self.last_pump = 0.0
+        self.idle_seq = 0
+        self.rev = 1
+        self.clip_text = None
+        self.idle_since = None
+
+    def attach(self, wm):
+        self.wm = wm
+
+    # -- input ----------------------------------------------------------------------------
+    def push(self, ev):
+        with self.cv:
+            self.inbox.append(ev)
+            self.cv.notify_all()
+
+    def pump(self):
+        self.last_pump = time.monotonic()
+        if not self.inbox:
+            return
+        with self.cv:
+            evs, self.inbox = self.inbox, []
+        for ev in evs:
+            self.wm.inject(ev)
+
+    def maybe_pump(self):
+        if time.monotonic() - self.last_pump > 0.02:
+            self.pump()
+            self.present()
+
+    def idle(self, timeout):
+        """Nothing runnable: present, report idle, wait for input or the deadline."""
+        self.pump()
+        self.present()
+        with self.cv:
+            self.idle_seq += 1
+            self.cv.notify_all()
+            if not self.inbox and timeout > 0:
+                self.cv.wait(timeout)
+        self.pump()
+
+    def present(self):
+        pass
+
+    def auto_answer(self):
+        return False
+
+    def title_changed(self, w):
+        self.rev += 1
+
+    def clipboard_set(self, text):
+        self.clip_text = text
+
+    def clipboard_get(self):
+        return self.clip_text
+
+    def file_dialog(self, save, title, filt, initial):
+        return None
+
+    def file_open_dialog(self, title, filt):
+        return self.file_dialog(False, title, filt, None)
+
+    def file_save_dialog(self, title, filt):
+        return self.file_dialog(True, title, filt, None)
+
+    def color_dialog(self, rgb):
+        return None
+
+    def message_box(self, title, text, style):
+        return None
+
+
+class NOOHeadlessDisplay(NOODisplay):
+    """No screen. Optional scripted input (NOO_GUI_SCRIPT) and PNG dumps (NOO_GUI_DUMP).
+    Without a script, an idle GUI is closed politely (WM_CLOSE to the active window,
+    then WM_QUIT) so unattended runs terminate like the old headless backend."""
+
+    kind = "headless"
+
+    def __init__(self, p, script=None):
+        super().__init__(p)
+        self.script = list(script or [])
+        self.scripted = script is not None
+        self.dump_dir = os.environ.get("NOO_GUI_DUMP") or None
+        self.dumped = {}
+        self.close_attempts = 0
+        self.wait_until = 0.0
+        self.shots = 0
+
+    def auto_answer(self):
+        return not self.scripted
+
+    def _step_script(self):
+        """Feed the next scripted event; returns True if something happened."""
+        now = time.monotonic()
+        if now < self.wait_until:
+            return False
+        while self.script:
+            ev = self.script.pop(0)
+            t = ev.get("type")
+            if t == "wait":
+                self.wait_until = now + float(ev.get("seconds", 0.1))
+                return True
+            if t == "shot":
+                self.shots += 1
+                name = ev.get("name") or "shot%d" % self.shots
+                if self.dump_dir:
+                    self.dump(name)
+                continue
+            if t == "call":
+                try:
+                    ev["fn"](self.p)
+                except Exception as e:
+                    self.p.log.warn("GUI script call failed: %s" % e)
+                continue
+            if ev.get("find") is not None:
+                ev = self._resolve(ev)
+                if ev is None:
+                    return True
+            for e2 in self._expand(ev):
+                self.wm.inject(e2)
+            return True
+        return False
+
+    def _expand(self, ev):
+        """Script conveniences: click, keys (typed text), press (key chord)."""
+        t = ev.get("type")
+        if t == "click":
+            base = {"type": "mouse", "hwnd": ev.get("hwnd", 0), "x": ev["x"], "y": ev["y"],
+                    "button": ev.get("button", 0)}
+            out = [dict(base, action="move"), dict(base, action="down"), dict(base, action="up")]
+            if ev.get("double"):
+                out += [dict(base, action="down"), dict(base, action="up")]
+            return out
+        if t == "keys":
+            out = []
+            for ch in ev.get("text", ""):
+                if ch == "\n":
+                    out += [{"type": "key", "action": "down", "vk": 13},
+                            {"type": "key", "action": "up", "vk": 13}]
+                    continue
+                vk = ord(ch.upper()) if ch.isalnum() and ord(ch) < 128 else \
+                    {" ": 32, ".": 0xBE, ",": 0xBC, "-": 0xBD}.get(ch, 0)
+                shift = ch.isupper()
+                if shift:
+                    out.append({"type": "key", "action": "down", "vk": 0x10})
+                out.append({"type": "key", "action": "down", "vk": vk, "char": ch})
+                out.append({"type": "key", "action": "up", "vk": vk})
+                if shift:
+                    out.append({"type": "key", "action": "up", "vk": 0x10})
+            return out
+        if t == "press":
+            mods = [m for m, k_ in ((0x11, "ctrl"), (0x10, "shift"), (0x12, "alt")) if ev.get(k_)]
+            out = [{"type": "key", "action": "down", "vk": m} for m in mods]
+            out.append({"type": "key", "action": "down", "vk": ev["vk"], "char": ev.get("char")})
+            out.append({"type": "key", "action": "up", "vk": ev["vk"]})
+            out += [{"type": "key", "action": "up", "vk": m} for m in reversed(mods)]
+            return out
+        return [ev]
+
+    def _resolve(self, ev):
+        """Script helper: {"find": text, "cls": name} targets a window by its text;
+        x / y (default: centre) are relative to it (or its client area)."""
+        wm = self.wm
+        want = ev["find"]
+        cls = (ev.get("cls") or "").upper()
+        hit = None
+        for w in list(wm.wins.values()):
+            if w.dead or w is wm.desktop or not wm.visible(w):
+                continue
+            if w.text.replace("&", "") != want.replace("&", ""):
+                continue
+            if cls and (w.cls is None or w.cls.name.upper() != cls):
+                continue
+            hit = w
+        if hit is None:
+            tries = ev.get("_tries", 0)
+            if tries < 50:
+                ev["_tries"] = tries + 1
+                self.script.insert(0, ev)
+                self.wait_until = time.monotonic() + 0.02
+            else:
+                self.p.log.warn("GUI script: no window %r" % want)
+            return None
+        if ev.get("client"):
+            ox, oy = wm.client_origin(hit)
+            cw, ch = hit.cl[2] - hit.cl[0], hit.cl[3] - hit.cl[1]
+        else:
+            ox, oy = wm.screen_origin(hit)
+            cw, ch = hit.w, hit.h
+        out = {k_: v for k_, v in ev.items() if k_ not in ("find", "cls", "client", "_tries")}
+        out["hwnd"] = 0
+        out["x"] = ox + int(ev.get("x", cw // 2))
+        out["y"] = oy + int(ev.get("y", ch // 2))
+        if ev.get("type") == "close":
+            out = {"type": "close", "hwnd": wm.top(hit).hwnd}
+        return out
+
+    def dump(self, name="screen"):
+        try:
+            os.makedirs(self.dump_dir, exist_ok=True)
+            s = _composite(self.wm)
+            with open(os.path.join(self.dump_dir, name + ".png"), "wb") as fh:
+                fh.write(s.to_png())
+        except Exception as e:
+            self.p.log.warn("GUI dump failed: %s" % e)
+
+    def idle(self, timeout):
+        self.pump()
+        with self.cv:
+            self.idle_seq += 1
+            self.cv.notify_all()
+        if self.script:
+            if self._step_script():
+                self.idle_since = None
+                return
+            time.sleep(min(timeout, max(0.0, self.wait_until - time.monotonic())) if timeout > 0 else 0)
+            return
+        if self.scripted and self.dump_dir and not self.dumped.get("final"):
+            self.dumped["final"] = True
+            self.dump("final")
+        now = time.monotonic()
+        if self.idle_since is None:
+            self.idle_since = now
+        if now - self.idle_since >= (0.3 if self.scripted else 1.0):
+            self.idle_since = now
+            self._auto_close()
+        if timeout > 0:
+            time.sleep(min(timeout, 0.01))
+
+    def _auto_close(self):
+        wm = self.wm
+        self.close_attempts += 1
+        target = wm.wnd(wm.modal[-1]) if wm.modal else None
+        if target is None:
+            target = wm.wnd(wm.active)
+        if target is None:
+            for w in wm.desktop.children:
+                if not w.dead and w.style & WS_VISIBLE:
+                    target = w
+                    break
+        if target is not None and self.close_attempts <= 6:
+            self.p.log.warn("[GUI] headless idle — sending WM_CLOSE to %r" % target.text)
+            wm.post(target.hwnd, WM_SYSCOMMAND, SC_CLOSE, 0)
+            return
+        # nothing (more) to close: end every message loop
+        self.p.log.warn("[GUI] headless idle with no event source — posting WM_QUIT")
+        for t in self.p.threads:
+            if t.state != "dead":
+                q = wm.queue(t.tid)
+                q.quit = 0 if q.quit is None else q.quit
+                q.wake_seq += 1
+
+
+class NOOWebDisplay(NOODisplay):
+    """AetherOS shell display: the emulator runs in its own thread; the bridge
+    pushes DOM input and pulls per-window PNG snapshots."""
+
+    kind = "web"
+
+    def __init__(self, p):
+        super().__init__(p)
+        self.cache = {}                  # hwnd -> (surf rev, png b64)
+        self.snap = None
+        self.snap_lock = _py_threading.Lock()
+        self.last_present = 0.0
+
+    def present(self):
+        now = time.monotonic()
+        if now - self.last_present < 0.03:
+            return
+        self.last_present = now
+        try:
+            s = self.build_snapshot()
+        except Exception as e:
+            self.p.log.warn("GUI snapshot failed: %s" % e)
+            return
+        with self.snap_lock:
+            self.snap = s
+
+    def build_snapshot(self):
+        wm = self.wm
+        wins = []
+        z = 0
+        for w in list(wm.desktop.children):
+            if w.dead or getattr(w, "msg_only", False):
+                continue
+            z += 1
+            surf = w.surf
+            ent = self.cache.get(w.hwnd)
+            png = None
+            srev = surf.rev if surf is not None else 0
+            key = (srev, surf.w if surf else 0, surf.h if surf else 0)
+            if surf is not None and w.style & WS_VISIBLE:
+                if ent is None or ent[0] != key:
+                    png = base64.b64encode(surf.to_png()).decode("ascii")
+                    self.cache[w.hwnd] = (key, png)
+                else:
+                    png = ent[1]
+            fr = _window_frame(wm, w)
+            wins.append({
+                "hwnd": w.hwnd, "title": w.text, "x": w.x, "y": w.y, "w": w.w, "h": w.h,
+                "client": list(w.cl), "frame": list(fr),
+                "caption": (w.style & WS_CAPTION) == WS_CAPTION,
+                "visible": bool(w.style & WS_VISIBLE), "minimized": w.min_state == 1,
+                "maximized": w.min_state == 2, "active": wm.active == w.hwnd,
+                "owner": w.owner, "topmost": bool(w.exstyle & WS_EX_TOPMOST),
+                "enabled": not (w.style & WS_DISABLED),
+                "resizable": bool(w.style & WS_THICKFRAME),
+                "tool": bool(w.exstyle & WS_EX_TOOLWINDOW),
+                "z": z, "rev": "%d:%d:%d" % key, "png": png,
+                "cls": w.cls.name if w.cls is not None else "",
+            })
+        for h in list(self.cache):
+            if wm.wnd(h) is None:
+                del self.cache[h]
+        ci = wm.caret_info()
+        cur = wm.gdi.get(getattr(wm, "cursor", 0))
+        self.rev += 1
+        return {"rev": self.rev, "screen": [wm.gdi.screen.w, wm.gdi.screen.h],
+                "windows": wins, "focus": wm.focus, "active": wm.active,
+                "caret": {"hwnd": ci[0], "x": ci[1], "y": ci[2], "w": ci[3], "h": ci[4]}
+                if ci else None,
+                "cursor": cur.css if cur is not None and hasattr(cur, "css") else "default",
+                "clipboard": self.clip_text}
+
+
+class NOOTkDisplay(NOODisplay):
+    """Real windows through tkinter: each top-level guest window is a Tk toplevel
+    showing the guest-rendered pixels; Tk input is fed back as raw input."""
+
+    kind = "tkinter"
+    _TK_VK = {"BackSpace": 8, "Tab": 9, "Return": 13, "Escape": 27, "space": 32,
+              "Prior": 33, "Next": 34, "End": 35, "Home": 36, "Left": 37, "Up": 38,
+              "Right": 39, "Down": 40, "Insert": 45, "Delete": 46, "Shift_L": 0xA0,
+              "Shift_R": 0xA1, "Control_L": 0xA2, "Control_R": 0xA3, "Alt_L": 0xA4,
+              "Alt_R": 0xA5, "Caps_Lock": 20, "Menu": 93}
+
+    def __init__(self, p, tk, root):
+        super().__init__(p)
+        self.tk = tk
+        self.root = root
+        self.tops = {}                   # hwnd -> dict(top, label, photo, rev, geom)
+        self.origin = (0, 0)
+
+    def _vk(self, e):
+        vk = self._TK_VK.get(e.keysym)
+        if vk is None and e.keysym.startswith("F") and e.keysym[1:].isdigit():
+            vk = 0x6F + int(e.keysym[1:])
+        if vk is None and len(e.keysym) == 1:
+            ch = e.keysym.upper()
+            if "A" <= ch <= "Z" or "0" <= ch <= "9":
+                vk = ord(ch)
+        if vk is None and e.char:
+            vk = {";": 0xBA, "=": 0xBB, ",": 0xBC, "-": 0xBD, ".": 0xBE, "/": 0xBF,
+                  "`": 0xC0, "[": 0xDB, "\\": 0xDC, "]": 0xDD, "'": 0xDE}.get(e.char, 0)
+        return vk or 0
+
+    def _make(self, w):
+        tk = self.tk
+        caption = (w.style & WS_CAPTION) == WS_CAPTION
+        top = tk.Toplevel(self.root)
+        if not caption:
+            top.overrideredirect(True)
+        top.title(w.text or " ")
+        lbl = tk.Label(top, borderwidth=0, highlightthickness=0)
+        lbl.pack(fill="both", expand=True)
+        ent = {"top": top, "label": lbl, "photo": None, "rev": None, "caption": caption,
+               "geom": None}
+        h = w.hwnd
+        wm = self.wm
+
+        def frame_off():
+            ww = wm.wnd(h)
+            return _window_frame(wm, ww)[:2] if ww is not None and caption else (0, 0)
+
+        def mouse(e, act, btn=0):
+            fx, fy = frame_off()
+            ww = wm.wnd(h)
+            if ww is None:
+                return
+            self.push({"type": "mouse", "hwnd": h, "x": e.x + fx, "y": e.y + fy,
+                       "action": act, "button": btn})
+
+        lbl.bind("<Motion>", lambda e: mouse(e, "move"))
+        for b, btn in ((1, 0), (2, 1), (3, 2)):
+            lbl.bind("<ButtonPress-%d>" % b, lambda e, btn=btn: mouse(e, "down", btn))
+            lbl.bind("<ButtonRelease-%d>" % b, lambda e, btn=btn: mouse(e, "up", btn))
+            lbl.bind("<B%d-Motion>" % b, lambda e: mouse(e, "move"))
+        lbl.bind("<MouseWheel>", lambda e: self.push({"type": "mouse", "hwnd": h, "x": e.x,
+                                                      "y": e.y, "action": "wheel",
+                                                      "delta": 120 if e.delta > 0 else -120}))
+        top.bind("<KeyPress>", lambda e: self.push({"type": "key", "action": "down",
+                                                    "vk": self._vk(e), "char": e.char or None,
+                                                    "shift": bool(e.state & 1),
+                                                    "ctrl": bool(e.state & 4)}))
+        top.bind("<KeyRelease>", lambda e: self.push({"type": "key", "action": "up",
+                                                      "vk": self._vk(e)}))
+        top.protocol("WM_DELETE_WINDOW", lambda: self.push({"type": "close", "hwnd": h}))
+
+        def configure(e):
+            if e.widget is not top:
+                return
+            ww = wm.wnd(h)
+            if ww is None or not caption:
+                return
+            fr = _window_frame(wm, ww)
+            fw, fh = fr[2] - fr[0], fr[3] - fr[1]
+            if (e.width, e.height) != (fw, fh) and e.width > 1 and e.height > 1 and \
+                    ww.style & WS_THICKFRAME:
+                self.push({"type": "resize", "hwnd": h, "w": e.width + ww.w - fw,
+                           "h": e.height + ww.h - fh})
+            x, y = top.winfo_rootx() - fr[0], top.winfo_rooty() - fr[1]
+            if (x, y) != (ww.x, ww.y):
+                self.push({"type": "move", "hwnd": h, "x": x, "y": y})
+
+        top.bind("<Configure>", configure)
+        self.tops[h] = ent
+        return ent
+
+    def present(self):
+        wm = self.wm
+        tk = self.tk
+        seen = set()
+        for w in list(wm.desktop.children):
+            if w.dead or getattr(w, "msg_only", False):
+                continue
+            seen.add(w.hwnd)
+            ent = self.tops.get(w.hwnd)
+            vis = bool(w.style & WS_VISIBLE) and w.min_state != 1
+            if ent is None:
+                if not vis:
+                    continue
+                ent = self._make(w)
+            try:
+                top = ent["top"]
+                if not vis:
+                    top.withdraw()
+                    continue
+                fr = _window_frame(wm, w) if ent["caption"] else (0, 0, w.w, w.h)
+                geom = (fr[2] - fr[0], fr[3] - fr[1], w.x + fr[0], w.y + fr[1])
+                if ent["geom"] != geom:
+                    ent["geom"] = geom
+                    top.geometry("%dx%d+%d+%d" % geom)
+                    top.deiconify()
+                if top.title() != (w.text or " "):
+                    top.title(w.text or " ")
+                s = w.surf
+                ci = wm.caret_info()
+                key = (s.rev if s else 0, geom, ci if ci and ci[0] == w.hwnd else None)
+                if s is not None and ent["rev"] != key:
+                    ent["rev"] = key
+                    rows = []
+                    for y in range(fr[1], fr[3]):
+                        row = s.px[(y * s.w + fr[0]) * 4:(y * s.w + fr[2]) * 4]
+                        rgb = bytearray(len(row) // 4 * 3)
+                        rgb[0::3] = row[2::4]
+                        rgb[1::3] = row[1::4]
+                        rgb[2::3] = row[0::4]
+                        rows.append(bytes(rgb))
+                    ppm = ("P6 %d %d 255\n" % (fr[2] - fr[0], fr[3] - fr[1])).encode() + \
+                        b"".join(rows)
+                    photo = tk.PhotoImage(data=ppm, format="PPM")
+                    ent["label"].configure(image=photo)
+                    ent["photo"] = photo
+            except Exception as e:
+                self.p.log.warn("Tk present failed: %s" % e)
+        for h in list(self.tops):
+            if h not in seen:
+                try:
+                    self.tops[h]["top"].destroy()
+                except Exception:
+                    pass
+                del self.tops[h]
+
+    def pump(self):
+        try:
+            self.root.update()
+        except Exception:
+            pass
+        super().pump()
+
+    def idle(self, timeout):
+        end = time.monotonic() + max(0.0, timeout)
+        self.pump()
+        self.present()
+        while not self.inbox and time.monotonic() < end:
+            try:
+                self.root.update()
+            except Exception:
+                pass
+            time.sleep(0.005)
+        self.pump()
+
+    def clipboard_set(self, text):
+        self.clip_text = text
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except Exception:
+            pass
+
+    def clipboard_get(self):
+        try:
+            return self.root.clipboard_get()
+        except Exception:
+            return self.clip_text
+
+    def file_dialog(self, save, title, filt, initial):
+        try:
+            from tkinter import filedialog
+            f = filedialog.asksaveasfilename if save else filedialog.askopenfilename
+            return f(title=title or ("Save As" if save else "Open")) or None
+        except Exception:
+            return None
+
+    def color_dialog(self, rgb):
+        try:
+            from tkinter import colorchooser
+            res, _hx = colorchooser.askcolor(color="#%02x%02x%02x" % (rgb & 255, (rgb >> 8) & 255,
+                                                                     (rgb >> 16) & 255))
+            if res is None:
+                return None
+            r, g, b = (int(v) & 255 for v in res)
+            return r | (g << 8) | (b << 16)
+        except Exception:
+            return None
+
+
+def _make_display(p):
+    """Choose the display for a process (called on the first top-level window)."""
+    if getattr(p, "_force_web_gui", False) or os.environ.get("NOO_WEB_GUI") == "1":
+        p.log.ok("GUI display: AetherOS web (per-window pixel frames)")
+        return NOOWebDisplay(p)
+    script = getattr(p, "gui_script", None)
+    if script is None and os.environ.get("NOO_GUI_SCRIPT"):
+        try:
+            import json as _json
+            with open(os.environ["NOO_GUI_SCRIPT"]) as fh:
+                script = _json.load(fh)
+        except Exception as e:
+            p.log.warn("NOO_GUI_SCRIPT unreadable: %s" % e)
+    if script is not None or os.environ.get("NOO_HEADLESS") == "1" or \
+            getattr(p, "gui_headless", False):
+        return NOOHeadlessDisplay(p, script)
+    if os.environ.get("DISPLAY") or HOST_SYSTEM in ("Windows", "Darwin"):
+        try:
+            import tkinter as tk
+            root = tk.Tk()
+            root.withdraw()
+            p.log.ok("GUI display: tkinter (real windows)")
+            return NOOTkDisplay(p, tk, root)
+        except Exception as e:
+            p.log.warn("GUI display: tkinter unavailable (%s) — headless" % e)
+    return NOOHeadlessDisplay(p, None)
+
+
+def _wm_ensure_display(self):
+    if self.display is None:
+        d = _make_display(self.p)
+        d.attach(self)
+        self.display = d
+    return self.display
+
+
+_WM.ensure_display = _wm_ensure_display
+
+
+# -- AetherOS GUI sessions (threaded emulator) ----------------------------------------------
+
+_GUI_SESSIONS = {}
+_GUI_SESSION_SEQ = [1]
+
+
+class _GuiSession:
+    def __init__(self, sid, rt, proc, tmp_path):
+        self.sid = sid
+        self.rt = rt
+        self.proc = proc
+        self.tmp_path = tmp_path
+        self.exited = False
+        self.exit_code = None
+        self.error = None
+        self.thread = None
+        self.done = _py_threading.Event()
+
+    @property
+    def display(self):
+        wm = getattr(self.proc, "wm", None)
+        return wm.ensure_display() if wm is not None else None
+
+    def start(self):
+        def body():
+            try:
+                code = self.proc.run()
+                self.exit_code = code
+            except NOOExitProcess as e:
+                self.exit_code = e.code
+            except BaseException as e:
+                self.error = str(e)
+                self.exit_code = getattr(self.proc, "exit_code", 0xC0000005) or 1
+                try:
+                    self.proc.log.error("GUI session crashed: %s" % e)
+                except Exception:
+                    pass
+            finally:
+                self.exited = True
+                d = self.display
+                if d is not None:
+                    try:
+                        d.last_present = 0
+                        d.present()
+                    except Exception:
+                        pass
+                    with d.cv:
+                        d.idle_seq += 1
+                        d.cv.notify_all()
+                self.done.set()
+        self.thread = _py_threading.Thread(target=body, name="noo-gui-" + self.sid, daemon=True)
+        self.thread.start()
+
+    def wait_idle(self, after_seq, timeout):
+        d = self.display
+        end = time.monotonic() + timeout
+        if d is None:
+            self.done.wait(timeout)
+            return
+        with d.cv:
+            while not self.exited and d.idle_seq <= after_seq:
+                left = end - time.monotonic()
+                if left <= 0:
+                    break
+                d.cv.wait(min(left, 0.05))
+
+    def snapshot(self, known=None):
+        d = self.display
+        base = {"ok": True, "sid": self.sid, "exited": self.exited, "exit_code": self.exit_code}
+        if self.error:
+            base["error"] = self.error
+        snap = None
+        if d is not None and hasattr(d, "snap_lock"):
+            if d.snap is None:
+                try:
+                    d.last_present = 0
+                    d.present()
+                except Exception:
+                    pass
+            with d.snap_lock:
+                snap = d.snap
+        if snap is None:
+            snap = {"rev": 0, "screen": [1024, 768], "windows": [], "caret": None}
+        out = dict(base)
+        out.update(snap)
+        wins = []
+        for w in snap.get("windows", []):
+            w2 = dict(w)
+            if known and known.get(str(w["hwnd"])) == w["rev"]:
+                w2["png"] = None
+                w2["same"] = True
+            wins.append(w2)
+        out["windows"] = wins
+        p = self.proc
+        out["gl"] = {"rev": getattr(p, "gl_rev", 0), "hwnd": getattr(p, "gl_hwnd", 0),
+                     "commands": list(getattr(p, "gl_commands", []))}
+        out["messageboxes"] = []
+        out["quit"] = self.exit_code or 0
+        return out
+
+    def dispose(self):
+        try:
+            if self.tmp_path and os.path.isfile(self.tmp_path):
+                os.remove(self.tmp_path)
+        except OSError:
+            pass
+
+
+def gui_start(data, args=None, verbose=False, instruction_cap=None, fs_root=None):
+    """Start a Win32 GUI program in a background emulator thread and return the
+    first snapshot once it is idle (or after a start-up timeout). Never raises."""
+    import tempfile
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as fh:
+            fh.write(data)
+            tmp = fh.name
+        sandbox = NOOSandbox(fs_root=fs_root) if fs_root else None
+        rt = Runtime(sandbox=sandbox, verbose=verbose, capture=True)
+        cap = instruction_cap
+        rt.sandbox.max_instructions = max(int(cap or 0), 10 ** 13)
+        proc = NOOProcess(rt, tmp, args or [], rt.log)
+        proc._force_web_gui = True
+        rt.process = proc
+        proc.setup()
+        sid = "gui%d" % _GUI_SESSION_SEQ[0]
+        _GUI_SESSION_SEQ[0] += 1
+        sess = _GuiSession(sid, rt, proc, tmp)
+        _GUI_SESSIONS[sid] = sess
+        sess.start()
+        sess.wait_idle(0, 20.0)
+        return sess.snapshot()
+    except Exception as e:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return {"ok": False, "error": str(e)}
+
+
+def gui_poll(sid, known=None):
+    sess = _GUI_SESSIONS.get(sid)
+    if sess is None:
+        return {"ok": False, "error": "no such GUI session"}
+    try:
+        d = sess.display
+        if d is not None:
+            d.last_present = 0
+        return sess.snapshot(known)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+_LEGACY_EVENTS = {"mousemove": ("mouse", "move", 0), "mousedown": ("mouse", "down", 0),
+                  "mouseup": ("mouse", "up", 0), "rmousedown": ("mouse", "down", 2),
+                  "rmouseup": ("mouse", "up", 2), "dblclick": ("mouse", "dbl", 0)}
+
+
+def gui_event(sid, ev):
+    """Feed one input event (dict) and return the snapshot after the guest reacted.
+    Mouse events use {type:'mouse', action:'move|down|up|wheel', button, x, y} with
+    either hwnd + window-relative coords or hwnd 0 + screen coords; keys use
+    {type:'key', action:'down|up|char', vk, char, shift, ctrl, alt}."""
+    sess = _GUI_SESSIONS.get(sid)
+    if sess is None:
+        return {"ok": False, "error": "no such GUI session"}
+    try:
+        ev = dict(ev or {})
+        known = ev.pop("known", None)
+        t = ev.get("type")
+        if t in _LEGACY_EVENTS:
+            kind, act, btn = _LEGACY_EVENTS[t]
+            ev = {"type": kind, "action": act, "button": btn, "hwnd": int(ev.get("hwnd", 0) or 0),
+                  "x": int(ev.get("x", 0) or 0), "y": int(ev.get("y", 0) or 0),
+                  "client": True}
+        elif t in ("keydown", "keyup"):
+            ev = {"type": "key", "action": "down" if t == "keydown" else "up",
+                  "vk": int(ev.get("key", 0) or 0)}
+        elif t == "char":
+            ev = {"type": "key", "action": "char", "char": chr(int(ev.get("char", 0) or 0))}
+        elif t not in ("mouse", "key", "close", "move", "resize", "activate", "command"):
+            return {"ok": False, "error": "unknown event type: %r" % t}
+        d = sess.display
+        if d is None:
+            return sess.snapshot(known)
+        seq = d.idle_seq
+        d.push(ev)
+        sess.wait_idle(seq, 2.0)
+        d.last_present = 0
+        d.present()
+        return sess.snapshot(known)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def gui_stop(sid):
+    sess = _GUI_SESSIONS.pop(sid, None)
+    if sess is None:
+        return {"ok": True}
+    try:
+        p = sess.proc
+        p.terminate_code = 0
+        d = sess.display
+        if d is not None:
+            with d.cv:
+                d.cv.notify_all()
+        if sess.thread is not None:
+            sess.thread.join(2.0)
+        sess.dispose()
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+# Bitmap glyphs rasterized from the DejaVu fonts (c) Bitstream / DejaVu
+# authors (Bitstream Vera / DejaVu license); regenerate with tools/mkfonts.py
+_NOO_FONT_B64 = (
+    "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"
+    "ljiuLOqPM64s6o8zqSzsj2OdUBb1x5ldFvbHsU4s4/qiqJs/vyzqj3NaWVi/XSwvC+u3i3PKov44a8vC+u3iorKoP87msrB+u6go"
+    "C+u3i61lYf12sb0srN8udpWF9dvt/WVh/XZxVVlYv138qSys3y5uLgvrt4s7yoL67ULcW6bqi9Log2VB/XYhHysL6rcL8feysH67"
+    "eKks6o/zelnQH8cS75aF9dvFh2Vcvz1GR8lnZWH9dvHfsrB+u/i+LKzfLn4tU/WvaE/p5VH9dqdc1b+i0VQ598fR6ZjMLY/64+SX"
+    "R/1xOpRH/XE6lgf12y3ZuTys3252Kw/qt1uyV3nUH2dgedQfZ2h5UL/dEqPLw/rtckK5qs+gafKEclWfgb7izi0P67fLReWqPgMt"
+    "cEZ51B9nVXlYv91cUx7Ub7fMteVB/XZLbCgP6rdbYlN5WL/dLCsP6rebZlW5qn9FB/jW8rB+u7m9POiPY5nN5WH9drO1XNVvNyxz"
+    "f3lYv120lXN9UXTNubpc1Relt/mn8qg/zi3lqr4ojd5VHvXHOVYe1Rd9sDys3y4QVf128Vg51xfFAf5MedQf58XysH67eLU86o/z"
+    "dnlYv11+UB7Vb/+sXPXH0aT8vFzVv9IN6+vyqD/OD+WqPw5tzi/lka9+K1f9cehliEF/HLMiqt9uVaj+OHQW2hVh/XYjXhHWbzdS"
+    "FVF/nMyKsH67yKrg/ji4tHWoUPVFaZHiiqg/TpcKrn9Fn4VRWsH1r+jNWz0qov44fSu4Pw461gys4P44Md0RwyuC/jhCTKwI67eL"
+    "EypU/XZNyDkVqn47xfkVqn47xSUVqn47xRUVqn47xTUVqn47xfUVYf12saki6o9TVhH1x9laEfXHaaqI+uO0VkT9cQ5VqPrttCuv"
+    "rlD1r+gku7FC1b+i4+G2Cq5/1U5nyz0VYf128WCFqi9Ko49VqPrttDl/r1D12ym+XKHqt1N8s0LVb6f4foWq307xk4qoP05RVVC/"
+    "XYhvK4L+OJb8uSLoj2NJrTLoj2NJuzLoj2PJZKWqL0oxp1LVF6VDrrAyqN9uyS6VUX+cXpVRf5wBlVF/nGGVUX+c0ZVRf5wJlVF/"
+    "nGmVQX8c25xTGdZvFydXRv1xFlVG/XFOr4z646ysjPrjrKkM61+JCyq5PgPiJZVB/StdXF7J9RnaadOrKlV90Zgl6yuD+qKm2FkZ"
+    "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"
+    "6I8j7SUNYX1RubIhrN8uz23g+qKIGxqC+u1SXtrA9UWxiooGrt9OGpF1DVxfFAvsaQjqi9qyrUH5ima4piGsz+Dc1BDWF7XvbAjr"
+    "Mzj3N0T9cR5riPrjPNkQ9cd5qiGsL2o90xDUbxf2Cw1B/XbLer0hqN8u7Hcawvqi1r8bgvqilv1ZQ1C/nT6WhqB+u7B/agj64+i2"
+    "1hj0xzFcpzGoLyrszMagvqhud2wM+uO4VpfGoH67sPo2hvVFrUGNQf12IYc3BvXbhTy+Mawvak1uDOuLWtMbw/oMck5jUL9dWPMb"
+    "ub4o4uLGoH67bZ3RGPTHEdbKRq4vinlXN3J9Ucx7QaOq365bzsWNqn67rrlljVy/XafR+saoP05LY+Sr3Y1c/4oOe4l4hJ8o2Qcb"
+    "g/rtdOI0Rv1xbmzk+u0YvbUxqt9+dyP3x8FV46HGqD/Ok42qPw5973iqMagvaooXG8P+ONZrjVF/nLcbI1/9s1H1x6GXIQb9cT5u"
+    "jPrjfNIY+ErKzxv/6I/T+Ed/nMY/+uM0BvXbpfy18Y/+ONuC+u267m3j/jj4qXt8W1S/PbktrC8qMreF/XGs/G1Rf5xO26L+OH22"
+    "Rf1xjtsW1m+X07ZxfVEtZrtztnF9UcRF27i+KOLybVxfFPG8bVxflETpXLKN64silm/j+u04s+q3Rf1x9m4L67e7V24L67e7N24L"
+    "67e7d24L67c7D2xT9a9ihvvEtrC+qPviNq7PQKhy39oW1GcwnX9vC/rj2PLLbUH9dul+ty3ojyPd9m1BfxzpOtuD/jjSzdwe9MeR"
+    "buH2oD+OdLpvj/rjHGsK+uNIOWx7UL9dumO2B/XbpTt1e1C/Xbonbg/qt0tn8fagvqjtrtge1heV528P6rcL+6LtYX1R+/LtYX1R"
+    "u2Z7WF/U3r49rC9qt24P64vKtu1B/XbhXLM96o9z8/agfrsl794e1he1H9ge1he1H98e1he1n9se1heVr24Pnl8Z9jvbo/44/94e"
+    "PL8y7S+2B/VFTfnd9qB+u7B/3R7Ubxe22RTWF7X9prC+qJ3VFNYXtQuawvqidtemsL6o7NOkfIULf1NYX9Q6rimo3y7ssU1B/XZh"
+    "T20K6rcLe05TUL9dyAVNXF8U5biWNgX124V7dhPXF8Vxtr4pqN8u5eamqD5DZVNUn6GmKajPYBl1TVyfga4PRmMT98fRyFdNTdwf"
+    "h/a0tqNJ9cexXb25SfnKMs3WJtUfRxfG/qaoP86hpqg/ztVNUX+cG5ui/ji3NUX9ce5pinz1SFPUH+fJpshXzzdF/XH+0RT0x5Hy"
+    "raaoP86/mqL+OJ82Rf1xPmuK+uN81xT1x9F2RP1x/B1/+Or/9sfJ3RHUb9dtxKB+e+cdUX+ckh1cX5Teh9trB9dvp/PbHrJD1RdF"
+    "dfodka9m7gh95c7ZEfrKXbQj7I9jLd8R9cc5ewf7KuYY5todqv6VNPQNO5Sv6MvjRTui/jiX7Ajrt9vlO4L67cKu2xHWb7d37gjr"
+    "t9v7dgT126V95Y6wfrt9/Y6wfrt9646wfrt9z46wfrv90I6wfrv95I7QV+KFHeyrmGXYr+5Q/XFMKd7dEfXH+XCH6o9Dox/vCHxl"
+    "2V/siPrjfLdD1RelHeXsDHwl7YydQf12aefvDOu328U7w/rtds+dYf0re+DOqD/OyJ1h/XZ7/M7QV/YJO4P6V6Z74s6w/pW9eGdQ"
+    "v13Yy3eq+qKGY6/ZGdZvtzfvDOq323bVzrD+ld24M6jfbru7doa+stt2hvXb7Wt3qvqi9LKbd4b12+2/7OT6ohg9tpPrt2uGZz+2"
+    "M6jfbtuv7FT1RSm+szPqj/PvnYGvTPeLnVF/nB92sq9QXD3WHPXHcZuj/jjx5qA/jqEnmkNfiVRzWF/UyWkO67eLzs1hfVGntDn0"
+    "lejXHNS/spwhzWH9dntMc1hf1JncHNS/0p3Zzaq+qG54C5pDXznLmoP6V7qzpjnoj+OKC5vD+u2ivFnVF6VY2xzWb7e3NYf12+3d"
+    "zVF/nEPNQf0rSxxpDn1lX98c1m8XtzYH9duluKuZ67eji8f9zUH9dimebA7640j7uebAV5Z4tZnri+JK+XZz1B/no2ZVv51G/9cc"
+    "9cf5pTmqf/Vbc1C/XbcRVf1212rh+qI4CJItUX+c3BauL4oPtlNL6Cu3W4uqL2pYzoCWqD/OyJaoP85xLWH9djGhJeqPM60l6o8z"
+    "qyXy1dyWqD8OYtAfZ2FLVL99UUvUH2dJS1C/3bRWtET1289pCeq3G/r5LWH9dntdS9QfZ2NL5KuKFq4vqnm6XtUS1W+vaYl81dAS"
+    "9cfZ2RL1x2ltCfrjeM61LVF/nLtbwvrt9hMtqr4oXYyfb1H1RSm+2aLqi1L8d4uqL0rxvy2qvijdf35pCeqL2q61K6zfbid3BfXb"
+    "pdt5V1i/3eu5K6zf7g3ZFdZv98buCuu3u9N3hb7yTtkV1r/yTt8V+spbvSv0lXvRrrB+u122K6zf7m3dFdRvt72WXUH9dttr2xXU"
+    "b7e963cF9dtt745dQf12231gF/fHga+qWoP67bb93K6wfrv36q6wfrv3/q6wfrv3n11h/Xb3h12qvih6ve0O61/Z/u6gvqh0snaH"
+    "vnIKd4e+crrtDn3l9N8d+soZsTv0lT1+d+gr94TdYf12cfLusH67ffru0FfOqt2hr5x1u0NfOZt2h76yK3dzfQb8KaFhd1CfwXB2"
+    "7eb6DGjGdWi3qn9F3yKv3a3qi5Idb94d1m937tqt6otSfHC3qi9K8cndqr4oxRd3q/qiFN/creqL0oo/2K3645j0NX63qi9Ku/rr"
+    "3WH9dufH3WH9dkdrDeu3O25rWL/dzmwN+uNIr2NrWF/U69Ya9MeR7sBWri+KfkmjWgNfGcbEVvYVfbk3prQGvhLGCa1B/SthzGxV"
+    "9UWlqc1pVf1xpKvNbVX9cRxXP6lV1W8nX81v5f44dPMxTm2N+uMsaY3646xsjfrjnNca9ce5qDXqj3N5a9Qfp7416o/T1Br1x9nT"
+    "GvXHOdiq6rfTDFe3Rv1xbmqN+uPc0Rr1x7mzNeqP87fWqD/OW61Rf5xPWv/w1f/tj/Nda+grBzHw1e+tqj+OYTvaHlW/3ZCeu4fr"
+    "t+MSkr0n8JXjdN8T1r8yRu4JfGV6o/ewr1DAceqeqD/OSXui/jgL93D9q5hrmKfvUb6yTX35Hq5/heaqK/dE/XFW7Ql8JZ0L9oS+"
+    "ci7dE/hKOlV7Al9JZ9ue0FdO657AV9I5vCfwlXT+tCfwlXRu3RP4Sjr37gl8JZ2H93D9K3x7f2YP178iXzkv7Qn748i39kT9cf61"
+    "J+yPI/+9J6wv6vxnT9Afx/W+2xP4ynG8vap+O62icK+q306x215Vv512df+9UX+cEXtDXznj96r67bTA9L2qfjvFk/eGvnJO2xv6"
+    "ylu5N/CV7azbG9YXdTbtDeuLOpV7w/qizu69qn47bVnbXviKN+foXlW/3XC8e/aq+u207HN7w/qizmt7Q1857+0N64s6n+4NfOU4"
+    "X+/l+u2a4TvmPlW/nUZz9gX1RW2nxz5Vv53iwH2hr7zj9kX9cSbvC33lzdkX9cc5dV/UH2fJvshXS/ep+u10RJ2xL6wv6q7aF/hK"
+    "yAv2hfVF3Y37VP12WrZyX+grt35fWF/U3bUvrC/qtu0LfeX+aV/oq/ht+4L6otJ9YF/oK/fJfUF/HFe+tC+sLyrf2xf4SsqP94X1"
+    "Rd0v94X1Rd0f9wX1RS2p7w/ri0pnv6p/RYdRan9YX1Tm7w/ri8qi/UF9UVd236/qt9Po0P1hfVF39P6wvqicsp/ri+JKOWt/1B9n"
+    "4X6uL4rRFfuj/jhr90e+umB/6CsH8YhqxHLp/tBXTs3+qH570/7QV07r/qg/zuH9ga+Ee/3+qD/O7fuj/jh37A/ri8rH9of1262/"
+    "7w/745gv7o989cr+qD8OYlC//eP9ka8+2c/9cbCj/rM/8tU3+yNf/bg/8tVv+8P6om77fq7fjuZqzgGuf4XfJWQeCPrjGHr2gchX"
+    "uQfC+qKy4EBYv93qciDqj9PjQNAfx3OOOxD1x5l5IKwv6i49EPjK8c8+EPjK8csPBL5y/H0HAl85/q0HAl853pMHwvrt3rsHVP12"
+    "OrO+PaDqt9NVWRyM+uNkHIz64xQejPrj9DwY9ccZejD0lT/uYOgrf+bB0Ff+woOhr7wVB1X9dtrraw+G9UX9ioOqfjtt5PaDqn47"
+    "xWsPqvrtFI8dVPXbKb5yUNVvp03/4mDUH8c7rOq3647jHgrri/oFh8L6on6PQ2F9UX/IobC+qDfuUFBf1PZnHIKv+Gq04FBYX9Q9"
+    "45Cq305x9SFVv53ihYdU/XaKWw6p+u0U6w6p+u00Q8uhoH679A4eUvXbLV9edyjwlXDuPKTqt9PLjh1S9dspPnFI1W+n+OIhVb+d"
+    "JnvrUOgr98NDoa/cLw+FvnJ/PBT6ytHbgvrt0vXawvqibnZb4CuCc1vgK+n2bAt8Jd3BbYGvpDumLfCVdKa2qf44dB+a2xb4SsoF"
+    "baq+KC27tE3VF6V4dpuqL0pxfZuqL4pus22qvqgu4zVtYX3ReEubqi9qSP+KtsBXtnNTW1D/yjDvbOP6V+Qr8562oP6VMO9vC+pf"
+    "CfOhtqg/zqNtUX+cx9qC/jiu/kSbqi9KvnqmLeqP83xb1B/npbaoP86bbVF/nP+0Rf1xvm2L+uOYh6P+OOnD3B8H7bwKDkf9cUoP"
+    "c38cjPY/HPXHGXE46o8z/XDUH+e0w1F/nCWHo/44aw5H/XG2Ho7647Qe/sNXQX8cLiV422FVX9TUHUTUFzUN86+HVX8cWt8Dh1X9"
+    "dlN6Lxzm+u3o+/DWYVW/3XSdLw5H/XHaD4f1RX3jirC+qJ+8QtVvN6XoeAX3x0EZ3+IrlK88w+x5ReSrvlcoX9GXx/5XqPqipuUN"
+    "vELVbzf/H1PnHSdFlbXhuV1duTpMT56BYWZgAnnIOUpUyShBBVSCIIi66rqmXV03GHaN67rr7gJDzjmK5AwCAoJINIASRAUVjHzn"
+    "Paeq/P57vb/bt2oq9dPY/T6m3XaS9LdHDbvrJO5vh32l9yTpb6cJgyZJfzuNjpgk/e00OnaS9LdTfHCS9LdTfHyS9LdTfHaS9LdT"
+    "/Nsk4SsjYr4xSfjK0Oz/Tgr9ODMmiR/HsIz5k0I/ztJJ0i9Ke7ZmUujH2TxJ+tvpQB2dJP3ttGcXJkl/O8VvJkl/Ox3qnydJfzvt"
+    "Q2Ky9ItSzJ0s/e00oXiy9LdTbDKZ+68Unbeuk/3+q6jXe7L0i9K6QycLX9EKd08GX7G6Y/xk8BWv8NRk6W+n+PJk6Rell1VNlv72"
+    "qO3OnSz97TS6cbLwFS22a7L0t9PowcngKzRS2Mcnc3/7dfozz0yW/vZo3L46WfrbadSeInxFsWBK6MepP8XvF416zadIvyid7s5T"
+    "uF8Uo72mhH6cIVNCP84dU3w/DvHVFOlvN4ivpghfaZYzZor0txvEV1OEr2j00SnS305zn5kS9Is6z00RvjIs57Upwlf0ae2/U/x+"
+    "UeKrKX6/aDS2eErQL+qsm+L3ixJfTZH+dsMzD0wRvqJNnJ4i/e0UP5sifEWbuDRF+IritSnCVwbxVZXfL0p8VRX0i9rJKuErWiGv"
+    "yvfjWGZRFfjKSzNcs7zK9+NYZrMq4Stat22V3y9KfFUl/e2a4fWqCvpFY0OqmK8wOroq8ONoD1aF/aIPV0l/uxGxEav4Hx7cp6qk"
+    "v50u8OeqQr56tYr723E9/Ksq6Bd1q6p8P47hzK/y//1Kj6ysCv04q6uEr6K6ubsq9OMcqBI/DvHVB1UhXx2vCv04iD5fXaoK+erL"
+    "Kvbj4LFypUr6RaNR48cq6RelqKb6fhwtYk71+0Utx54a+nEypoZ8VX1q6MepMVX6RaOaUTJV+Iqe4RVTQz9Ow6m+H8e1m031/Tie"
+    "032q78dx7dumcr8odEgTpkp/u3K8306V/naKL02V/naKM6dKfzvF9VP9/nbHOzJV+tspfjlV+tujMducJv3tUcvLmyb97cr0SqdJ"
+    "fzvFRtOkv51iu2lhf3vPadIvSh9+bpkW9F95d06TflHa9wnTuP/qOl3Lv5sm/e10x/5pGviKi9j/OU362ykunCb97RS3T5P+doqn"
+    "pkl/O8Wr08L+9sR0349jWXfPlP524raG08FX6J7yOk0HX3HsNR18xXHIdPAVx1HTha/oODwwXfpF6ZJ7brrwFd3dr06X/na6N/8z"
+    "XfrbKc6YLv3tkA5Ml/52imumS387xS3Tpb+djs7e6dLfbsTMD6dLfzudt8+nS387zb08XfrbKf40XfrbKRozpL+dYnKG8JWmOfkz"
+    "fD+O5tSaIXxFHx0bzPD7RQ2n5Qzpb49YTucZwle0ws0zpL+d4q0zpL+d4ogZ0t9OcdwM6W+n+NAM6W+n+NSMwI9j/XWG9LcTyr48"
+    "Q/iKJvxzhvAVxSkzhK8ozp0R8JWzfIbwlWbF1s8QvqK4Z4bPV1bs6Azpb6ejfnaG8BWRwpczhK8oXpnB/Vd0i0SvzvD7r4zojzMC"
+    "vopcnyF+HMuLqJnsx1EuIfdMv79d1+2ZoR8nPjP046Rmhn6cspmhH6flzNCPc+PM0I9z+8zAj2PcO9P34xjOb2cGfhzj6Zm+H8dw"
+    "/jZT/Di0iX/ODP04c2eGfpz1M0M/zoaZoR9n38zQj/PFzNCP4876la/i/4+vas/y+9sjDiL3t+vRJrNCP06LWdLfTjB70yzwVVxp"
+    "MWfwLL+/3XXGz/L//SoS/cMs4atI1Ht2lvAVxZdnBX4c8z+z2I+D22zqrODfr/S5s6RflPhq0azg36+0JbNCP87yWUF/u7Nxlt/f"
+    "bji7ZwX97c77s4L+dufULL+/3XLOzQr6250rs4L+dufnWUF/u2PODvrbnfTZQX+7UzCb+0WVHrFKZ3O/aJquOfVnh36cFrPFj6Pb"
+    "RvfZoR9nwOygv925e3box5kwO+hvd/402+9vt5x/zfb9OLYzdbbf3247K2f7/e2ms3s294vy3zbb9+M4zqnZfn+77VyZLXxF582c"
+    "I3xF7//pc8BX7LwpnBP0tzuN5wT97U7bOX5/u+30nQO+4nM8ck7Q3+48Ogd8xZ3sz8wJ+tudf88J+tudBXO4vx1x1RzhK5qwaQ73"
+    "t+PPPDwHfIWWf+f8HO5vh2Ljlzl+fzvdL3N9P47tlM0VvqKrpPXc0I/Tba7wFY32nxv6cYbNDf04o+f6fpyoNmau78cxrXFzpb89"
+    "YrkPzvX9OKb15Fzpb6fRP82V/na6+l6eK3wV0d0350p/u265U+dKfzvNXTCX+0VVJOKunsv9otcj0fiWucJXNOHAXO4XxYQTc8FX"
+    "+J209flc6W+nTVybK/3tFIkZuL+dNmHNk/52ihnzpL9dN6zCecJXtL9l87hfFH6cBvOkv51WaDmP+9vxaa3jPO5vx9b6zuP+doyO"
+    "mCf97brt3j9P+IoW+/M86W+PGLG/z/P9OJH4W/Okv51GZ88TP45hayvmhXy1dp7vx4k4iOhvJxbbNo/72yHIODAv9OMcn8f97bge"
+    "Pp3n+3Ei3qV57MfBv6/8MI/9OHSoI/r80I9jzg/72wvmh36cmvNDP07t+SFfNZof+nEQF3L1rOo63/fj6Hq3+eLH0R3rpvlBf7tx"
+    "2/ygv924c77vx6ELZr7wFR2ocfNDP84f5gd8pb0wP/Tj/H0+8xW+OfrK/LC//Z/zQz/OpPnsx0nT4s70+ezHoeiunu/7cWLOvvnC"
+    "V7rhfjJf+tuvu/FL86W/naKzQPrbKZYtkP52ip0XSH87xWELuL89Lc2NPbYAfJXA1l5f4Ptx7NisBdLfft2Mb1og/e0U9y+Q/naK"
+    "JxdIfzvFiwuEr65r8R8WCF9RtBYKX12PxrMXCl9dN+K1Fvr97Y7TeKH0t1+3490Wgq8oOvG7FoKvOD61EHzF8d8LwVccVywEX3E8"
+    "sFD8OHTBnFwCvvJUxHG+Wyh8Res6i4SvKJYtEr6i2HmR8BXFYYukv50We2xR0N/uvLFI+tvphpy8yPfjmN7cRb4fx/RWLvL9OKa3"
+    "eZHwFcV9i3w/jukeW+T7cczY2UXgK7qP49aVRb4fx3S1xdLfTlgQXyz97RTzF0t/O8WyxdLfTvvQeLH0ixKptlss/aJ0n/ZcLP2i"
+    "NHrLYu4XvR4x3DsXB/3t7vjF0t9Oi/12sfS3U/zjYulvp/jSYulvp/jWYulvpzhzsfS30wpLF7MfB2+s6xZLfzsd6m2Lpb+d5u5d"
+    "LP3tFD9cLP3tFM8ulv52WuHyYulvV3bi58XS3x6x4gVLpL89YsdrL/H7222n65Lw36+GLPH727XoHUuErzQjeucS4SuKo5aIH8cy"
+    "ImOXiB/HikXuXcJ+HOU42sQl0t+u6/rDS0I/zmNLQj/OM0tCP86bS0I/zrwloR9n05LQj3N4ifhxdMc4u8T34xjO5SXix6HRn5b4"
+    "fhzDsZb6fhzHTS0N/TgVS0M/TvuloR+n49LQj9NvaejH+c3S0I/z2tJf+cr343CV4NKl3N+OZyJiCT9CouuXih9Hc73NS7m/XdPM"
+    "+LGl4Cs2n5xbKv3tRBBqmfS3E1/lLeP+dnTWVl8W9LfH6y4L/Dhmq2Xix9Edp+My7hdFl83AZdIvauuRIcu4X1R5Ee22ZdLfrhmx"
+    "Ycukv12zvXuXSX+7RtffMulvp/jSMulvpwlvLZP+dgKEpcukv51Gdy+T/naKnyyT/naKPy6T/naKGculv51i3eXCV/Tp/YblwleG"
+    "5t68XPw4umMPWi5+HProMna5+HFo9OHl4Ct2p/xleejHeW259LfTgVq4nPvbsWfbl4OvOJ5aDr7iQ311Ofe34w9KrABfcSxYAb7i"
+    "CeUrwFcxvKzDCukXpfM2aAX3i9LHo8TdK7i/HRMeXMH97SyRWMH97fB1vLGC+9sxYcEK6W+nPdu2gvtFMXpyhfS3a178uxXc347R"
+    "1ErwFTDHq7NS+ttptPNK7m/HhKErpb+dFntwJfe3p2np3vMrub8dowtWSr8ozd22UvrbsbWVQX97/LuV0t9Opzu6ivvbMZq+KvTj"
+    "1FgV+nFqrgr9OLVWSX+7Ydnlq7i/HTtZucr341h2j1VBf7vXb5X0txu2PXYV94sCGx5fJf3thu39ZRX3t2PupFXCV3R8V64SvqLj"
+    "u3kV+IonHFglfEUTzq8CX6XDq/HdKu5vxyas1dLfTjF/Nfe3YxP1Vkt/O8Uuq7lfFB6b21dLvyjt76jV0i8aNdz7VnN/O1b43Wrw"
+    "lZNmOPYLq7m/HTae/64GX/HowtXgK0Rv42rpb6fFjq72+9uNxMerg/725Ner/f52I6HWBH4cLbkm7BfNXsP97REj4iFW4R8QzVjJ"
+    "Gulvpyuq4ZrQj9NmDfe348T2WhP0t8dHrfH9OFb8N2t8P44eeXpN6Mf54xrpF9VM+601oR9n2prQjzN3TchXy9eEfhxE34/z7hr2"
+    "44Cv9q7x/TiOc3CN9LdruvnZGulvp3hpTejH+XYN+AouMu/aGt+PY8WTb3O/KH5tU/i278eJasVvS3+7Zpi13pZ+Udrfum+Hfpym"
+    "b0t/uxb32rwt/e30cBzwtvS30+i9b4Ov2LPyx7elvz3NS7z0tvS3U5z/tvS3U9z9tvS3X/eS596W/nYatdcG/e2J8rXgq/Q0Lel1"
+    "XQu+wj2UuGMt97dDf/P4Wu5vR3x+Lfe3I/5rLfe3I85aG/SLJlauDfpFE9vWBv2iiffXBv2iiU/Xgq/wfyO9K2u5v51AKem+I/3t"
+    "tDt135H+doo935H+dopj3pH+dvor/vSO9LfT6PR3Qj/OTxulvz3iee+/w/3t0N988Q73tyO667i/HbH2Ou5vR+y+zu8XdRKj1nG/"
+    "KB4gf1wHvuIH01vrpL89YsWWrpP+doob1kl/O8V310l/O8UP1wX97d5n64L+9viVdeAruo+Ttlrv+3EsL2O99LdH7FiN9dLfTrHV"
+    "eulvpzhgvd/fbnsT1jNfwY/zp/XCVxRfXc98RVAVm7Re+IqeO/PW+/3ttrdqPfe3Y7H966W/neL59dLfTjG6QfrbKRZukP52ii03"
+    "+P3tttd/g/hxiBrGbfD72237sQ3c3465L27g/nbEGRu4vx1xwwbub8cKH24AXzlpESd5eQP3t0O+lNoIvsLH4kTlRulvp6Pee6P0"
+    "i2qaPnqj9LdTvHcj+AqPFf3+jeArWsHQH94ofhzbiDy2Ufw4djzyxEb24yjP0/6wEXzlROjjyp83sh9H02z9xY2hH+eNjaEfZ8HG"
+    "0I+zZWPoxzm+MfTjfLNR/DiGZ8U3+X4cyyvcJH4cGq2zyffjWF7rTeLHoRW6bQr9OMM2hX6cRzaFfpxHN4V+nBc2hX6cxZtCP86R"
+    "Tb/y1f/34/y8ye9v12KIfn+7s1n8ONFYLLGZ+9vpYk6vvRl8xeaTmzb7/e2x2IObw/72FzdLf7umJ1/ZLP3tFKdsZj8Okaa1eHPo"
+    "x9m4GXxlqnjUOLpZ+MoxtFObwVdmJK5pH28O+tsTZzb7/e1u7JvNQX97LL7F7293YhVbgv72WOctQX977PYtfn+7E3tkS9DfHnt5"
+    "S9DfHpuzJehvj23ZEvS3x05ukf52U3OubZH+djMai2wVP47hOomtoR+n5lbx49Bow62+H8eK3bA19OP03er3t8dj92/1+9vd2PNb"
+    "Qz/OtK1Bf3ts3VbwFQt0Ptjq97fbsctbwVd8Lrxtfn+7FyvbJv2idN46buN+0etRI73XNvBVHBOGbQv622OPbgNfpSLRROzVbX5/"
+    "uxebtw18xetu2wa+Qu177PQ28BVGkz9s8/vbvVj+9qC/PdZ0u9/f7sZ6b/f7273YPdv9/vZ47Jntfn97Ruw/27m/HYqNzdvBVzHE"
+    "E9vBV/zHX90u/e10laTvCPrbE8U7pL+dRit3hH6cjjtCP86NO0I/Tu8d0t9uOk6/HdLfrrnxUTukv920nad3SH87jf5jh/S3m66z"
+    "eAf3i6bRW+vWHdLfbrrxgzukv11z4l/ukP52TYu7O6W/XdNTeTulv50m1N0p/e00oftO6W83E84tO6W/nXZn7E7pb6etPblT+ttp"
+    "E6/slP52ivN3gq/siGk6O3eCr3h/D+7kflFcRp/tlP52WuybndzfjsWsXeCrdFg8qu3i/naMVu7i/nas22WX9LfTYiN2cX87fSBM"
+    "f2gX97fDj/PGLulvp9FZu8SPY7varl0hX+3fJf3tphZDrOKu9+SJXdzfjovgi12+H8dxzN3c346zWbCb+9vhx2m22/fj2Imuu30/"
+    "jh65e3foxxm1G3wFm5Tz+93c3w4/znO7Qz/OK7tDvnprd+jHQVwosp3lu0M/zsrdoR/nnd1hf/vB3WF/+7HdoR/nk93S304H6uxu"
+    "34/jJCJ7wFdmhKYU7WE/TiQ9Gq25h/vbsUL5HvAV7m6n4R7pb6f9bbWH+9thwum0h/vb6eEYv22P39+ejP1pD/txiB3jk/ZIf7uK"
+    "J+fvkf52iu/ukf52il/skf72tHh67F3pb6fRhu/6/e3x9D7vgq8y06Kp2APvBn6c9DffBV95EWUn17wLvuL44bvgK44/vAu+4pi/"
+    "l/tFI0pLtt7r94tqyRv3cr+oUnpy6F7uF0Uctxd8lcAt/dhe6W9P89Jf3wu+SigVS67YC77ieHgv+Irjd3vBVwmVFkvP3ge+4tGW"
+    "+3w/jus+dQh8hX/fjt23T/rblZf86z7pb6c4a5/0t1PcsU/62yl+vg98FUujxaz94Ct+XFXsl/52urs77/f72534sP1+f7sTf2y/"
+    "39/uxN/Y7/e3O/El+6W/neLe/dLfrpzk+f3gqwxlpjvOe9Lfbtrxivf8/na6s97z+9vd+Ij3/P52N/7Ee9LfTvHN97i/HZ8Ml73H"
+    "/e30jIpves/vbzfj+9/j/nZi/vjJ96S/nV528T2/v92JWwf8/nY3XuuA39/uxjse8Pvb3fjtB/z+djf+6AHpb6f4+gHx49D70KID"
+    "fn+762w54Pe3O/EPDvj97U78mwN+f7sTTx6U/naK9Q5yfzstlupxUPrbKY4/yP3tGH35IPe3X6en/bKD4Cu60aPG3oPgKxP/E/7Q"
+    "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"
+)
+
+
+# ==============================================================================
 # 11. Module / DLL loader
 # ==============================================================================
 
@@ -26062,6 +44505,8 @@ class NOOProcess:
             self.log.error("API %s!%s raised internally: %s — returning 0"
                            % (dll, name, e))
             self.log.debug(traceback.format_exc())
+            if os.environ.get("NOO_TRACEBACK"):
+                sys.stderr.write(traceback.format_exc())
             return 0
         return int(ret) & SIZE_MASK[64 if cpu.mode == 64 else 32] if ret is not None else 0
 
@@ -26108,8 +44553,10 @@ class NOOProcess:
                 try:
                     cpu.run_slice(1 << 40)
                 except NOOYield:
-                    # A blocking call inside a callback cannot suspend the Python
-                    # call stack; complete it as if it returned immediately.
+                    # A blocking call inside a callback: wait for it right here
+                    # (other threads keep running) and then complete the call.
+                    if t.state in ("blocked", "guiwait") and t.waiting_on is not None:
+                        self.py_wait(lambda: self._wake_check(t))
                     t.state = "running"
                     t.waiting_on = None
                     cpu.finish_yield()
@@ -26235,6 +44682,7 @@ class NOOProcess:
         _nt_install(self.k32)
         _ws_install(self.k32)
         _proc_install(self.k32)
+        _gui_install(self.k32)
         main = NOOModule(os.path.basename(self.exe_host_path).lower(), base,
                          pe.size_of_image, "pe", pe)
         self.modules.main = main
@@ -27194,6 +45642,9 @@ class NOOProcess:
 
     # -- scheduler / main loop -----------------------------------------------------------
     def gui_backend(self):
+        wm = self.__dict__.get("wm")
+        if wm is not None:
+            return wm.ensure_display()
         if self._gui is None:
             self._gui = create_gui_backend(self)
         return self._gui
@@ -27227,6 +45678,108 @@ class NOOProcess:
         d = w[-1]
         return d if isinstance(d, float) else None
 
+    # -- idle / nested waiting -------------------------------------------------------------
+    def _earliest_deadline(self, exclude=None):
+        best = None
+        for t in self.threads:
+            if t is exclude or t.state not in ("blocked", "guiwait"):
+                continue
+            d = self._wait_deadline(t)
+            if d is not None and (best is None or d < best):
+                best = d
+        return best
+
+    def idle_wait(self, deadline=None):
+        """Nothing can run: drive the display (input, presentation) until input
+        arrives or the deadline passes."""
+        now = time.monotonic()
+        timeout = 0.05 if deadline is None else max(0.0, min(0.05, deadline - now))
+        wm = self.__dict__.get("wm")
+        disp = wm.display if wm is not None else None
+        if disp is not None:
+            disp.idle(timeout)
+        elif timeout > 0:
+            time.sleep(timeout)
+        if self.__dict__.get("terminate_code") is not None:
+            raise NOOExitProcess(self.terminate_code)
+
+    def yield_now(self):
+        wm = self.__dict__.get("wm")
+        if wm is not None and wm.display is not None:
+            wm.display.maybe_pump()
+        if self.__dict__.get("terminate_code") is not None:
+            raise NOOExitProcess(self.terminate_code)
+
+    def _slice(self, t, n=20000):
+        """Run one scheduler slice of thread t (shared by nested waits)."""
+        self.current_thread = t
+        try:
+            if self.use_threaded and t.cpu.threaded:
+                before = t.cpu.instructions
+                try:
+                    t.cpu.run_slice(n)
+                finally:
+                    self.instruction_count += t.cpu.instructions - before
+            else:
+                for _ in range(n):
+                    t.cpu.step()
+                    self.instruction_count += 1
+        except NOOYield:
+            pass
+        except NOOExitThread as e:
+            t.state = "dead"
+            t.exit_code = e.code
+        except NOOCPUFault as f:
+            if not self._try_seh(t, f):
+                self._crash_report(t, f)
+                raise NOOExitProcess(0xC0000005)
+
+    def _run_others(self, me):
+        """One scheduling round over every thread that is not stuck in a Python
+        frame below us (i.e. not inside its own nested wait)."""
+        ran = 0
+        for o in list(self.threads):
+            if o is me or o.__dict__.get("nested", 0) > 0 or o.state == "dead":
+                continue
+            if o.state in ("blocked", "guiwait") and self._wake_check(o):
+                o.state = "suspended" if getattr(o, "suspend", 0) else "running"
+                o.waiting_on = None
+                o.cpu.finish_yield()
+            if o.state != "running":
+                continue
+            ran += 1
+            try:
+                self._slice(o)
+            finally:
+                self.current_thread = me
+        return ran
+
+    def py_wait(self, cond, deadline=None):
+        """Block the current guest thread inside Python (modal loops, a blocking
+        call made from a callback) while every other thread keeps running."""
+        me = self.current_thread
+        me.nested = me.__dict__.get("nested", 0) + 1
+        try:
+            while True:
+                if self.__dict__.get("terminate_code") is not None:
+                    raise NOOExitProcess(self.terminate_code)
+                if cond():
+                    return True
+                if deadline is not None and time.monotonic() >= deadline:
+                    return False
+                ran = self._run_others(me)
+                self.current_thread = me
+                if cond():
+                    return True
+                if not ran:
+                    dl = self._earliest_deadline(me)
+                    if deadline is not None:
+                        dl = deadline if dl is None else min(dl, deadline)
+                    self.idle_wait(dl)
+        finally:
+            me.nested -= 1
+            self.current_thread = me
+
     def run(self):
         self.log.info("starting virtual Windows environment "
                       "(host: %s, interpreter: pure Python)" % HOST_SYSTEM)
@@ -27254,7 +45807,7 @@ class NOOProcess:
                                  if t.state == "blocked"]
                     deadlines = [d for d in deadlines if d is not None]
                     if deadlines:
-                        time.sleep(max(0.0, min(0.05, min(deadlines) - time.monotonic())))
+                        self.idle_wait(min(deadlines))
                         continue
                     self.log.error("deadlock: all threads are blocked with no timeout — "
                                    "ending the process")
@@ -27295,23 +45848,10 @@ class NOOProcess:
                             self._crash_report(t, f)
                             raise NOOExitProcess(0xC0000005)
                 if ran == 0:
-                    # every live thread is waiting (GUI event loop, blocking
-                    # waits with deadlines): sleep a little instead of spinning
-                    idle_rounds += 1
-                    time.sleep(0.005)
-                    if self._gui is not None and self._gui.kind == "headless" \
-                            and idle_rounds >= 200:
-                        self.log.warn("[GUI] headless idle with no event source — "
-                                      "posting WM_QUIT so message loops can exit")
-                        self.gui_queue.append({"hwnd": 0, "message": WM_QUIT,
-                                               "w": self.gui_quit_code, "l": 0})
-                        idle_rounds = 0
-                    if idle_rounds >= 60000:
-                        self.log.error("GUI idle timeout (~5 minutes without events) — "
-                                       "ending emulation")
-                        break
-                else:
-                    idle_rounds = 0
+                    # every live thread is waiting (GUI message loops, blocking
+                    # waits with deadlines): let the display run until input
+                    # arrives or the earliest deadline passes
+                    self.idle_wait(self._earliest_deadline())
         except NOOExitProcess as e:
             self.exit_code = e.code
         # atexit handlers
@@ -27889,6 +46429,12 @@ class _APIShim(WinAPI):
             _proc_install(k)
         except Exception:
             pass
+        try:
+            _gdi_install(k)
+            for fn in (_user_install, _user_install2, _user_install3):
+                fn(k)
+        except Exception:
+            pass
 
 
 # ==============================================================================
@@ -28188,226 +46734,6 @@ def pe_probe(data):
 # A session keeps the emulator process alive between bridge calls so the guest's
 # own message loop and WndProc drive everything, exactly like a real program.
 # ------------------------------------------------------------------------------
-
-# Win32 message ids the shell injects (kept local so this block is self-contained;
-# they match the constants defined in the GUI subsystem section).
-_WM_DESTROY   = 0x0002
-_WM_PAINT     = 0x000F
-_WM_CLOSE     = 0x0010
-_WM_KEYDOWN   = 0x0100
-_WM_KEYUP     = 0x0101
-_WM_CHAR      = 0x0102
-_WM_COMMAND   = 0x0111
-_WM_MOUSEMOVE = 0x0200
-_WM_LBUTTONDOWN = 0x0201
-_WM_LBUTTONUP   = 0x0202
-_WM_RBUTTONDOWN = 0x0204
-
-_GUI_SESSIONS = {}
-_GUI_SESSION_SEQ = [1]
-
-
-class _GuiSession:
-    """One running GUI program. Holds the live Runtime/process and its temp
-    file. Driven cooperatively: start() runs until the app is idle in its
-    message loop; event() posts a Win32 MSG and runs until idle again."""
-
-    def __init__(self, sid, rt, tmp_path):
-        self.sid = sid
-        self.rt = rt
-        self.tmp_path = tmp_path
-        self.exited = False
-        self.exit_code = None
-        # The bridge serves every call on its own thread; a poll and an input
-        # event must never drive the same emulated CPU at the same time.
-        self.lock = _py_threading.RLock()
-
-    @property
-    def proc(self):
-        return getattr(self.rt, "process", None)
-
-    def _gui(self):
-        p = self.proc
-        if p is None:
-            return None
-        # Force-create the web backend (set before first gui_backend()).
-        p._force_web_gui = True
-        return p.gui_backend()
-
-    def pump_idle(self):
-        p = self.proc
-        if p is None:
-            self.exited = True
-            return "exited"
-        if self.exited:
-            # A finished program must never be resumed: after ExitProcess, a
-            # crash or an exhausted budget its threads may still look runnable.
-            return "exited"
-        status = p.run_until_idle()
-        if status == "exited":
-            self.exited = True
-            self.exit_code = getattr(p, "exit_code", 0)
-        return status
-
-    def snapshot(self):
-        gb = None
-        p = self.proc
-        if p is not None and p._gui is not None and getattr(p._gui, "kind", "") == "web":
-            gb = p._gui
-        base = {
-            "ok": True, "sid": self.sid, "exited": self.exited,
-            "exit_code": self.exit_code,
-        }
-        if gb is not None:
-            snap = gb.serialize()
-            base.update(snap)
-            p.gui_messageboxes = []
-        else:
-            base.update({"rev": 0, "windows": [], "messageboxes": [], "quit": 0})
-        # GL state lives on the process, so surface it even for windowless GL
-        # programs (a GL app that renders without a classic HWND/message loop).
-        if p is not None and "gl" not in base:
-            base["gl"] = {"rev": p.gl_rev, "hwnd": p.gl_hwnd,
-                          "commands": list(p.gl_commands)}
-        return base
-
-    def post(self, hwnd, message, wparam, lparam):
-        """Enqueue a Win32 message for the guest (the caller then pumps)."""
-        p = self.proc
-        if p is None:
-            self.exited = True
-            return
-        with self.lock:
-            p.gui_queue.append({"hwnd": hwnd & SIZE_MASK[64], "message": message,
-                                "w": wparam & SIZE_MASK[64],
-                                "l": lparam & SIZE_MASK[64]})
-
-    def dispose(self):
-        try:
-            if self.tmp_path and os.path.isfile(self.tmp_path):
-                os.remove(self.tmp_path)
-        except OSError:
-            pass
-
-
-def gui_start(data, args=None, verbose=False, instruction_cap=None, fs_root=None):
-    """Load a Win32 GUI .exe (raw bytes) and run it until its window is up and
-    it is waiting for input. Returns {ok, sid, ...serialized window state...}.
-    The OS shell then renders the windows and calls gui_event / gui_poll.
-    If fs_root is given, the guest's virtual C:\\ is backed by that host folder
-    so files it writes (e.g. an installer) persist there. Never raises."""
-    import tempfile
-    tmp = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as fh:
-            fh.write(data)
-            tmp = fh.name
-        sandbox = NOOSandbox(fs_root=fs_root) if fs_root else None
-        rt = Runtime(sandbox=sandbox, verbose=verbose, capture=True)
-        if instruction_cap is not None:
-            try:
-                rt.sandbox.max_instructions = int(instruction_cap)
-            except Exception:
-                pass
-        # Prepare the process WITHOUT running the blocking scheduler: load and
-        # set up, then drive cooperatively.
-        pe = PEFile(data, tmp)
-        proc = NOOProcess(rt, tmp, args or [], rt.log)
-        proc._force_web_gui = True          # select the web backend up front
-        rt.process = proc
-        proc.setup()
-        sid = "gui%d" % _GUI_SESSION_SEQ[0]
-        _GUI_SESSION_SEQ[0] += 1
-        sess = _GuiSession(sid, rt, tmp)
-        _GUI_SESSIONS[sid] = sess
-        with sess.lock:
-            sess.pump_idle()                # run to first idle (window shown)
-            snap = sess.snapshot()
-        snap["ok"] = True
-        return snap
-    except Exception as e:
-        if tmp:
-            try: os.remove(tmp)
-            except OSError: pass
-        return {"ok": False, "error": str(e)}
-
-
-def gui_poll(sid):
-    """Return the current serialized window/draw state for a session."""
-    sess = _GUI_SESSIONS.get(sid)
-    if sess is None:
-        return {"ok": False, "error": "no such GUI session"}
-    try:
-        with sess.lock:
-            # advance any timers / pending work, then snapshot
-            sess.pump_idle()
-            return sess.snapshot()
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-def gui_event(sid, ev):
-    """Inject a DOM event as a Win32 message and run the guest until idle.
-    `ev` is a dict: {type, hwnd, x, y, button, key, char, ctrl_id}. Supported
-    types: mousemove, mousedown, mouseup, rmousedown, keydown, keyup, char,
-    command (button click -> WM_COMMAND), close. Returns the fresh snapshot."""
-    sess = _GUI_SESSIONS.get(sid)
-    if sess is None:
-        return {"ok": False, "error": "no such GUI session"}
-    try:
-        ev = ev or {}
-        t = ev.get("type")
-        hwnd = int(ev.get("hwnd", 0) or 0)
-        x = int(ev.get("x", 0) or 0)
-        y = int(ev.get("y", 0) or 0)
-        # MAKELPARAM: both coordinates are 16-bit (negative when the pointer
-        # is left of / above the client area) — mask y too.
-        lparam = ((y & 0xFFFF) << 16) | (x & 0xFFFF)
-        post = sess.post
-        if t == "mousemove":
-            post(hwnd, _WM_MOUSEMOVE, 0, lparam)
-        elif t == "mousedown":
-            post(hwnd, _WM_LBUTTONDOWN, 1, lparam)
-        elif t == "mouseup":
-            post(hwnd, _WM_LBUTTONUP, 0, lparam)
-        elif t == "rmousedown":
-            post(hwnd, _WM_RBUTTONDOWN, 2, lparam)
-        elif t == "keydown":
-            post(hwnd, _WM_KEYDOWN, int(ev.get("key", 0) or 0), 1)
-        elif t == "keyup":
-            post(hwnd, _WM_KEYUP, int(ev.get("key", 0) or 0), 1)
-        elif t == "char":
-            post(hwnd, _WM_CHAR, int(ev.get("char", 0) or 0), 1)
-        elif t == "command":
-            # Button/menu click: WM_COMMAND with control id in the low word of
-            # wParam (0 = from menu), lParam = control hwnd. Sent to the parent.
-            ctrl_id = int(ev.get("ctrl_id", 0) or 0)
-            parent = int(ev.get("parent", hwnd) or hwnd)
-            post(parent, _WM_COMMAND, (0 << 16) | (ctrl_id & 0xFFFF), hwnd)
-        elif t == "close":
-            post(hwnd, _WM_CLOSE, 0, 0)
-        else:
-            return {"ok": False, "error": "unknown event type: %r" % t}
-        with sess.lock:
-            sess.pump_idle()
-            return sess.snapshot()
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-def gui_stop(sid):
-    """Terminate and clean up a GUI session."""
-    sess = _GUI_SESSIONS.pop(sid, None)
-    if sess is None:
-        return {"ok": True}
-    try:
-        with sess.lock:             # wait for an in-flight pump to finish
-            sess.exited = True
-            sess.dispose()
-    except Exception:
-        pass
-    return {"ok": True}
-
 
 def run_bytes(data, args=None, verbose=False, instruction_cap=None, fs_root=None):
     """Run a PE given as raw bytes (not a path) through the NOO emulator and
@@ -29219,7 +47545,7 @@ def _test_e2e_event_blocking(tmpdir):
 def _gui32_pe():
     imps = {"user32.dll": ["RegisterClassExA", "CreateWindowExA", "ShowWindow",
                            "UpdateWindow", "GetMessageA", "TranslateMessage",
-                           "DispatchMessageA", "PostQuitMessage"],
+                           "DispatchMessageA", "PostQuitMessage", "DefWindowProcA"],
             "kernel32.dll": ["ExitProcess"]}
     base = 0x400000
     text = base + 0x1000
@@ -29229,16 +47555,19 @@ def _gui32_pe():
     gm, tm, dm, pq = U("GetMessageA"), U("TranslateMessage"), U("DispatchMessageA"), \
         U("PostQuitMessage")
     ep = base + iat_rva(imps, "kernel32.dll", "ExitProcess")
+    dwp = U("DefWindowProcA")
     code = bytearray()
-    # --- wndproc (offset 0): WM_PAINT -> painted=1, PostQuitMessage(0); ret 16
+    # --- wndproc (offset 0): WM_PAINT -> painted=1, PostQuitMessage(0); ret 16;
+    #     everything else -> DefWindowProcA (tail call)
     code += b"\x8B\x44\x24\x08"                       # mov eax, [esp+8] (msg)
     code += b"\x83\xF8\x0F"                           # cmp eax, WM_PAINT
-    code += b"\x75\x0F"                               # jne .ret
+    code += b"\x75\x14"                               # jne .def
     code += b"\xC6\x05" + b"PPPP" + b"\x01"           # mov byte [painted], 1
     code += b"\x6A\x00"                               # push 0
     code += b"\xFF\x15" + struct.pack("<I", pq)       # call PostQuitMessage
-    code += b"\x31\xC0"                               # .ret: xor eax, eax
+    code += b"\x31\xC0"                               # xor eax, eax
     code += b"\xC2\x10\x00"                           # ret 16
+    code += b"\xFF\x25" + struct.pack("<I", dwp)      # .def: jmp [DefWindowProcA]
     wndproc_va = text
     main_off = len(code)
     # --- main ---
@@ -29302,11 +47631,11 @@ def _test_e2e_gui(tmpdir):
     path = os.path.join(tmpdir, "gui.exe")
     open(path, "wb").write(data)
     rt = _run_guest(path, expect_code=1)
-    backend = rt.process._gui
+    backend = rt.process.wm.display
     assert backend is not None
     return ("RegisterClassEx/CreateWindowEx/ShowWindow/UpdateWindow -> WM_PAINT "
             "dispatched to guest WndProc -> PostQuitMessage exited the loop "
-            "(backend=%s)" % backend.kind)
+            "(display=%s)" % backend.kind)
 
 
 # -- v0.35 tests: x64 SEH (.pdata) and PE resources ---------------------------------
@@ -29665,7 +47994,7 @@ def _dlg32_pe():
     a WS_CHILD 'BUTTON' control (id 101), then drive GetDlgItem /
     SetDlgItemTextA / GetDlgItemTextA against it."""
     imps = {"user32.dll": ["RegisterClassExA", "CreateWindowExA", "GetDlgItem",
-                           "SetDlgItemTextA", "GetDlgItemTextA"],
+                           "SetDlgItemTextA", "GetDlgItemTextA", "DefWindowProcA"],
             "kernel32.dll": ["ExitProcess"]}
     base = 0x400000
     text = base + 0x1000
@@ -29691,7 +48020,9 @@ def _dlg32_pe():
         code.extend(b"\x68" + struct.pack("<I", v & 0xFFFFFFFF))
 
     CW = 0x80000000
-    # RegisterClassExA(&wc)
+    # wc.lpfnWndProc = DefWindowProcA; RegisterClassExA(&wc)
+    code += b"\xA1" + struct.pack("<I", U("DefWindowProcA"))   # mov eax, [iat]
+    code += b"\xA3" + b"WCL8"                                   # mov [wc+8], eax
     code += b"\x68" + b"WCLS" + b"\xFF\x15" + struct.pack("<I", rc)
     code += b"\x85\xC0"                                   # test eax, eax
     jcc(0x84, "fail7")
@@ -29771,7 +48102,7 @@ def _dlg32_pe():
     dbuf_va = text + len(code)
     code += b"\x00" * 16
     code = bytes(code)
-    for tag, va in ((b"WCLS", wc_va), (b"CNAM", cnam_va), (b"TPAR", tpar_va),
+    for tag, va in ((b"WCLS", wc_va), (b"WCL8", wc_va + 8), (b"CNAM", cnam_va), (b"TPAR", tpar_va),
                     (b"CLSC", clsc_va), (b"TOKS", toks_va), (b"TPRS", tprs_va),
                     (b"PARN", parn_va), (b"BTNH", btnh_va), (b"DBUF", dbuf_va),
                     (b"DBU4", dbuf_va + 4)):
