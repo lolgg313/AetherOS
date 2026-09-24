@@ -37930,15 +37930,17 @@ def _user_install(k):
     # ---- classes --------------------------------------------------------------------------------
     def _read_wndclass(a, ex, wide):
         ps = wm.ps
-        if ex:
-            a += 4
         if ps == 8:
-            style = M_.read32(a)
+            # x64: WNDCLASS {style, pad, proc...} / WNDCLASSEX {cbSize, style, proc...}:
+            # only the style moves, the 8-aligned pointer fields line up
+            style = M_.read32(a + (4 if ex else 0))
             proc = M_.read64(a + 8)
             ce, we = M_.read32(a + 16), M_.read32(a + 20)
             inst, icon, cur, br, menu, name = (M_.read64(a + 24 + 8 * i) for i in range(6))
             sm = M_.read64(a + 72) if ex else 0
         else:
+            if ex:
+                a += 4
             style, proc, ce, we, inst, icon, cur, br, menu, name = \
                 struct.unpack("<10I", M_.read(a, 40))
             sm = M_.read32(a + 40) if ex else 0
@@ -38004,14 +38006,18 @@ def _user_install(k):
             return err(1411)
         ps = wm.ps
         proc = cls.proc if (wide or not hasattr(cls, "proc_a")) else cls.proc_a
-        o = out + (4 if ex else 0)
         menu = cls.menu_name if isinstance(cls.menu_name, int) else 0
         if ps == 8:
-            M_.write(o, struct.pack("<I4xQiiQQQQQQ", cls.style, proc, len(cls.cls_extra),
-                                    cls.wnd_extra, cls.inst, cls.icon, cls.cursor, cls.brush,
-                                    menu, name if name < 0x10000 else name))
+            M_.write(out + 8, struct.pack("<QiiQQQQQQ", proc, len(cls.cls_extra),
+                                          cls.wnd_extra, cls.inst, cls.icon, cls.cursor,
+                                          cls.brush, menu, name))
+            M_.write32(out + (4 if ex else 0), cls.style)
             if ex:
-                M_.write64(out + 80 - 8, cls.icon_sm)
+                M_.write64(out + 72, cls.icon_sm)
+            return cls.atom
+        o = out + (4 if ex else 0)
+        if False:
+            pass
         else:
             M_.write(o, struct.pack("<IIiiIIIIII", cls.style, proc, len(cls.cls_extra),
                                     cls.wnd_extra, cls.inst, cls.icon, cls.cursor, cls.brush,
