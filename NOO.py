@@ -4747,6 +4747,77 @@ class NOOSandbox:
 # 7. Virtual filesystem
 # ==============================================================================
 
+def _copy_vfs(v):
+    """A child process's view of the same filesystem (own current directory)."""
+    import copy as _c
+    n = _c.copy(v)
+    if hasattr(v, "overlay"):
+        n.overlay = dict(v.overlay)
+    return n
+
+
+def _split_cmdline(s):
+    """CommandLineToArgvW / MSVCRT rules (program name first, then arguments
+    with the 2n / 2n+1 backslash + quote conventions)."""
+    args = []
+    i, n = 0, len(s)
+    while i < n and s[i] in " \t":
+        i += 1
+    if i >= n:
+        return args
+    # program name: quoted or up to whitespace, no backslash processing
+    if s[i] == '"':
+        j = s.find('"', i + 1)
+        j = n if j < 0 else j
+        args.append(s[i + 1:j])
+        i = j + 1
+    else:
+        j = i
+        while j < n and s[j] not in " \t":
+            j += 1
+        args.append(s[i:j])
+        i = j
+    while True:
+        while i < n and s[i] in " \t":
+            i += 1
+        if i >= n:
+            break
+        cur = []
+        inq = False
+        while i < n:
+            ch = s[i]
+            if ch == "\\":
+                j = i
+                while j < n and s[j] == "\\":
+                    j += 1
+                nb = j - i
+                if j < n and s[j] == '"':
+                    cur.append("\\" * (nb // 2))
+                    if nb % 2:
+                        cur.append('"')
+                        i = j + 1
+                    else:
+                        i = j
+                    continue
+                cur.append("\\" * nb)
+                i = j
+                continue
+            if ch == '"':
+                if inq and i + 1 < n and s[i + 1] == '"':
+                    cur.append('"')
+                    i += 2
+                    continue
+                inq = not inq
+                i += 1
+                continue
+            if ch in " \t" and not inq:
+                break
+            cur.append(ch)
+            i += 1
+        args.append("".join(cur))
+    return args
+
+
 class VirtualFileSystem:
     """Maps a Windows-style namespace (C:\\..., drive letters, backslashes)
     onto a sandboxed host directory. The guest never sees host paths.
@@ -9124,7 +9195,11 @@ class _CRT:
         if f.text:
             raw = data.replace(b"\n", b"\r\n")
         if f.kind in ("stdout", "stderr"):
-            self.p.log.guest_write(raw, f.kind)
+            sink = self.p.__dict__.get("std_sink")
+            if sink is not None and sink.get(f.kind) is not None:
+                sink[f.kind](raw)
+            else:
+                self.p.log.guest_write(raw, f.kind)
             return len(data)
         if f.kind == "null":
             return len(data)
@@ -9139,6 +9214,9 @@ class _CRT:
         return len(data)
 
     def _stdin_read(self, n):
+        source = self.p.__dict__.get("std_source")
+        if source is not None:
+            return source(n)
         src = self.stdin_src
         if src is None:
             prov = getattr(self.p.runtime, "stdin_data", None)
@@ -13955,7 +14033,7 @@ class _K32:
                     obj["owner_tid"] = tid
                 return True
             return False
-        if kind == "process":
+        if kind in ("process", "process_thread"):
             return obj.get("exited", True)
         if kind == "ktimer":
             return obj.ready(take)
@@ -14097,6 +14175,13 @@ class _K32:
                 due = getattr(obj, "due", None)
                 if due is not None and (best is None or due < best):
                     best = due
+        if w[0] == "kwait" and any(self.p.handles.kind(h) in ("process", "process_thread")
+                                   for h in w[1]):
+            poll = time.monotonic() + 0.01         # another emulated process may exit
+            best = poll if best is None else min(best, poll)
+        if w[0] in ("sock", "sockselect", "pipe", "iocp"):
+            poll = time.monotonic() + 0.02         # external events: keep polling
+            best = poll if best is None else min(best, poll)
         return best
 
     def _cs_fields(self, addr, st):
@@ -15525,6 +15610,9 @@ def _k32_install(k):
 
     @R("ResumeThread", "p")
     def _resume(c, h):
+        if p.handles.kind(h) == "process_thread" and hasattr(k, "resume_child"):
+            r = k.resume_child(h)
+            return 1 if r else 0
         t = p.handles.get(h, "thread")
         if t is None:
             return 0xFFFFFFFF
@@ -16280,12 +16368,17 @@ def _k32_install(k):
         return p._handle_read(HandleTable.STDIN_HANDLE, n) or b""
 
     def console_write(h, data):
-        crt = getattr(api, "crt", None)
-        if crt is not None and hasattr(crt, "flush_std"):
-            crt.flush_std()
-        p.log.guest_write(data, "stderr" if h == HandleTable.STDERR_HANDLE else "stdout")
+        stream = "stderr" if h == HandleTable.STDERR_HANDLE else "stdout"
+        sink = p.__dict__.get("std_sink")
+        if sink is not None and sink.get(stream) is not None:
+            sink[stream](data)
+            return
+        p.log.guest_write(data, stream)
 
     def is_console(h):
+        redir = p.__dict__.get("std_redirect") or {}
+        if h in STD and redir.get(h) is not None:
+            return False                            # redirected to a pipe / file
         return h in STD or p.handles.kind(h) in ("conin", "conout")
 
     def create_file(c, path, access, share, disp, flags):
@@ -16653,6 +16746,9 @@ def _k32_install(k):
 
     @R("GetFileType", "p")
     def _gft(c, h):
+        redir = (p.__dict__.get("std_redirect") or {}).get(h) if h in STD else None
+        if redir is not None:
+            return {"pipe": 3, "file": 1, "null": 2}.get(redir[0], 2)
         kind = p.handles.kind(h)
         if h in STD or kind in ("conin", "conout", "null"):
             return 2                                # FILE_TYPE_CHAR
@@ -23865,6 +23961,1385 @@ def _nt_install(k):
 
 
 # ==============================================================================
+# 10i. Winsock (ws2_32 / wsock32): Berkeley sockets over host sockets
+# ==============================================================================
+
+_WS = ("ws2_32.dll", "wsock32.dll")
+WSAEINTR, WSAEBADF, WSAEACCES, WSAEFAULT, WSAEINVAL = 10004, 10009, 10013, 10014, 10022
+WSAEWOULDBLOCK, WSAEINPROGRESS, WSAEALREADY, WSAENOTSOCK = 10035, 10036, 10037, 10038
+WSAEMSGSIZE, WSAEPROTONOSUPPORT, WSAEOPNOTSUPP, WSAEAFNOSUPPORT = 10040, 10043, 10045, 10047
+WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAENETDOWN, WSAENETUNREACH = 10048, 10049, 10050, 10051
+WSAECONNABORTED, WSAECONNRESET, WSAENOBUFS, WSAEISCONN = 10053, 10054, 10055, 10056
+WSAENOTCONN, WSAESHUTDOWN, WSAETIMEDOUT, WSAECONNREFUSED = 10057, 10058, 10060, 10061
+WSAEHOSTUNREACH, WSANOTINITIALISED, WSAHOST_NOT_FOUND, WSANO_DATA = 10065, 10093, 11001, 11004
+EAI_NONAME = 11001
+
+
+def _ws_install(k):
+    R = k.reg
+    p = k.p
+    M_ = p.mem
+    import errno as _en
+    import select as _sel
+    ps = k.ptr_size
+    INVALID = M64
+    SOCKET_ERROR = 0xFFFFFFFF
+    _ERRMAP = {_en.EWOULDBLOCK: WSAEWOULDBLOCK, _en.EINPROGRESS: WSAEWOULDBLOCK,
+               _en.EALREADY: WSAEALREADY, _en.ECONNREFUSED: WSAECONNREFUSED,
+               _en.ECONNRESET: WSAECONNRESET, _en.ECONNABORTED: WSAECONNABORTED,
+               _en.ETIMEDOUT: WSAETIMEDOUT, _en.EADDRINUSE: WSAEADDRINUSE,
+               _en.EADDRNOTAVAIL: WSAEADDRNOTAVAIL, _en.ENETUNREACH: WSAENETUNREACH,
+               _en.EHOSTUNREACH: WSAEHOSTUNREACH, _en.ENOTCONN: WSAENOTCONN,
+               _en.EISCONN: WSAEISCONN, _en.EINVAL: WSAEINVAL, _en.EACCES: WSAEACCES,
+               _en.EPIPE: WSAECONNRESET, _en.EMSGSIZE: WSAEMSGSIZE, _en.EAFNOSUPPORT:
+               WSAEAFNOSUPPORT, _en.ENOBUFS: WSAENOBUFS, _en.EBADF: WSAENOTSOCK}
+
+    class _Sock:
+        def __init__(self, s, af, typ, proto):
+            self.s, self.af, self.type, self.proto = s, af, typ, proto
+            self.blocking = True
+            self.rcvtimeo = 0
+            self.sndtimeo = 0
+            self.connecting = False
+
+    k.wsa_started = 0
+
+    def err(e):
+        p.last_error = e
+        return SOCKET_ERROR
+
+    def oserr(e):
+        return err(_ERRMAP.get(getattr(e, "errno", None), WSAENETDOWN))
+
+    def sock(h):
+        so = p.handles.get(h, "socket")
+        if so is None:
+            p.last_error = WSAENOTSOCK
+        return so
+
+    def allowed(host=None):
+        if p.sandbox.allow_network:
+            return True
+        p.log.warn("sandbox: network access blocked%s" % (" (%s)" % host if host else ""))
+        p.last_error = WSAEACCES
+        return False
+
+    # -- sockaddr ----------------------------------------------------------------------
+    def read_sa(a, n):
+        if not a or n < 2:
+            return None, None
+        fam = M_.read16(a)
+        if fam == 2:
+            port = int.from_bytes(M_.read(a + 2, 2), "big")
+            ip = ".".join(str(b_) for b_ in M_.read(a + 4, 4))
+            return socket.AF_INET, (ip, port)
+        if fam == 23:
+            port = int.from_bytes(M_.read(a + 2, 2), "big")
+            flow = M_.read32(a + 4)
+            ip = socket.inet_ntop(socket.AF_INET6, M_.read(a + 8, 16))
+            scope = M_.read32(a + 24) if n >= 28 else 0
+            return socket.AF_INET6, (ip, port, flow, scope)
+        return None, None
+
+    def sa_bytes(addr, af):
+        if af == socket.AF_INET:
+            return struct.pack("<H", 2) + int(addr[1]).to_bytes(2, "big") + \
+                socket.inet_aton(addr[0]) + bytes(8)
+        ip, port = addr[0], addr[1]
+        flow = addr[2] if len(addr) > 2 else 0
+        scope = addr[3] if len(addr) > 3 else 0
+        return struct.pack("<H", 23) + int(port).to_bytes(2, "big") + struct.pack("<I", flow) + \
+            socket.inet_pton(socket.AF_INET6, ip.split("%")[0]) + struct.pack("<I", scope)
+
+    def write_sa(buf, plen, addr, af):
+        if not buf:
+            return
+        data = sa_bytes(addr, af)
+        have = _s32(M_.read32(plen)) if plen else len(data)
+        M_.write(buf, data[:max(0, have)])
+        if plen:
+            M_.write32(plen, len(data))
+
+    # -- blocking helper -------------------------------------------------------------------
+    def attempt_or_block(c, so, op, want, timeout_ms):
+        """Run op(); if it would block on a blocking socket, park the thread
+        until the socket is ready (want 'r'/'w') and retry in the wake hook."""
+        try:
+            return op()
+        except (BlockingIOError, InterruptedError):
+            if not so.blocking:
+                return err(WSAEWOULDBLOCK)
+        except OSError as e:
+            return oserr(e)
+        t = p.current_thread
+        deadline = time.monotonic() + timeout_ms / 1000.0 if timeout_ms else None
+        t.state = "blocked"
+        t.waiting_on = ("sock", so, op, want, deadline)
+        c.regs[RAX] = SOCKET_ERROR
+        raise NOOYield()
+
+    def sock_hook(t):
+        _k, so, op, want, deadline = t.waiting_on
+        try:
+            r, w, x = _sel.select([so.s] if want == "r" else [], [so.s] if want == "w" else [],
+                                  [so.s], 0)
+        except (OSError, ValueError):
+            r = w = x = [so.s]
+        if r or w or x:
+            prev = p.current_thread
+            p.current_thread = t
+            try:
+                try:
+                    res = op()
+                except (BlockingIOError, InterruptedError):
+                    return False
+                except OSError as e:
+                    res = oserr(e)
+            finally:
+                p.current_thread = prev
+            t.cpu.regs[RAX] = res & (M64 if p.cpu_mode == 64 else 0xFFFFFFFF)
+            return True
+        if deadline is not None and time.monotonic() >= deadline:
+            prev = p.current_thread
+            p.current_thread = t
+            p.last_error = WSAETIMEDOUT
+            p.current_thread = prev
+            t.cpu.regs[RAX] = SOCKET_ERROR
+            return True
+        return False
+
+    k.wait_hooks["sock"] = sock_hook
+    k.wait_hooks["sockselect"] = lambda t: t.waiting_on[1](t)
+
+    # -- startup -------------------------------------------------------------------------------
+    @R("WSAStartup", "up", dlls=_WS)
+    def _wsastartup(c, ver, data):
+        k.wsa_started += 1
+        if data:
+            desc = b"NOO Winsock 2.2".ljust(257, b"\0")
+            status = b"Running".ljust(129, b"\0")
+            if p.cpu_mode == 64:
+                blob = struct.pack("<HHHHQ", 0x0202, 0x0202, 0, 0, 0) + desc + status
+            else:
+                blob = struct.pack("<HH", 0x0202, 0x0202) + desc + status + \
+                    struct.pack("<HHI", 0, 0, 0)
+            M_.write(data, blob)
+        return 0
+
+    @R("WSACleanup", "", dlls=_WS)
+    def _wsacleanup(c):
+        if k.wsa_started <= 0:
+            return err(WSANOTINITIALISED)
+        k.wsa_started -= 1
+        return 0
+
+    @R("WSAGetLastError", "", dlls=_WS)
+    def _wsagle(c):
+        return p.last_error
+
+    @R("WSASetLastError", "i", "v", dlls=_WS)
+    def _wsasle(c, e):
+        p.last_error = e
+
+    # -- socket lifecycle -------------------------------------------------------------------------
+    def new_socket(af, typ, proto):
+        if not allowed():
+            return INVALID
+        paf = {2: socket.AF_INET, 23: socket.AF_INET6}.get(af)
+        ptyp = {1: socket.SOCK_STREAM, 2: socket.SOCK_DGRAM, 3: socket.SOCK_RAW}.get(typ)
+        if paf is None:
+            p.last_error = WSAEAFNOSUPPORT
+            return INVALID
+        if ptyp is None:
+            p.last_error = 10044                        # WSAESOCKTNOSUPPORT
+            return INVALID
+        try:
+            s = socket.socket(paf, ptyp, proto if proto not in (6, 17) else 0)
+            s.setblocking(False)
+        except OSError as e:
+            oserr(e)
+            return INVALID
+        return p.handles.add(_Sock(s, paf, typ, proto), "socket")
+
+    @R("socket", "iii", "p", dlls=_WS)
+    def _socket(c, af, typ, proto):
+        return new_socket(af, typ, proto)
+
+    @R("WSASocketA WSASocketW", "iiipuu", "p", dlls=_WS)
+    def _wsasocket(c, af, typ, proto, info, g, flags):
+        return new_socket(af, typ, proto)
+
+    @R("closesocket", "p", dlls=_WS)
+    def _closesocket(c, h):
+        so = sock(h)
+        if so is None:
+            return SOCKET_ERROR
+        try:
+            so.s.close()
+        except OSError:
+            pass
+        p.handles.close(h)
+        return 0
+
+    @R("shutdown", "pi", dlls=_WS)
+    def _shutdown(c, h, how):
+        so = sock(h)
+        if so is None:
+            return SOCKET_ERROR
+        try:
+            so.s.shutdown({0: socket.SHUT_RD, 1: socket.SHUT_WR}.get(how, socket.SHUT_RDWR))
+        except OSError as e:
+            return oserr(e)
+        return 0
+
+    @R("bind", "ppi", dlls=_WS)
+    def _bind(c, h, sa, n):
+        so = sock(h)
+        if so is None:
+            return SOCKET_ERROR
+        af, addr = read_sa(sa, n)
+        if addr is None:
+            return err(WSAEFAULT)
+        try:
+            so.s.bind(addr)
+        except OSError as e:
+            return oserr(e)
+        return 0
+
+    @R("listen", "pi", dlls=_WS)
+    def _listen(c, h, backlog):
+        so = sock(h)
+        if so is None:
+            return SOCKET_ERROR
+        try:
+            so.s.listen(max(1, min(backlog, 128)))
+        except OSError as e:
+            return oserr(e)
+        return 0
+
+    def do_accept(c, h, sa, plen):
+        so = sock(h)
+        if so is None:
+            return INVALID
+
+        def op():
+            ns, addr = so.s.accept()
+            ns.setblocking(False)
+            nh = p.handles.add(_Sock(ns, so.af, so.type, so.proto), "socket")
+            if sa:
+                write_sa(sa, plen, addr, so.af)
+            return nh
+        r = attempt_or_block(c, so, op, "r", so.rcvtimeo)
+        return INVALID if r == SOCKET_ERROR else r
+
+    @R("accept", "ppp", "p", dlls=_WS)
+    def _accept(c, h, sa, plen):
+        return do_accept(c, h, sa, plen)
+
+    @R("WSAAccept", "ppppp", "p", dlls=_WS)
+    def _wsaaccept(c, h, sa, plen, cond, data):
+        return do_accept(c, h, sa, plen)
+
+    @R("connect WSAConnect", "ppi", dlls=_WS)
+    def _connect(c, h, sa, n):
+        so = sock(h)
+        if so is None:
+            return SOCKET_ERROR
+        af, addr = read_sa(sa, n)
+        if addr is None:
+            return err(WSAEFAULT)
+        if not allowed("%s:%s" % (addr[0], addr[1])):
+            return SOCKET_ERROR
+        try:
+            so.s.connect(addr)
+            return 0
+        except (BlockingIOError, InterruptedError):
+            if not so.blocking:
+                return err(WSAEWOULDBLOCK)
+        except OSError as e:
+            return oserr(e)
+
+        def op():
+            e = so.s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            if e:
+                return err(_ERRMAP.get(e, WSAECONNREFUSED))
+            return 0
+        t = p.current_thread
+        t.state = "blocked"
+        t.waiting_on = ("sock", so, op, "w", time.monotonic() + 75.0)
+        c.regs[RAX] = SOCKET_ERROR
+        raise NOOYield()
+
+    # -- data -------------------------------------------------------------------------------------
+    @R("send", "ppii", dlls=_WS)
+    def _send(c, h, buf, n, flags):
+        so = sock(h)
+        if so is None:
+            return SOCKET_ERROR
+        data = M_.read(buf, n) if n else b""
+        return attempt_or_block(c, so, lambda: so.s.send(data), "w", so.sndtimeo)
+
+    @R("recv", "ppii", dlls=_WS)
+    def _recv(c, h, buf, n, flags):
+        so = sock(h)
+        if so is None:
+            return SOCKET_ERROR
+        peek = socket.MSG_PEEK if flags & 2 else 0
+
+        def op():
+            data = so.s.recv(max(n, 0), peek)
+            if data:
+                M_.write(buf, data)
+            return len(data)
+        return attempt_or_block(c, so, op, "r", so.rcvtimeo)
+
+    @R("sendto", "ppiipi", dlls=_WS)
+    def _sendto(c, h, buf, n, flags, sa, salen):
+        so = sock(h)
+        if so is None:
+            return SOCKET_ERROR
+        data = M_.read(buf, n) if n else b""
+        af, addr = read_sa(sa, salen)
+        if addr is None:
+            return attempt_or_block(c, so, lambda: so.s.send(data), "w", so.sndtimeo)
+        if not allowed("%s:%s" % (addr[0], addr[1])):
+            return SOCKET_ERROR
+        return attempt_or_block(c, so, lambda: so.s.sendto(data, addr), "w", so.sndtimeo)
+
+    @R("recvfrom", "ppiipp", dlls=_WS)
+    def _recvfrom(c, h, buf, n, flags, sa, plen):
+        so = sock(h)
+        if so is None:
+            return SOCKET_ERROR
+
+        def op():
+            data, addr = so.s.recvfrom(max(n, 0))
+            if data:
+                M_.write(buf, data)
+            if sa and addr:
+                write_sa(sa, plen, addr, so.af)
+            return len(data)
+        return attempt_or_block(c, so, op, "r", so.rcvtimeo)
+
+    def wsabufs(bufs, n):
+        out = []
+        for i in range(min(n, 64)):
+            e = bufs + i * (16 if ps() == 8 else 8)
+            ln = M_.read32(e)
+            ptr = M_.read64(e + 8) if ps() == 8 else M_.read32(e + 4)
+            out.append((ptr, ln))
+        return out
+
+    def complete_ov(ov, n):
+        if ov:
+            k.wptr(ov, 0)
+            k.wptr(ov + ps(), n)
+            ev = M_.read64(ov + 24) if ps() == 8 else M_.read32(ov + 16)
+            e = p.handles.get(ev, "kevent")
+            if e is not None:
+                e.signaled = True
+
+    @R("WSASend", "ppupupp", dlls=_WS)
+    def _wsasend(c, h, bufs, n, psent, flags, ov, cb):
+        so = sock(h)
+        if so is None:
+            return SOCKET_ERROR
+        data = b"".join(M_.read(a, ln) for a, ln in wsabufs(bufs, n) if ln)
+
+        def op():
+            r = so.s.send(data)
+            if psent:
+                M_.write32(psent, r)
+            complete_ov(ov, r)
+            return 0
+        return attempt_or_block(c, so, op, "w", so.sndtimeo)
+
+    @R("WSARecv", "ppupppp", dlls=_WS)
+    def _wsarecv(c, h, bufs, n, precv, pflags, ov, cb):
+        so = sock(h)
+        if so is None:
+            return SOCKET_ERROR
+        lst = wsabufs(bufs, n)
+        total = sum(ln for _a, ln in lst)
+
+        def op():
+            data = so.s.recv(total)
+            off = 0
+            for a, ln in lst:
+                chunk = data[off:off + ln]
+                if chunk:
+                    M_.write(a, chunk)
+                off += ln
+            if precv:
+                M_.write32(precv, len(data))
+            if pflags:
+                M_.write32(pflags, 0)
+            complete_ov(ov, len(data))
+            return 0
+        return attempt_or_block(c, so, op, "r", so.rcvtimeo)
+
+    # -- options / control --------------------------------------------------------------------------
+    _SOL = {0xFFFF: socket.SOL_SOCKET, 6: socket.IPPROTO_TCP, 0: socket.IPPROTO_IP,
+            41: socket.IPPROTO_IPV6, 17: socket.IPPROTO_UDP}
+    _OPT = {(0xFFFF, 4): socket.SO_REUSEADDR, (0xFFFF, 8): socket.SO_KEEPALIVE,
+            (0xFFFF, 0x20): socket.SO_BROADCAST, (0xFFFF, 0x1001): socket.SO_SNDBUF,
+            (0xFFFF, 0x1002): socket.SO_RCVBUF, (0xFFFF, 0x1007): socket.SO_ERROR,
+            (0xFFFF, 0x1008): socket.SO_TYPE, (6, 1): socket.TCP_NODELAY,
+            (41, 27): getattr(socket, "IPV6_V6ONLY", 26), (0, 4): socket.IP_TTL}
+
+    @R("setsockopt", "piipi", dlls=_WS)
+    def _setsockopt(c, h, level, opt, val, n):
+        so = sock(h)
+        if so is None:
+            return SOCKET_ERROR
+        v = M_.read32(val) if val and n >= 4 else (M_.read8(val) if val and n else 0)
+        if level == 0xFFFF and opt in (0x1006, 0x1005):         # SO_RCVTIMEO / SO_SNDTIMEO
+            if opt == 0x1006:
+                so.rcvtimeo = v
+            else:
+                so.sndtimeo = v
+            return 0
+        if level == 0xFFFF and opt in (0x80, 0xFF7F, ~4 & 0xFFFFFFFF, 0xFFFFFFFB):
+            return 0                                            # LINGER / DONTLINGER / EXCLUSIVEADDRUSE
+        host_opt = _OPT.get((level, opt))
+        if host_opt is None:
+            return 0
+        try:
+            so.s.setsockopt(_SOL[level], host_opt, v)
+        except OSError as e:
+            return oserr(e)
+        return 0
+
+    @R("getsockopt", "piipp", dlls=_WS)
+    def _getsockopt(c, h, level, opt, val, plen):
+        so = sock(h)
+        if so is None:
+            return SOCKET_ERROR
+        if level == 0xFFFF and opt == 0x1008:
+            v = so.type
+        elif level == 0xFFFF and opt in (0x1006, 0x1005):
+            v = so.rcvtimeo if opt == 0x1006 else so.sndtimeo
+        elif level == 0xFFFF and opt == 0x2004:                 # SO_MAX_MSG_SIZE
+            v = 65507
+        else:
+            host_opt = _OPT.get((level, opt))
+            if host_opt is None:
+                v = 0
+            else:
+                try:
+                    v = so.s.getsockopt(_SOL[level], host_opt)
+                except OSError as e:
+                    return oserr(e)
+                if host_opt == socket.SO_ERROR:
+                    v = _ERRMAP.get(v, v)
+        if val:
+            M_.write32(val, v & 0xFFFFFFFF)
+        if plen:
+            M_.write32(plen, 4)
+        return 0
+
+    @R("ioctlsocket", "pup", dlls=_WS)
+    def _ioctlsocket(c, h, cmd, argp):
+        so = sock(h)
+        if so is None:
+            return SOCKET_ERROR
+        if cmd == 0x8004667E:                                   # FIONBIO
+            so.blocking = not M_.read32(argp)
+            return 0
+        if cmd == 0x4004667F:                                   # FIONREAD
+            try:
+                n = len(so.s.recv(65536, socket.MSG_PEEK))
+            except (BlockingIOError, OSError):
+                n = 0
+            M_.write32(argp, n)
+            return 0
+        if cmd == 0x40047307:                                   # SIOCATMARK
+            M_.write32(argp, 1)
+            return 0
+        return err(WSAEINVAL)
+
+    @R("WSAIoctl", "pupupuppp", dlls=_WS)
+    def _wsaioctl(c, h, code, inb, inn, outb, outn, pret, ov, cb):
+        if code in (0x8004667E, 0x4004667F):
+            return _ioctlsocket(c, h, code, inb if code == 0x8004667E else outb)
+        return err(WSAEOPNOTSUPP)
+
+    @R("getsockname", "ppp", dlls=_WS)
+    def _getsockname(c, h, sa, plen):
+        so = sock(h)
+        if so is None:
+            return SOCKET_ERROR
+        try:
+            addr = so.s.getsockname()
+        except OSError as e:
+            return oserr(e)
+        write_sa(sa, plen, addr, so.af)
+        return 0
+
+    @R("getpeername", "ppp", dlls=_WS)
+    def _getpeername(c, h, sa, plen):
+        so = sock(h)
+        if so is None:
+            return SOCKET_ERROR
+        try:
+            addr = so.s.getpeername()
+        except OSError as e:
+            return oserr(e)
+        write_sa(sa, plen, addr, so.af)
+        return 0
+
+    # -- select / poll ------------------------------------------------------------------------------
+    def fdset_read(a):
+        if not a:
+            return []
+        n = M_.read32(a)
+        base = a + (8 if ps() == 8 else 4)
+        return [M_.read64(base + 8 * i) if ps() == 8 else M_.read32(base + 4 * i)
+                for i in range(min(n, 1024))]
+
+    def fdset_write(a, hs):
+        if not a:
+            return
+        M_.write32(a, len(hs))
+        base = a + (8 if ps() == 8 else 4)
+        for i, h in enumerate(hs):
+            k.wptr(base + ps() * i, h)
+
+    @R("select", "ipppp", dlls=_WS)
+    def _select(c, nfds, rfd, wfd, xfd, tv):
+        sets = [fdset_read(rfd), fdset_read(wfd), fdset_read(xfd)]
+        socks = {}
+        for lst in sets:
+            for h in lst:
+                so = p.handles.get(h, "socket")
+                if so is None:
+                    return err(WSAENOTSOCK)
+                socks[h] = so
+        if not socks:
+            return err(WSAEINVAL)
+        timeout = None
+        if tv:
+            timeout = M_.read32(tv) + M_.read32(tv + 4) / 1e6
+
+        def poll():
+            try:
+                r, w, x = _sel.select([socks[h].s for h in sets[0]], [socks[h].s for h in sets[1]],
+                                      [socks[h].s for h in sets[2]], 0)
+            except (OSError, ValueError):
+                return None
+            res = [[h for h in sets[0] if socks[h].s in r], [h for h in sets[1] if socks[h].s in w],
+                   [h for h in sets[2] if socks[h].s in x]]
+            n = sum(len(x_) for x_ in res)
+            if n:
+                fdset_write(rfd, res[0])
+                fdset_write(wfd, res[1])
+                fdset_write(xfd, res[2])
+            return n
+        n = poll()
+        if n is None:
+            return err(WSAENOTSOCK)
+        if n or timeout == 0:
+            if not n:
+                fdset_write(rfd, [])
+                fdset_write(wfd, [])
+                fdset_write(xfd, [])
+            return n
+        deadline = None if timeout is None else time.monotonic() + timeout
+
+        def hook(t):
+            r = poll()
+            if r:
+                t.cpu.regs[RAX] = r
+                return True
+            if deadline is not None and time.monotonic() >= deadline:
+                fdset_write(rfd, [])
+                fdset_write(wfd, [])
+                fdset_write(xfd, [])
+                t.cpu.regs[RAX] = 0
+                return True
+            return False
+        t = p.current_thread
+        t.state = "blocked"
+        t.waiting_on = ("sockselect", hook, deadline)
+        raise NOOYield()
+
+    @R("WSAPoll", "pui", dlls=_WS)
+    def _wsapoll(c, fds, n, timeout):
+        esz = 16 if ps() == 8 else 8
+        ents = []
+        for i in range(min(n, 1024)):
+            a = fds + i * esz
+            h = M_.read64(a) if ps() == 8 else M_.read32(a)
+            ev = M_.read16(a + ps())
+            ents.append((a, h, ev))
+
+        def poll():
+            cnt = 0
+            for a, h, ev in ents:
+                so = p.handles.get(h, "socket")
+                rev = 0
+                if so is None:
+                    rev = 0x4000 if h != M64 else 0                 # POLLNVAL
+                else:
+                    try:
+                        r, w, x = _sel.select([so.s] if ev & 0x300 else [],
+                                              [so.s] if ev & 0x10 else [], [so.s], 0)
+                    except (OSError, ValueError):
+                        r, w, x = [], [], [so.s]
+                    if r:
+                        rev |= ev & 0x300
+                    if w:
+                        rev |= 0x10
+                    if x:
+                        rev |= 0x1                                  # POLLERR
+                M_.write16(a + ps() + 2, rev)
+                if rev:
+                    cnt += 1
+            return cnt
+        cnt = poll()
+        if cnt or timeout == 0:
+            return cnt
+        deadline = None if timeout < 0 else time.monotonic() + timeout / 1000.0
+
+        def hook(t):
+            r = poll()
+            if r or (deadline is not None and time.monotonic() >= deadline):
+                t.cpu.regs[RAX] = r
+                return True
+            return False
+        t = p.current_thread
+        t.state = "blocked"
+        t.waiting_on = ("sockselect", hook, deadline)
+        raise NOOYield()
+
+    @R("__WSAFDIsSet", "pp", dlls=_WS)
+    def _fdisset(c, h, fds):
+        return 1 if h in fdset_read(fds) else 0
+
+    # -- name resolution ------------------------------------------------------------------------------
+    def resolve_name(name, family=0, socktype=0):
+        name = name or ""
+        if not p.sandbox.allow_network and name.lower() not in ("localhost", "", "127.0.0.1", "::1") \
+                and not re.fullmatch(r"[\d.]+|[0-9a-fA-F:]+", name):
+            return None
+        try:
+            return socket.getaddrinfo(name or None, None, family, socktype)
+        except (OSError, UnicodeError):
+            return None
+
+    k.hostent = {}
+
+    def hostent_for(name):
+        infos = resolve_name(name, socket.AF_INET)
+        if not infos:
+            p.last_error = WSAHOST_NOT_FOUND
+            return 0
+        ips = []
+        for _fam, _t, _p2, _cn, sa in infos:
+            if sa[0] not in ips:
+                ips.append(sa[0])
+        P = ps()
+        t = p.current_thread
+        blob = k.hostent.get(t.tid)
+        if blob is None:
+            blob = k.hostent[t.tid] = p.heap_alloc(p.process_heap_handle, 0x800)
+        hdr = 32 if P == 8 else 16
+        nm = name.encode()[:200] + b"\0"
+        name_a = blob + hdr
+        alias_a = (name_a + len(nm) + 7) & ~7
+        list_a = alias_a + P
+        addrs_a = list_a + P * (len(ips[:16]) + 1)
+        M_.write(name_a, nm)
+        k.wptr(alias_a, 0)
+        for i, ip in enumerate(ips[:16]):
+            k.wptr(list_a + P * i, addrs_a + 4 * i)
+            M_.write(addrs_a + 4 * i, socket.inet_aton(ip))
+        k.wptr(list_a + P * len(ips[:16]), 0)
+        if P == 8:
+            M_.write(blob, struct.pack("<QQhh4xQ", name_a, alias_a, 2, 4, list_a))
+        else:
+            M_.write(blob, struct.pack("<IIhhI", name_a, alias_a, 2, 4, list_a))
+        return blob
+
+    @R("gethostbyname", "p", "p", dlls=_WS)
+    def _ghbn(c, name):
+        return hostent_for(k.cs_(name))
+
+    @R("gethostbyaddr", "pii", "p", dlls=_WS)
+    def _ghba(c, addr, n, typ):
+        if typ != 2 or n < 4:
+            p.last_error = WSAEAFNOSUPPORT
+            return 0
+        ip = socket.inet_ntoa(M_.read(addr, 4))
+        return hostent_for(ip)
+
+    def hostname():
+        return p.env.get("COMPUTERNAME", "NOO-PC")
+
+    @R("gethostname", "pi", dlls=_WS)
+    def _ghn(c, buf, n):
+        nm = hostname().encode() + b"\0"
+        if n < len(nm):
+            return err(WSAEFAULT)
+        M_.write(buf, nm)
+        return 0
+
+    @R("GetHostNameW", "pi", dlls=_WS)
+    def _ghnw(c, buf, n):
+        nm = hostname()
+        if n < len(nm) + 1:
+            return err(WSAEFAULT)
+        M_.write(buf, nm.encode("utf-16-le") + b"\0\0")
+        return 0
+
+    def addrinfo(node, service, hints, pres, wide):
+        flags = fam = st = proto = 0
+        if hints:
+            flags, fam, st, proto = struct.unpack("<iiii", M_.read(hints, 16))
+        pfam = {0: 0, 2: socket.AF_INET, 23: socket.AF_INET6}.get(fam, 0)
+        port = 0
+        if service:
+            try:
+                port = int(service)
+            except ValueError:
+                try:
+                    port = socket.getservbyname(service)
+                except OSError:
+                    return 10109                            # WSATYPE_NOT_FOUND
+        if node is None:
+            infos = [(socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                      ("0.0.0.0" if flags & 1 else "127.0.0.1", 0))]
+        else:
+            infos = resolve_name(node, pfam, {1: socket.SOCK_STREAM, 2: socket.SOCK_DGRAM}.get(st, 0))
+            if not infos:
+                return EAI_NONAME
+        P = ps()
+        esz = 48 if P == 8 else 32
+        out = 0
+        prev = None
+        seen = set()
+        for fam_, typ_, proto_, cn, sa in infos:
+            if fam_ not in (socket.AF_INET, socket.AF_INET6):
+                continue
+            wtyp = {socket.SOCK_STREAM: 1, socket.SOCK_DGRAM: 2}.get(typ_, st or 1)
+            key = (fam_, wtyp, sa[0])
+            if key in seen:
+                continue
+            seen.add(key)
+            addr = (sa[0], port) + tuple(sa[2:]) if fam_ == socket.AF_INET6 else (sa[0], port)
+            sab = sa_bytes(addr, fam_)
+            e = p.heap_alloc(p.process_heap_handle, esz + len(sab) + 8)
+            sa_a = e + esz
+            M_.write(sa_a, sab)
+            wfam = 2 if fam_ == socket.AF_INET else 23
+            wproto = proto or {1: 6, 2: 17}.get(wtyp, 0)
+            if P == 8:
+                M_.write(e, struct.pack("<iiiiQQQQ", flags, wfam, wtyp, wproto, len(sab), 0, sa_a, 0))
+            else:
+                M_.write(e, struct.pack("<iiiiIIII", flags, wfam, wtyp, wproto, len(sab), 0, sa_a, 0))
+            if prev is None:
+                out = e
+            else:
+                k.wptr(prev + (40 if P == 8 else 28), e)
+            prev = e
+        if not out:
+            return EAI_NONAME
+        k.wptr(pres, out)
+        return 0
+
+    @R("getaddrinfo", "pppp", dlls=_WS)
+    def _gai(c, node, svc, hints, pres):
+        return addrinfo(k.cs_(node) if node else None, k.cs_(svc) if svc else None, hints, pres,
+                        False)
+
+    @R("GetAddrInfoW", "pppp", dlls=_WS)
+    def _gaiw(c, node, svc, hints, pres):
+        return addrinfo(k.ws_(node) if node else None, k.ws_(svc) if svc else None, hints, pres,
+                        True)
+
+    @R("GetAddrInfoExW GetAddrInfoExA", "ppupppppppp", dlls=_WS)
+    def _gaix(c, *a):
+        return WSAEOPNOTSUPP
+
+    @R("freeaddrinfo FreeAddrInfoW FreeAddrInfoEx FreeAddrInfoExW", "p", "v", dlls=_WS)
+    def _fai(c, ai):
+        P = ps()
+        guard = 0
+        while ai and guard < 4096:
+            nxt = M_.read64(ai + 40) if P == 8 else M_.read32(ai + 28)
+            p.heap_free(p.process_heap_handle, ai)
+            ai = nxt
+            guard += 1
+
+    def nameinfo(sa, salen, host, hostlen, serv, servlen, flags, wide):
+        af, addr = read_sa(sa, salen)
+        if addr is None:
+            return WSAEAFNOSUPPORT
+        h = addr[0]
+        if not flags & 2 and p.sandbox.allow_network:              # NI_NUMERICHOST
+            try:
+                h = socket.gethostbyaddr(addr[0])[0]
+            except OSError:
+                pass
+        sv = str(addr[1])
+        if host and hostlen:
+            k.put(host, hostlen, h, wide)
+        if serv and servlen:
+            k.put(serv, servlen, sv, wide)
+        return 0
+
+    @R("getnameinfo", "pipupui", dlls=_WS)
+    def _gni(c, sa, salen, host, hostlen, serv, servlen, flags):
+        return nameinfo(sa, salen, host, hostlen, serv, servlen, flags, False)
+
+    @R("GetNameInfoW", "pipupui", dlls=_WS)
+    def _gniw(c, sa, salen, host, hostlen, serv, servlen, flags):
+        return nameinfo(sa, salen, host, hostlen, serv, servlen, flags, True)
+
+    @R("getservbyname", "pp", "p", dlls=_WS)
+    def _gsbn(c, name, proto):
+        try:
+            port = socket.getservbyname(k.cs_(name), k.cs_(proto) if proto else None)
+        except OSError:
+            p.last_error = WSANO_DATA
+            return 0
+        P = ps()
+        blob = p.heap_alloc(p.process_heap_handle, 64)
+        nm = blob + 32
+        M_.write(nm, name and M_.read_cstring(name, 64) + b"\0" or b"\0")
+        if P == 8:
+            M_.write(blob, struct.pack("<QQQh", nm, 0, 0, socket.htons(port)))
+        else:
+            M_.write(blob, struct.pack("<IIhhI", nm, 0, socket.htons(port), 0, 0))
+        return blob
+
+    @R("getprotobyname", "p", "p", dlls=_WS)
+    def _gpbn(c, name):
+        num = {"tcp": 6, "udp": 17, "icmp": 1, "ip": 0}.get(k.cs_(name).lower())
+        if num is None:
+            p.last_error = WSANO_DATA
+            return 0
+        blob = p.heap_alloc(p.process_heap_handle, 32)
+        M_.write(blob + 16, k.cs_(name).encode() + b"\0")
+        if ps() == 8:
+            M_.write(blob, struct.pack("<QQ", blob + 16, 0) + struct.pack("<h", num))
+        else:
+            M_.write(blob, struct.pack("<IIh", blob + 16, 0, num))
+        return blob
+
+    # -- address conversion ------------------------------------------------------------------------------
+    @R("inet_addr", "p", dlls=_WS)
+    def _inet_addr(c, s_):
+        try:
+            return struct.unpack("<I", socket.inet_aton(k.cs_(s_).strip()))[0]
+        except OSError:
+            return 0xFFFFFFFF
+
+    @R("inet_ntoa", "u", "p", dlls=_WS)
+    def _inet_ntoa(c, a):
+        t = p.current_thread
+        buf = getattr(t, "ntoa_buf", 0)
+        if not buf:
+            buf = t.ntoa_buf = p.heap_alloc(p.process_heap_handle, 32)
+        M_.write(buf, socket.inet_ntoa(struct.pack("<I", a)).encode() + b"\0")
+        return buf
+
+    def pton(fam, txt, out):
+        f = {2: socket.AF_INET, 23: socket.AF_INET6}.get(fam)
+        if f is None:
+            return err(WSAEAFNOSUPPORT)
+        try:
+            M_.write(out, socket.inet_pton(f, txt))
+        except OSError:
+            return 0
+        return 1
+
+    @R("inet_pton", "ipp", dlls=_WS)
+    def _pton(c, fam, s_, out):
+        return pton(fam, k.cs_(s_), out)
+
+    @R("InetPtonW", "ipp", dlls=_WS)
+    def _ptonw(c, fam, s_, out):
+        return pton(fam, k.ws_(s_), out)
+
+    def ntop(fam, src, buf, n, wide):
+        f = {2: socket.AF_INET, 23: socket.AF_INET6}.get(fam)
+        if f is None:
+            p.last_error = WSAEAFNOSUPPORT
+            return 0
+        txt = socket.inet_ntop(f, M_.read(src, 4 if f == socket.AF_INET else 16))
+        if n < len(txt) + 1:
+            p.last_error = WSAEINVAL
+            return 0
+        k.put(buf, n, txt, wide)
+        return buf
+
+    @R("inet_ntop", "ippz", "p", dlls=_WS)
+    def _ntop(c, fam, src, buf, n):
+        return ntop(fam, src, buf, n, False)
+
+    @R("InetNtopW", "ippz", "p", dlls=_WS)
+    def _ntopw(c, fam, src, buf, n):
+        return ntop(fam, src, buf, n, True)
+
+    @R("htons ntohs", "u", dlls=_WS)
+    def _htons(c, v):
+        v &= 0xFFFF
+        return ((v >> 8) | (v << 8)) & 0xFFFF
+
+    @R("htonl ntohl", "u", dlls=_WS)
+    def _htonl(c, v):
+        return int.from_bytes((v & 0xFFFFFFFF).to_bytes(4, "little"), "big")
+
+    @R("WSAHtons WSANtohs", "pup", dlls=_WS)
+    def _wsahtons(c, s_, v, out):
+        M_.write16(out, _htons(c, v))
+        return 0
+
+    @R("WSAHtonl WSANtohl", "pup", dlls=_WS)
+    def _wsahtonl(c, s_, v, out):
+        M_.write32(out, _htonl(c, v))
+        return 0
+
+    # -- events (WSAEventSelect family, polled) --------------------------------------------------------
+    @R("WSACreateEvent", "", "p", dlls=_WS)
+    def _wsace(c):
+        return p.handles.add(_KEvent(True, False), "kevent")
+
+    @R("WSACloseEvent", "p", dlls=_WS)
+    def _wsacle(c, h):
+        p.handles.close(h)
+        return 1
+
+    @R("WSASetEvent", "p", dlls=_WS)
+    def _wsase(c, h):
+        e = p.handles.get(h, "kevent")
+        if e is not None:
+            e.signaled = True
+        return 1
+
+    @R("WSAResetEvent", "p", dlls=_WS)
+    def _wsare(c, h):
+        e = p.handles.get(h, "kevent")
+        if e is not None:
+            e.signaled = False
+        return 1
+
+    @R("WSAEventSelect", "ppi", dlls=_WS)
+    def _wsaes(c, h, ev, mask):
+        so = sock(h)
+        if so is None:
+            return SOCKET_ERROR
+        so.blocking = False
+        so.event, so.mask = ev, mask
+        return 0
+
+    @R("WSAEnumNetworkEvents", "ppp", dlls=_WS)
+    def _wsaene(c, h, ev, out):
+        so = sock(h)
+        if so is None:
+            return SOCKET_ERROR
+        try:
+            r, w, x = _sel.select([so.s], [so.s], [so.s], 0)
+        except (OSError, ValueError):
+            r = w = x = []
+        mask = getattr(so, "mask", 0)
+        bits = 0
+        if r:
+            bits |= mask & (0x1 | 0x8 | 0x20)                        # READ / ACCEPT / CLOSE
+        if w:
+            bits |= mask & (0x2 | 0x10)                              # WRITE / CONNECT
+        M_.write(out, struct.pack("<i", bits) + bytes(40))
+        e = p.handles.get(ev, "kevent")
+        if e is not None:
+            e.signaled = False
+        return 0
+
+    @R("WSAAsyncSelect", "ppui", dlls=_WS)
+    def _wsaas(c, h, hwnd, msg, mask):
+        return err(WSAEOPNOTSUPP)
+
+    @R("WSAGetOverlappedResult", "ppppp", dlls=_WS)
+    def _wsagor(c, h, ov, pn, wait, pflags):
+        n = M_.read64(ov + 8) if ps() == 8 else M_.read32(ov + 4)
+        M_.write32(pn, n)
+        if pflags:
+            M_.write32(pflags, 0)
+        return 1
+
+    @R("WSADuplicateSocketA WSADuplicateSocketW", "pup", dlls=_WS)
+    def _wsads(c, h, pid, info):
+        return err(WSAEOPNOTSUPP)
+
+
+# ==============================================================================
+# 10j. Guest child processes: CreateProcess / ShellExecute / exit codes
+# ==============================================================================
+
+class _ChildRuntime:
+    """Runtime facade for a guest child process (shares the parent's policy)."""
+
+    def __init__(self, parent_rt):
+        self.sandbox = parent_rt.sandbox
+        self.threaded = getattr(parent_rt, "threaded", True)
+        self.stdin_data = None
+        self.interactive_stdin = False
+        self.process = None
+
+
+def _proc_install(k):
+    R = k.reg
+    p = k.p
+    M_ = p.mem
+    import threading as _th
+    STD = (HandleTable.STDIN_HANDLE, HandleTable.STDOUT_HANDLE, HandleTable.STDERR_HANDLE)
+    k.children = {}                                  # pid -> process object
+
+    def std_target(h):
+        """Parent handle -> ('pipe', obj) / ('file', obj) / ('null',) / None (console)."""
+        if not h or h in (0xFFFFFFFF, M64):
+            return None
+        redir = (p.__dict__.get("std_redirect") or {})
+        if h in STD:
+            return redir.get(h)
+        kind = p.handles.kind(h)
+        obj = p.handles.get(h)
+        if kind in ("pipe_r", "pipe_w"):
+            return ("pipe", obj)
+        if kind == "file":
+            return ("file", obj)
+        if kind == "null":
+            return ("null", None)
+        if kind in ("conin", "conout"):
+            return None
+        return None
+
+    def wire_child(child, targets):
+        """Install the child's std stream sinks/sources."""
+        child.std_redirect = {}
+        sinks = {}
+        for stream, h, tgt in (("stdout", HandleTable.STDOUT_HANDLE, targets[1]),
+                               ("stderr", HandleTable.STDERR_HANDLE, targets[2])):
+            if tgt is None:
+                continue
+            child.std_redirect[h] = tgt
+            if tgt[0] == "pipe":
+                pipe = tgt[1]
+                pipe.writers += 1
+
+                def sink(data, pipe=pipe):
+                    if pipe.readers > 0:
+                        pipe.buf += data
+                sinks[stream] = sink
+            elif tgt[0] == "file":
+                f = tgt[1]
+
+                def sink(data, f=f):
+                    try:
+                        f.write(data)
+                        f.flush()
+                    except (OSError, ValueError):
+                        pass
+                sinks[stream] = sink
+            else:
+                sinks[stream] = lambda data: None
+        child.std_sink = sinks
+        tin = targets[0]
+        if tin is not None:
+            child.std_redirect[HandleTable.STDIN_HANDLE] = tin
+            if tin[0] == "pipe":
+                pipe = tin[1]
+                pipe.readers += 1
+
+                def source(n, pipe=pipe, child=child):
+                    while not pipe.buf:
+                        if pipe.writers <= 0 or child.__dict__.get("terminate_code") is not None:
+                            return b""
+                        time.sleep(0.002)
+                    data = bytes(pipe.buf[:n])
+                    del pipe.buf[:len(data)]
+                    return data
+                child.std_source = source
+            elif tin[0] == "file":
+                f = tin[1]
+                child.std_source = lambda n, f=f: (f.read(n) or b"")
+            else:
+                child.std_source = lambda n: b""
+
+    def release_child_std(child):
+        for h, tgt in (child.__dict__.get("std_redirect") or {}).items():
+            if tgt and tgt[0] == "pipe":
+                if h == HandleTable.STDIN_HANDLE:
+                    tgt[1].readers -= 1
+                else:
+                    tgt[1].writers -= 1
+
+    def find_exe(app, cmdline, cwd):
+        """-> guest path of the program or None."""
+        if app:
+            cands = [app]
+        else:
+            args = _split_cmdline(cmdline)
+            if not args:
+                return None
+            first = args[0]
+            cands = [first]
+            if "." not in first.rsplit("\\", 1)[-1]:
+                cands.insert(0, first + ".exe")
+        dirs = [cwd, p.exe_win_path.rsplit("\\", 1)[0], "C:\\Windows\\System32", "C:\\Windows"]
+        dirs += [d for d in p.env.get("PATH", "").split(";") if d]
+        for cand in cands:
+            if (len(cand) > 1 and cand[1] == ":") or cand.startswith("\\"):
+                paths = [cand]
+            else:
+                paths = [d.rstrip("\\") + "\\" + cand for d in dirs if d]
+            for g in paths:
+                try:
+                    host = p.vfs.resolve(g)
+                except (NOOSandboxViolation, Exception):
+                    continue
+                if os.path.isfile(host):
+                    drive, parts = VirtualFileSystem.normalize(g, p.vfs.cwd)
+                    return drive + ":\\" + "\\".join(parts), host
+        return None
+
+    def read_env_block(a, wide):
+        env = {}
+        off = a
+        for _ in range(4096):
+            s_ = k.ws_(off) if wide else k.cs_(off)
+            if not s_:
+                break
+            name, sep, val = s_[1:].partition("=") if s_.startswith("=") else s_.partition("=")
+            if s_.startswith("="):
+                name = "=" + name
+            if sep:
+                env[name.upper() if not name.startswith("=") else name] = val
+            off += (len(s_) + 1) * (2 if wide else 1) if wide else len(s_.encode()) + 1
+        return env
+
+    def create_process(c, app, cmdline, inherit, flags, envp, cwd, si, pi, wide):
+        cwd_g = k.s(cwd, wide) if cwd else p.vfs.cwd
+        app_s = k.s(app, wide) if app else ""
+        cmd_s = k.s(cmdline, wide) if cmdline else ""
+        if not cmd_s:
+            cmd_s = '"%s"' % app_s if " " in app_s else app_s
+        found = find_exe(app_s, cmd_s, cwd_g)
+        if found is None:
+            p.log.warn("CreateProcess: program not found in the virtual filesystem: %s"
+                       % (app_s or cmd_s))
+            return k.err(ERROR_FILE_NOT_FOUND)
+        guest, host = found
+        try:
+            data = open(host, "rb").read()
+            pe = PEFile(data, host)
+            if pe.is_dll or pe.machine not in (IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_AMD64):
+                raise NOOParseError("not an executable")
+        except (NOOParseError, OSError, NOOError) as e:
+            p.log.warn("CreateProcess: %s is not a runnable Windows program (%s)" % (guest, e))
+            return k.err(193)                           # ERROR_BAD_EXE_FORMAT
+        # standard handles
+        P = k.ptr_size()
+        use_std = False
+        hs = [0, 0, 0]
+        if si:
+            sflags = M_.read32(si + (60 if P == 8 else 44))
+            if sflags & 0x100:                          # STARTF_USESTDHANDLES
+                use_std = True
+                base = si + (80 if P == 8 else 56)
+                hs = [(M_.read64 if P == 8 else M_.read32)(base + P * i) for i in range(3)]
+        if not use_std:
+            hs = [k.std.get(0xFFFFFFF6), k.std.get(0xFFFFFFF5), k.std.get(0xFFFFFFF4)]
+        targets = [std_target(h) for h in hs]
+        env = read_env_block(envp, bool(flags & 0x400)) if envp else None
+        crt = _ChildRuntime(p.runtime)
+        try:
+            child = NOOProcess(crt, host, [], p.log, parent=p, exe_win_path=guest,
+                               cmdline=cmd_s, cwd=cwd_g, env=env)
+        except NOOError as e:
+            p.log.warn("CreateProcess: %s" % e)
+            return k.err(ERROR_NOT_ENOUGH_MEMORY)
+        crt.process = child
+        wire_child(child, targets)
+        pobj = {"exited": False, "code": 259, "proc": child, "pid": child.pid,
+                "tid": 0, "started": False, "name": guest}
+
+        def runner():
+            code = 0
+            try:
+                child.setup()
+                pobj["tid"] = child.threads[0].tid if child.threads else 0
+                code = child.run()
+            except NOOExitProcess as e:
+                code = e.code
+            except BaseException as e:                  # the parent must never be taken down
+                p.log.error("child process %s crashed in the emulator: %s" % (guest, e))
+                code = 0xC0000005
+            finally:
+                release_child_std(child)
+                pobj["code"] = (code or 0) & 0xFFFFFFFF
+                pobj["exited"] = True
+
+        th = _th.Thread(target=runner, name="noo-child-%d" % child.pid, daemon=True)
+        pobj["thread"] = th
+        k.children[child.pid] = pobj
+        if flags & 0x4:                                 # CREATE_SUSPENDED
+            pobj["suspended"] = True
+        else:
+            pobj["started"] = True
+            th.start()
+        hp = p.handles.add(pobj, "process")
+        ht = p.handles.add(pobj, "process_thread")
+        if pi:
+            k.wptr(pi, hp)
+            k.wptr(pi + P, ht)
+            M_.write32(pi + 2 * P, child.pid)
+            M_.write32(pi + 2 * P + 4, child.pid + 1)
+        p.log.info("[process] started %s (pid %d)" % (cmd_s, child.pid))
+        p.last_error = 0
+        return 1
+
+    @R("CreateProcessA", "ppppiupppp")
+    def _cpa(c, app, cmd, psa, tsa, inherit, flags, env, cwd, si, pi):
+        return create_process(c, app, cmd, inherit, flags, env, cwd, si, pi, False)
+
+    @R("CreateProcessW", "ppppiupppp")
+    def _cpw(c, app, cmd, psa, tsa, inherit, flags, env, cwd, si, pi):
+        return create_process(c, app, cmd, inherit, flags, env, cwd, si, pi, True)
+
+    @R("CreateProcessInternalW", "pppppiuppppp")
+    def _cpiw(c, tok, app, cmd, psa, tsa, inherit, flags, env, cwd, si, pi, newtok):
+        return create_process(c, app, cmd, inherit, flags, env, cwd, si, pi, True)
+
+    def _pobj(h):
+        if h in (0xFFFFFFFF, M64):
+            return None
+        o = p.handles.get(h)
+        if p.handles.kind(h) in ("process", "process_thread"):
+            return o
+        return None
+
+    @R("GetExitCodeProcess", "pp")
+    def _gecp(c, h, out):
+        if h in (0xFFFFFFFF, M64):
+            M_.write32(out, 259)
+            return 1
+        o = _pobj(h)
+        if o is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        M_.write32(out, o["code"] if o.get("exited") else 259)
+        return 1
+
+    @R("TerminateProcess", "pu")
+    def _termproc(c, h, code):
+        if h in (0xFFFFFFFF, M64):
+            raise NOOExitProcess(code)
+        o = _pobj(h)
+        if o is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        if not o.get("exited"):
+            o["proc"].terminate_code = code
+            if not o.get("started"):
+                o["exited"], o["code"] = True, code
+        return 1
+
+    @R("OpenProcess", "uiu", "p")
+    def _openproc(c, acc, inherit, pid):
+        if pid == p.pid:
+            return p.handles.add({"exited": False, "code": 259, "self": True}, "process")
+        o = k.children.get(pid)
+        if o is None:
+            return k.err(ERROR_INVALID_PARAMETER)
+        return p.handles.add(o, "process")
+
+    @R("GetProcessId", "p")
+    def _gpid2(c, h):
+        if h in (0xFFFFFFFF, M64):
+            return p.pid
+        o = _pobj(h)
+        if o is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        return o.get("pid", p.pid)
+
+    @R("WaitForInputIdle", "pu")
+    def _wfii(c, h, ms):
+        return 0
+
+    @R("GetProcessVersion", "u")
+    def _gpv(c, pid):
+        return 0x000A0000
+
+    def resume_child(h):
+        o = p.handles.get(h, "process_thread")
+        if o is None:
+            return None
+        if o.get("suspended") and not o.get("started"):
+            o["started"] = True
+            o["suspended"] = False
+            o["thread"].start()
+            return 1
+        return 0
+
+    k.resume_child = resume_child
+
+    # ShellExecute: executables only (documents/URLs have no handler in the sandbox)
+    def shell_exec(c, verb, file, params, dir_, show, wide):
+        f = k.s(file, wide) if file else ""
+        prm = k.s(params, wide) if params else ""
+        if not f.lower().endswith((".exe", ".com")) and "." in f.rsplit("\\", 1)[-1]:
+            p.log.info("[shell] ShellExecute(%r): no handler for this file type in the sandbox" % f)
+            return None
+        cmd = ('"%s"' % f) + ((" " + prm) if prm else "")
+        tmp = p.heap_alloc(p.process_heap_handle, 2 * len(cmd) + 2)
+        M_.write(tmp, cmd.encode("utf-16-le") + b"\0\0")
+        cwd = p.heap_alloc(p.process_heap_handle, 520) if dir_ else 0
+        if cwd:
+            M_.write(cwd, k.s(dir_, wide).encode("utf-16-le") + b"\0\0")
+        pi = p.heap_alloc(p.process_heap_handle, 32)
+        ok = create_process(c, 0, tmp, 0, 0, 0, cwd, 0, pi, True)
+        return (M_.read64(pi) if k.ptr_size() == 8 else M_.read32(pi)) if ok else 0
+
+    SH = ("shell32.dll",)
+
+    @R("ShellExecuteA", "pppppi", "p", dlls=SH)
+    def _sea(c, hwnd, verb, file, params, dir_, show):
+        h = shell_exec(c, verb, file, params, dir_, show, False)
+        return 42 if h else (31 if h is None else 2)    # >32 success / SE_ERR_NOASSOC / FNF
+
+    @R("ShellExecuteW", "pppppi", "p", dlls=SH)
+    def _sew(c, hwnd, verb, file, params, dir_, show):
+        h = shell_exec(c, verb, file, params, dir_, show, True)
+        return 42 if h else (31 if h is None else 2)
+
+    def shell_exec_ex(c, info, wide):
+        P = k.ptr_size()
+        # SHELLEXECUTEINFO: cbSize, fMask, hwnd, lpVerb, lpFile, lpParameters, lpDirectory,
+        # nShow, hInstApp, ... hProcess
+        mask = M_.read32(info + 4)
+        rd = M_.read64 if P == 8 else M_.read32
+        o = 8 if P == 4 else 8
+        hwnd = rd(info + o)
+        verb, file, params, dir_ = (rd(info + o + P * (i + 1)) for i in range(4))
+        h = shell_exec(c, verb, file, params, dir_, 1, wide)
+        hproc_off = 0x68 if P == 8 else 0x38
+        if h:
+            if mask & 0x40:                             # SEE_MASK_NOCLOSEPROCESS
+                k.wptr(info + hproc_off, h)
+            k.wptr(info + (0x38 if P == 8 else 0x20), 42)
+            return 1
+        k.wptr(info + (0x38 if P == 8 else 0x20), 31 if h is None else 2)
+        return k.err(1155 if h is None else ERROR_FILE_NOT_FOUND)   # NO_ASSOCIATION
+
+    @R("ShellExecuteExA", "p", dlls=SH)
+    def _seexa(c, info):
+        return shell_exec_ex(c, info, False)
+
+    @R("ShellExecuteExW", "p", dlls=SH)
+    def _seexw(c, info):
+        return shell_exec_ex(c, info, True)
+
+
+# ==============================================================================
 # 11. Module / DLL loader
 # ==============================================================================
 
@@ -24108,31 +25583,47 @@ class NOOProcess:
     """The emulated Windows process: virtual memory, CPU(s), threads, handles,
     modules, environment, filesystem namespace, registry, and API dispatch."""
 
-    def __init__(self, runtime, exe_host_path, args, log):
+    _next_pid = [4000 + (int(time.time()) % 1000) * 4]
+
+    def __init__(self, runtime, exe_host_path, args, log, parent=None, exe_win_path=None,
+                 cmdline=None, cwd=None, env=None):
         self.runtime = runtime
         self.sandbox = runtime.sandbox
         self.log = log
         self.use_threaded = getattr(runtime, "threaded", True)
-        self.pid = 4000 + (int(time.time()) % 1000)
+        self.pid = NOOProcess._next_pid[0]
+        NOOProcess._next_pid[0] += 4
+        self.parent = parent
+        self.cmdline_override = cmdline
         self.start_time = time.monotonic()
         self.cpu_mode = 32
         self.exe_host_path = os.path.abspath(exe_host_path)
         self.args = list(args or [])
 
         self.mem = VirtualMemory(log, limit_mb=self.sandbox.max_memory_mb)
-        self.vfs = VirtualFileSystem(self.sandbox.fs_root, log,
-                                     self.sandbox.allow_host_fs, self.sandbox.allow_host_write)
-        exe_dir = os.path.dirname(self.exe_host_path)
-        self.vfs.mount_host_dir(exe_dir, "C:\\app")
-        self.vfs.setcwd("C:\\app")
-        self.exe_win_path = "C:\\app\\" + os.path.basename(self.exe_host_path)
-        self.registry = VirtualRegistry(log)
+        if parent is not None:
+            # a guest child process: same machine (filesystem namespace and
+            # registry), its own address space, handles and threads
+            self.vfs = _copy_vfs(parent.vfs)
+            self.vfs.setcwd(cwd or parent.vfs.cwd)
+            self.exe_win_path = exe_win_path
+            self.registry = parent.registry
+        else:
+            self.vfs = VirtualFileSystem(self.sandbox.fs_root, log,
+                                         self.sandbox.allow_host_fs, self.sandbox.allow_host_write)
+            exe_dir = os.path.dirname(self.exe_host_path)
+            self.vfs.mount_host_dir(exe_dir, "C:\\app")
+            self.vfs.setcwd("C:\\app")
+            self.exe_win_path = "C:\\app\\" + os.path.basename(self.exe_host_path)
+            self.registry = VirtualRegistry(log)
         self.handles = HandleTable()
         self.api = WinAPI(self)
         self.modules = ModuleManager(self)
 
         self.env = self.vfs.default_environment(self.exe_win_path)
         self.env.update({k.upper(): v for k, v in self.sandbox.env.items()})
+        if parent is not None:
+            self.env = dict(env) if env is not None else dict(parent.env)
 
         self.threads = []
         self.current_thread = None
@@ -24742,6 +26233,8 @@ class NOOProcess:
         _adv_install(self.k32)
         _oa_install(self.k32)
         _nt_install(self.k32)
+        _ws_install(self.k32)
+        _proc_install(self.k32)
         main = NOOModule(os.path.basename(self.exe_host_path).lower(), base,
                          pe.size_of_image, "pe", pe)
         self.modules.main = main
@@ -24799,12 +26292,16 @@ class NOOProcess:
         cmdline = '"%s"' % self.exe_win_path
         if self.args:
             cmdline += " " + " ".join(self.args)
+        if self.cmdline_override is not None:
+            cmdline = self.cmdline_override
         self.cmdline_a_addr = self.mem.alloc(0x1000, MEM_READ | MEM_WRITE, tag="cmdline")
         self.mem.write(self.cmdline_a_addr, cmdline.encode() + b"\x00")
         self.cmdline_w_addr = self.mem.alloc(0x1000, MEM_READ | MEM_WRITE, tag="cmdline_w")
         self.mem.write(self.cmdline_w_addr, cmdline.encode("utf-16-le") + b"\x00\x00")
 
         argv_items = [self.exe_win_path] + self.args
+        if self.cmdline_override is not None:
+            argv_items = _split_cmdline(self.cmdline_override) or [self.exe_win_path]
         ptr_size = 8 if self.cpu_mode == 64 else 4
         str_area = self.mem.alloc(0x4000, MEM_READ | MEM_WRITE, tag="argv")
         a = str_area
@@ -25740,6 +27237,8 @@ class NOOProcess:
             self._startup_notify()
             idle_rounds = 0
             while True:
+                if self.__dict__.get("terminate_code") is not None:
+                    raise NOOExitProcess(self.terminate_code)
                 # wake any threads whose wait condition is now satisfied
                 for t in self.threads:
                     if t.state in ("blocked", "guiwait") and self._wake_check(t):
@@ -26386,6 +27885,8 @@ class _APIShim(WinAPI):
             _adv_install(k)
             _oa_install(k)
             _nt_install(k)
+            _ws_install(k)
+            _proc_install(k)
         except Exception:
             pass
 
