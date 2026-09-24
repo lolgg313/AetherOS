@@ -647,6 +647,8 @@ class VirtualMemory:
     def __init__(self, log=None, limit_mb=256):
         self.pages = {}        # page_no -> bytearray(PAGE_SIZE)
         self.loop_heads = set()  # guest addresses that start a hot loop
+        self.call_targets = set()  # entry points reached by direct calls
+        self.func_heads = set()  # hot function entries compiled as forward regions
         self.perms = {}        # page_no -> perm bits
         self.regions = []      # list of [base, size, perm, tag]
         self.log = log or NOOLog(verbose=False)
@@ -1094,7 +1096,7 @@ class _Mem:
 class _Ins:
     """One decoded guest instruction awaiting code generation."""
     __slots__ = ("start", "next", "emit", "fread", "fkill", "fwrite", "term",
-                 "live_out", "text", "sync_before", "succ")
+                 "live_out", "text", "sync_before", "succ", "call_tgt")
 
     def __init__(self, start):
         self.start = start
@@ -1108,6 +1110,7 @@ class _Ins:
         self.text = ""
         self.sync_before = False
         self.succ = None           # static successors of a direct branch
+        self.call_tgt = None       # target of a direct call
 
 
 class _BlockMeta:
@@ -1263,9 +1266,12 @@ class _Gen:
         return v
 
     # -- flags --------------------------------------------------------------------
-    def set_lazy(self, kind, size, a, b, r):
+    def set_lazy(self, kind, size, a, b, r, pure=False):
+        """Record lazy flags; pure: fr == fa - fb exactly (no borrow-in), so signed and
+        unsigned conditions can compare the operands directly."""
         self.L("fa, fb, fr = %s, %s, %s" % (a, b, r))
         self.fstate = ("lazy", kind, size)
+        self.pure_sub = pure
         self.dirty = True
 
     def set_mat(self, expr):
@@ -1309,6 +1315,15 @@ class _Gen:
         sb = hex(1 << (s - 1))
         sign = "((fr >> %d) & 1)" % (s - 1)
         z = "not (fr & %s)" % m
+        if k == _K_SUB and getattr(self, "pure_sub", False):
+            # sub/cmp without borrow-in: fa, fb are the size-masked operands
+            t = {2: "fa < fb", 3: "fa >= fb", 4: "fa == fb", 5: "fa != fb", 6: "fa <= fb",
+                 7: "fa > fb", 8: sign, 9: "not " + sign,
+                 12: "(fa ^ %s) < (fb ^ %s)" % (sb, sb), 13: "(fa ^ %s) >= (fb ^ %s)" % (sb, sb),
+                 14: "(fa ^ %s) <= (fb ^ %s)" % (sb, sb),
+                 15: "(fa ^ %s) > (fb ^ %s)" % (sb, sb)}.get(cc)
+            if t:
+                return t
         if k == _K_SUB:
             lt = "(((fa ^ %s) - fa) - ((fb ^ %s) - fb) + fr < 0)" % (sb, sb)
             t = {2: "fr < 0", 3: "fr >= 0", 4: z, 5: "(fr & %s) != 0" % m,
@@ -1931,7 +1946,9 @@ class _DecoderMixin:
             def e(g, ins, rel=rel):
                 g.push(str(ins.next))
                 g.L("c.eip = %d" % ((ins.next + rel) & (M64 if mode64 else 0xFFFFFFFF)))
-            return done(e, "call", term=True)
+            r_ = done(e, "call", term=True)
+            r_.call_tgt = (r_.next + rel) & (M64 if mode64 else 0xFFFFFFFF)
+            return r_
         if op in (0xE9, 0xEB):                         # jmp
             rel = _imm_s(imm(32), 32) if op == 0xE9 else _imm_s(imm(8), 8)
 
@@ -1971,7 +1988,7 @@ class _DecoderMixin:
                     g.L("%s = %s" % (a, g.rd(o, size)))
                     g.wr(o, size, "-%s" % a)
                     if ins.live_out & _FALL:
-                        g.set_lazy(_K_SUB, size, "0", a, "-%s" % a)
+                        g.set_lazy(_K_SUB, size, "0", a, "-%s" % a, pure=True)
                 return done(e, "neg", fkill=_FALL)
             return done(lambda g, ins, o=o, s=sub, z=size: self._e_muldiv(g, ins, o, s, z),
                         "muldiv", fkill=_FALL if sub in (4, 5) else 0,
@@ -2213,7 +2230,7 @@ class _DecoderMixin:
                 g.L("%s = %s" % (d, g.rd(o, size)))
                 a = g.tmp()
                 g.L("%s = %s" % (a, g.rreg((0, False), size)))
-                g.set_lazy(_K_SUB, size, a, d, "%s - %s" % (a, d))
+                g.set_lazy(_K_SUB, size, a, d, "%s - %s" % (a, d), pure=True)
                 g.L("if %s == %s:" % (a, d))
                 g.ind += "    "
                 g.wr(o, size, g.rd(r, size), masked=True)
@@ -2373,7 +2390,7 @@ class _DecoderMixin:
                 if aidx == 6:
                     g.set_lazy(_K_LOGIC, size, "0", "0", "0")
                 else:
-                    g.set_lazy(_K_SUB, size, "0", "0", "0")
+                    g.set_lazy(_K_SUB, size, "0", "0", "0", pure=True)
             return
         d = g.opaddr(dst, ins.next)
         a = g.tmp()
@@ -2404,7 +2421,7 @@ class _DecoderMixin:
             if writes:
                 g.wr(d, size, "%s & %s" % (r, m), masked=True)
             if live:
-                g.set_lazy(_K_SUB, size, a, bv, r)
+                g.set_lazy(_K_SUB, size, a, bv, r, pure=aidx != 3)
         else:
             opx = {1: "|", 4: "&", 6: "^", 8: "&"}[aidx]
             r = g.tmp()
@@ -4215,8 +4232,16 @@ class CPU(_DecoderMixin, _SSEMixin, _FPUMixin):
             if total > self._REGION_INSNS:
                 break
             work.extend(self._succs(insns))
+        if head in self.mem.func_heads and head not in self.mem.loop_heads:
+            # a hot function body: every block reachable by direct branches (calls and
+            # returns leave the region, which then resumes through the dispatcher)
+            body = sorted(order)
+            if len(body) < 2 or head not in blocks:
+                return None
+            reach = set(body)
+        else:
+            reach = {head}
         # keep the loop body: blocks from which the head is reachable
-        reach = {head}
         changed = True
         while changed:
             changed = False
@@ -4226,6 +4251,8 @@ class CPU(_DecoderMixin, _SSEMixin, _FPUMixin):
                     changed = True
         body = sorted(a for a in order if a in reach)
         if head not in blocks or (len(body) == 1 and head not in self._succs(blocks[head])):
+            return None
+        if head in self.mem.func_heads and head not in self.mem.loop_heads and len(body) < 2:
             return None
         key = ("region", self.mode, head,
                tuple((a, self.mem.read(a, max(1, blocks[a][-1].next - a))) for a in body))
@@ -4352,8 +4379,26 @@ class CPU(_DecoderMixin, _SSEMixin, _FPUMixin):
         meta.code = fn.__code__
         return fn
 
+    _FUNC_HOT = 40                 # calls before a function entry becomes a region
+
+    def _count_calls(self, eip, fn):
+        """Wrap a function-entry block: once it has run _FUNC_HOT times, drop it so the
+        next dispatch compiles the function body as one forward region."""
+        mem = self.mem
+        cnt = [0]
+        limit = self._FUNC_HOT
+
+        def counted(c, _fn=fn):
+            cnt[0] += 1
+            if cnt[0] == limit:
+                mem.func_heads.add(eip)
+                if mem.bcache.get(eip) is counted:
+                    del mem.bcache[eip]
+            return _fn(c)
+        return counted
+
     def _compile(self, eip, max_ins):
-        if eip in self.mem.loop_heads and self.use_regions:
+        if self.use_regions and (eip in self.mem.loop_heads or eip in self.mem.func_heads):
             try:
                 r = self._compile_region(eip)
             except NOOCPUFault:
@@ -4392,6 +4437,14 @@ class CPU(_DecoderMixin, _SSEMixin, _FPUMixin):
         fn = cached
         for pg in range(eip >> 12, ((p - 1 if p > eip else eip) >> 12) + 1):
             self.mem.mark_code(pg, eip)
+        if self.use_regions and insns:
+            tgt = insns[-1].call_tgt
+            if tgt is not None:
+                self.mem.call_targets.add(tgt)
+            if eip in self.mem.call_targets and eip not in self.mem.func_heads and \
+                    eip not in self.mem.loop_heads and not insns[-1].call_tgt and \
+                    len(insns) < self._BLOCK_MAX and insns[-1].succ:
+                fn = self._count_calls(eip, fn)
         if self.use_regions:
             self._note_back_edges(eip, insns)
             if eip in self.mem.loop_heads:              # a self-loop: region now
