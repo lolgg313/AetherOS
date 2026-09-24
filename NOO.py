@@ -47306,16 +47306,17 @@ def _cc_install_bars(k, notify, NMHDR_SZ, hfont, gfont, paint, IL, py_class):
         def layout():
             x = 2
             h = 0
-            for b in s["bands"]:
+            vis = [b for b in s["bands"] if not b.get("style", 0) & 8]
+            for b in vis:
                 ch = W(b["child"])
-                bh = max(b["minh"], ch.h if ch is not None else 0)
+                bh = b["minh"] or (ch.h if ch is not None else 0)
                 h = max(h, bh)
-            for b in s["bands"]:
+            for b in vis:
                 ch = W(b["child"])
                 if ch is None:
                     continue
                 tw = gfont(w).width(b["text"]) + 6 if b["text"] else 0
-                cw = b["cx"] or max(b["minw"], ch.w)
+                cw = b["cx"] or b.get("ideal") or max(b["minw"], ch.w)
                 wm.set_pos(ch, 0, x + tw + 6, 2, cw, h, SWP_NOZORDER | SWP_NOACTIVATE)
                 x += tw + 6 + cw + 4
             par = w.parent if w.parent is not wm.desktop else None
@@ -47328,6 +47329,8 @@ def _cc_install_bars(k, notify, NMHDR_SZ, hfont, gfont, paint, IL, py_class):
                 pt.fill(0, 0, Wd, Hd, sysc(COLOR_BTNFACE))
                 x = 2
                 for b in s["bands"]:
+                    if b.get("style", 0) & 8:
+                        continue
                     ch = W(b["child"])
                     _draw_edge(pt, (x, 0, x + 3, Hd), 4, 15)
                     if b["text"]:
@@ -47339,47 +47342,117 @@ def _cc_install_bars(k, notify, NMHDR_SZ, hfont, gfont, paint, IL, py_class):
             return 0
         if msg == 0x0014:
             return 1
+        # REBARBANDINFO field offsets (x86 / x64)
+        RBO = ({"style": 8, "fore": 12, "back": 16, "text": 20, "cch": 24, "image": 28,
+                "child": 32, "minw": 36, "minh": 40, "cx": 44, "id": 52, "cyChild": 56,
+                "ideal": 68, "lparam": 72, "header": 76} if ps == 4 else
+               {"style": 8, "fore": 12, "back": 16, "text": 24, "cch": 32, "image": 36,
+                "child": 40, "minw": 48, "minh": 52, "cx": 56, "id": 72, "cyChild": 76,
+                "ideal": 88, "lparam": 96, "header": 104})
+
+        def new_band():
+            return {"child": 0, "text": "", "minw": 0, "minh": 0, "cx": 0, "style": 0,
+                    "id": 0, "ideal": 0, "lparam": 0, "image": -1}
+
+        def adopt(b):
+            ch = W(b["child"])
+            if ch is not None and ch.parent is not w:
+                if ch in ch.parent.children:
+                    ch.parent.children.remove(ch)
+                ch.parent = w
+                w.children.append(ch)
+            if ch is not None:
+                want = not (b["style"] & 8)                          # RBBS_HIDDEN
+                if bool(ch.style & WS_VISIBLE) != want:
+                    wm.show(ch, 5 if want else 0)
+
         if msg in (0x401, 0x40A, 0x406, 0x40B):                   # RB_INSERTBAND(A/W)/SETBANDINFO
             wide_ = msg in (0x40A, 0x40B)
             mask = M_.read32(lp + 4)
-            off_text = 16 if ps == 4 else 16
-            b = {"child": 0, "text": "", "minw": 0, "minh": 0, "cx": 0}
+            b = new_band()
             if msg in (0x406, 0x40B):
                 if not 0 <= wp < len(s["bands"]):
                     return 0
                 b = s["bands"][wp]
-            fields = {"text": 16 if ps == 4 else 16, "child": 28 if ps == 4 else 40,
-                      "minw": 32 if ps == 4 else 48, "minh": 36 if ps == 4 else 52,
-                      "cx": 40 if ps == 4 else 56}
+            if mask & 1:
+                b["style"] = M_.read32(lp + RBO["style"])
             if mask & 4:
-                b["text"] = wm.gstr(wm.rp(lp + fields["text"]), wide_)
+                tp = wm.rp(lp + RBO["text"])
+                b["text"] = wm.gstr(tp, wide_) if tp else ""
+            if mask & 8:
+                b["image"] = _s32(M_.read32(lp + RBO["image"]))
             if mask & 0x10:
-                b["child"] = wm.rp(lp + fields["child"]) & 0xFFFFFFFF
-                ch = W(b["child"])
-                if ch is not None and ch.parent is not w:
-                    ch.parent.children.remove(ch)
-                    ch.parent = w
-                    w.children.append(ch)
+                b["child"] = wm.rp(lp + RBO["child"]) & 0xFFFFFFFF
             if mask & 0x20:
-                b["minw"] = M_.read32(lp + fields["minw"])
-                b["minh"] = M_.read32(lp + fields["minh"])
+                b["minw"] = M_.read32(lp + RBO["minw"])
+                b["minh"] = M_.read32(lp + RBO["minh"])
             if mask & 0x40:
-                b["cx"] = M_.read32(lp + fields["cx"])
+                b["cx"] = M_.read32(lp + RBO["cx"])
+            if mask & 0x100:
+                b["id"] = M_.read32(lp + RBO["id"])
+            if mask & 0x200:
+                b["ideal"] = M_.read32(lp + RBO["ideal"])
+            if mask & 0x400:
+                b["lparam"] = wm.rp(lp + RBO["lparam"])
             if msg in (0x401, 0x40A):
                 i = _s32(wp & 0xFFFFFFFF)
                 if i < 0 or i > len(s["bands"]):
                     s["bands"].append(b)
                 else:
                     s["bands"].insert(i, b)
+            adopt(b)
             layout()
             wm.invalidate(w, None, True)
             return 1
-        if msg == 0x402:                                          # RB_DELETEBAND
-            if 0 <= wp < len(s["bands"]):
-                del s["bands"][wp]
-                layout()
-                return 1
-            return 0
+        if msg in (0x405, 0x41C):                                 # RB_GETBANDINFO(A/W)
+            if not 0 <= wp < len(s["bands"]):
+                return 0
+            b = s["bands"][wp]
+            mask = M_.read32(lp + 4)
+            if mask & 1:
+                M_.write32(lp + RBO["style"], b["style"])
+            if mask & 8:
+                M_.write32(lp + RBO["image"], b["image"] & 0xFFFFFFFF)
+            if mask & 0x10:
+                wm.wp(lp + RBO["child"], b["child"])
+            if mask & 0x20:
+                M_.write(lp + RBO["minw"], struct.pack("<II", b["minw"], b["minh"]))
+            if mask & 0x40:
+                ch = W(b["child"])
+                M_.write32(lp + RBO["cx"], b["cx"] or (ch.w if ch is not None else 0))
+            if mask & 0x100:
+                M_.write32(lp + RBO["id"], b["id"])
+            if mask & 0x200:
+                M_.write32(lp + RBO["ideal"], b["ideal"])
+            if mask & 0x400:
+                wm.wp(lp + RBO["lparam"], b["lparam"])
+            if mask & 4:
+                tp = wm.rp(lp + RBO["text"])
+                n = M_.read32(lp + RBO["cch"])
+                if tp and n:
+                    wm.put_str(tp, n, b["text"], msg == 0x41C)
+            return 1
+        if msg == 0x423:                                          # RB_SHOWBAND
+            if not 0 <= wp < len(s["bands"]):
+                return 0
+            b = s["bands"][wp]
+            b["style"] = (b["style"] & ~8) if lp else (b["style"] | 8)
+            adopt(b)
+            layout()
+            wm.invalidate(w, None, True)
+            return 1
+        if msg == 0x410:                                          # RB_IDTOINDEX
+            for i, b in enumerate(s["bands"]):
+                if b["id"] == wp:
+                    return i
+            return 0xFFFFFFFF
+        if msg == 0x409:                                          # RB_GETRECT
+            if not 0 <= wp < len(s["bands"]) or not lp:
+                return 0
+            ch = W(s["bands"][wp]["child"])
+            r = (ch.x - 6, 0, ch.x + ch.w, w.h) if ch is not None else (0, 0, 0, 0)
+            M_.write(lp, struct.pack("<iiii", *r))
+            return 1
         if msg == 0x40C:                                          # RB_GETBANDCOUNT
             return len(s["bands"])
         if msg == 0x40D:                                          # RB_GETROWCOUNT
@@ -47389,7 +47462,9 @@ def _cc_install_bars(k, notify, NMHDR_SZ, hfont, gfont, paint, IL, py_class):
         if msg == 0x0005:
             layout()
             return 0
-        if msg in (0x404, 0x405, 0x403, 0x408, 0x409, 0x410, 0x411, 0x413, 0x414, 0x415,
+        if msg in (0x404, 0x417):                                 # RB_SETBARINFO / SIZETORECT
+            return 1
+        if msg in (0x405, 0x403, 0x408, 0x409, 0x410, 0x411, 0x413, 0x414, 0x415,
                    0x416, 0x417, 0x41C, 0x41E, 0x41F, 0x420, 0x421, 0x425):
             return 0
         return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
