@@ -40,7 +40,9 @@ import os
 import re
 import shutil
 import ssl
+import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -67,28 +69,39 @@ MAX_EXE_BYTES = 64 * 1024 * 1024         # 64 MB hard cap for a probed/run .exe
 EXE_INSTRUCTION_CAP = 20_000_000         # runaway-guard for emulated programs
 _NOO_MODULE = None
 _NOO_TRIED = False
+_NOO_LOCK = threading.Lock()
 
 
 def _load_noo():
     """Import NOO.py once, from next to OS.py, regardless of sys.path. Returns
-    the module or None. Cross-platform and dependency-free."""
+    the module or None. Cross-platform and dependency-free.
+
+    Thread-safe: pywebview serves every bridge call on its own thread, and the
+    desktop asks for many .exe icons at once on startup. Without the lock a
+    second caller saw _NOO_TRIED=True while the first import was still running
+    and wrongly reported the emulator as "not installed"."""
     global _NOO_MODULE, _NOO_TRIED
     if _NOO_TRIED:
         return _NOO_MODULE
-    _NOO_TRIED = True
+    with _NOO_LOCK:
+        if not _NOO_TRIED:
+            _NOO_MODULE = _import_noo()
+            _NOO_TRIED = True
+    return _NOO_MODULE
+
+
+def _import_noo():
     try:
         if os.path.isfile(NOO_FILE):
             import importlib.util
             spec = importlib.util.spec_from_file_location("NOO", NOO_FILE)
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
-            _NOO_MODULE = mod
-        else:
-            import importlib
-            _NOO_MODULE = importlib.import_module("NOO")
+            return mod
+        import importlib
+        return importlib.import_module("NOO")
     except Exception:
-        _NOO_MODULE = None
-    return _NOO_MODULE
+        return None
 
 
 MAX_FETCH_BYTES = 64 * 1024 * 1024      # 64 MB hard cap per fetched resource
@@ -128,6 +141,22 @@ IS_ADMIN = _detect_admin()
 ELEVATED = IS_ADMIN or os.environ.get("AETHER_ELEVATED") == "1"
 
 
+def _sudo_ready():
+    """True when `sudo` will run a command right now without failing: either
+    credentials are already cached / NOPASSWD (sudo -n), or we have a terminal
+    to ask for the password on (sudo -v). Never raises."""
+    try:
+        if subprocess.call(["sudo", "-n", "true"], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL) == 0:
+            return True
+        if sys.stdin is not None and sys.stdin.isatty():
+            return subprocess.call(["sudo", "-v"]) == 0
+    except Exception:
+        pass
+    return False
+
+
 def elevate_if_needed():
     """Try to restart this process with admin/root rights, exactly once.
     The AETHER_ELEVATED env var guards against re-exec loops. Cancellation
@@ -142,7 +171,8 @@ def elevate_if_needed():
         try:
             import ctypes
             rc = ctypes.windll.shell32.ShellExecuteW(
-                None, "runas", sys.executable, '"OS.py"', BASE_DIR, 1)
+                None, "runas", sys.executable,
+                '"%s"' % os.path.abspath(__file__), BASE_DIR, 1)
             if rc > 32:
                 # Relaunch accepted — this unelevated instance exits.
                 sys.exit(0)
@@ -160,11 +190,18 @@ def elevate_if_needed():
         geteuid = getattr(os, "geteuid", None)
         if geteuid is not None and geteuid() != 0 and shutil.which("sudo"):
             env = dict(os.environ, AETHER_ELEVATED="1")
-            try:
-                os.execvpe("sudo", ["sudo", "-E", sys.executable,
-                                    os.path.abspath(__file__)], env)
-            except Exception as exc:
-                print("[AetherOS] sudo re-exec failed (%s) — continuing unelevated." % exc)
+            # exec replaces this process, so a sudo failure there (wrong
+            # password, no terminal to ask on, user not in sudoers) used to
+            # END AetherOS instead of falling back. Obtain the credentials
+            # first; only exec once sudo has said yes.
+            if _sudo_ready():
+                try:
+                    os.execvpe("sudo", ["sudo", "-E", sys.executable,
+                                        os.path.abspath(__file__)], env)
+                except Exception as exc:
+                    print("[AetherOS] sudo re-exec failed (%s) — continuing unelevated." % exc)
+            else:
+                print("[AetherOS] sudo not authorized — continuing WITHOUT root rights.")
         elif geteuid is not None and geteuid() != 0:
             print("[AetherOS] sudo not found — continuing WITHOUT root rights.")
         ELEVATED = _detect_admin()
@@ -506,13 +543,32 @@ def _aefs_used_data(manifest):
 
 
 def _aefs_next_offset(manifest):
-    """Bump allocator: place new data after the highest existing extent."""
+    """End of the highest existing extent (where appended data would go)."""
     top = AEFS_HEADER
     for e in manifest:
         end = int(e.get("offset", AEFS_HEADER)) + int(e.get("size", 0))
         if end > top:
             top = end
     return top
+
+
+def _aefs_find_space(manifest, need, drive_size):
+    """First-fit allocator: return the lowest offset where `need` bytes fit
+    between existing extents (or after the last one), else None.
+
+    A plain bump allocator never reused the holes left by deleted or replaced
+    files, so a drive could refuse a write while reporting plenty of free
+    space."""
+    extents = sorted((int(e.get("offset", AEFS_HEADER)), int(e.get("size", 0)))
+                     for e in manifest)
+    cursor = AEFS_HEADER
+    for off, size in extents:
+        if off - cursor >= need:
+            return cursor
+        cursor = max(cursor, off + size)
+    if drive_size - cursor >= need:
+        return cursor
+    return None
 
 
 def _aefs_category(name, mime):
@@ -536,7 +592,11 @@ def _aefs_category(name, mime):
     return "Other"
 
 
-
+# --------------------------------------------------------------------------
+# DOCX -> HTML (stdlib only)
+# --------------------------------------------------------------------------
+# WordprocessingML namespace, in ElementTree's "{uri}tag" form.
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
 
 def _docx_to_html(data):
@@ -558,19 +618,32 @@ def _docx_to_html(data):
     except Exception as exc:
         raise ValueError("Could not parse document.xml: %s" % exc)
 
+    def _docx_flag(rpr, name):
+        """A run property is on when present, unless w:val turns it off
+        (<w:b w:val="0"/>, <w:u w:val="none"/>)."""
+        if rpr is None:
+            return False
+        el = rpr.find(_W + name)
+        if el is None:
+            return False
+        val = (el.get(_W + "val") or "").lower()
+        return val not in ("0", "false", "off", "none")
+
     paragraphs = []
     for p in root.iter(_W + "p"):
         seg = []
         for r in p.iter(_W + "r"):
             rpr = r.find(_W + "rPr")
-            bold = rpr is not None and rpr.find(_W + "b") is not None
-            italic = rpr is not None and rpr.find(_W + "i") is not None
-            underline = rpr is not None and rpr.find(_W + "u") is not None
+            bold = _docx_flag(rpr, "b")
+            italic = _docx_flag(rpr, "i")
+            underline = _docx_flag(rpr, "u")
             txt = []
             for child in r:
                 if child.tag == _W + "t" and child.text:
                     txt.append(_html_mod.escape(child.text))
-                elif child.tag == _W + "br":
+                elif child.tag == _W + "tab":
+                    txt.append("&emsp;")
+                elif child.tag in (_W + "br", _W + "cr"):
                     txt.append("<br>")
             s = "".join(txt)
             if not s:
@@ -996,8 +1069,8 @@ class AetherApi:
                 return {"ok": False, "error": "Drive directory is unreadable."}
             manifest = [e for e in manifest if e.get("name") != fn]   # replace
             size = os.path.getsize(path)
-            offset = _aefs_next_offset(manifest)
-            if offset + len(data) > size:
+            offset = _aefs_find_space(manifest, len(data), size)
+            if offset is None:
                 free = max(0, size - AEFS_HEADER - _aefs_used_data(manifest))
                 return {"ok": False,
                         "error": "Not enough space on '%s' (%d bytes free, need %d)."
@@ -1106,19 +1179,28 @@ class AetherApi:
             payload = (SAVE_HEADER + "\n" + state_json).encode("utf-8")
             path = _state_path(name)
             tmp_path = path + ".tmp"
-            if str(name) == "Main" and os.path.isfile(path):
+            try:
+                # Write the new payload FIRST: if this fails (disk full, ...)
+                # the previous save is left exactly where it was.
+                with open(tmp_path, "wb") as fh:
+                    fh.write(payload)
+                    fh.flush()
+                    try:
+                        os.fsync(fh.fileno())
+                    except OSError:
+                        pass
+                if str(name) == "Main" and os.path.isfile(path):
+                    try:
+                        os.replace(path, path + ".bak")  # keep the last good state
+                    except OSError:
+                        pass
+                os.replace(tmp_path, path)  # atomic on Windows AND Linux
+            except Exception:
                 try:
-                    os.replace(path, path + ".bak")  # keep the last good state
+                    os.remove(tmp_path)     # never leave a stray half-save
                 except OSError:
                     pass
-            with open(tmp_path, "wb") as fh:
-                fh.write(payload)
-                fh.flush()
-                try:
-                    os.fsync(fh.fileno())
-                except OSError:
-                    pass
-            os.replace(tmp_path, path)  # atomic on Windows AND Linux
+                raise
             return {"ok": True, "path": path, "size": len(payload)}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
