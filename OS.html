@@ -11232,8 +11232,13 @@ const OS = {
     winEl.style.top = `${posY}px`;
     winEl.style.zIndex = ++this.zIndexCounter;
 
+    /* appId can carry a user file name (exe:C:/.../Bob's Game.exe): pass it
+       to the inline handlers as a JSON string literal, HTML-escaped for the
+       attribute. A raw '${appId}' broke on apostrophes — the window could
+       not be closed, minimized, dragged or resized — and was injectable. */
+    const jsId = SecurityUtils.escapeHTML(JSON.stringify(String(appId)));
     winEl.innerHTML = `
-      <div class="titlebar" onmousedown="OS.startWindowDrag(event, '${appId}')">
+      <div class="titlebar" onmousedown="OS.startWindowDrag(event, ${jsId})">
         <div class="titlebar-left">
           <div class="titlebar-icon">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="${cfg.icon}"><circle cx="12" cy="12" r="10"/></svg>
@@ -11241,26 +11246,26 @@ const OS = {
           <span class="titlebar-title">${safeTitle}</span>
         </div>
         <div class="titlebar-controls">
-          <button class="win-btn" onclick="OS.minimizeWindow('${appId}')" title="Minimize">
+          <button class="win-btn" onclick="OS.minimizeWindow(${jsId})" title="Minimize">
             <svg viewBox="0 0 12 12"><line x1="1" y1="6" x2="11" y2="6"/></svg>
           </button>
-          <button class="win-btn" onclick="OS.toggleMaximize('${appId}')" title="Maximize">
+          <button class="win-btn" onclick="OS.toggleMaximize(${jsId})" title="Maximize">
             <svg viewBox="0 0 12 12"><rect x="1.5" y="1.5" width="9" height="9" fill="none"/></svg>
           </button>
-          <button class="win-btn close" onclick="OS.closeWindow('${appId}')" title="Close">
+          <button class="win-btn close" onclick="OS.closeWindow(${jsId})" title="Close">
             <svg viewBox="0 0 12 12"><line x1="1.5" y1="1.5" x2="10.5" y2="10.5"/><line x1="10.5" y1="1.5" x2="1.5" y2="10.5"/></svg>
           </button>
         </div>
       </div>
       <div class="window-body">${cfg.content}</div>
-      <div class="resize-handle resize-n" onmousedown="OS.startWindowResize(event, '${appId}', 'n')"></div>
-      <div class="resize-handle resize-s" onmousedown="OS.startWindowResize(event, '${appId}', 's')"></div>
-      <div class="resize-handle resize-e" onmousedown="OS.startWindowResize(event, '${appId}', 'e')"></div>
-      <div class="resize-handle resize-w" onmousedown="OS.startWindowResize(event, '${appId}', 'w')"></div>
-      <div class="resize-handle resize-ne" onmousedown="OS.startWindowResize(event, '${appId}', 'ne')"></div>
-      <div class="resize-handle resize-nw" onmousedown="OS.startWindowResize(event, '${appId}', 'nw')"></div>
-      <div class="resize-handle resize-se" onmousedown="OS.startWindowResize(event, '${appId}', 'se')"></div>
-      <div class="resize-handle resize-sw" onmousedown="OS.startWindowResize(event, '${appId}', 'sw')"></div>
+      <div class="resize-handle resize-n" onmousedown="OS.startWindowResize(event, ${jsId}, 'n')"></div>
+      <div class="resize-handle resize-s" onmousedown="OS.startWindowResize(event, ${jsId}, 's')"></div>
+      <div class="resize-handle resize-e" onmousedown="OS.startWindowResize(event, ${jsId}, 'e')"></div>
+      <div class="resize-handle resize-w" onmousedown="OS.startWindowResize(event, ${jsId}, 'w')"></div>
+      <div class="resize-handle resize-ne" onmousedown="OS.startWindowResize(event, ${jsId}, 'ne')"></div>
+      <div class="resize-handle resize-nw" onmousedown="OS.startWindowResize(event, ${jsId}, 'nw')"></div>
+      <div class="resize-handle resize-se" onmousedown="OS.startWindowResize(event, ${jsId}, 'se')"></div>
+      <div class="resize-handle resize-sw" onmousedown="OS.startWindowResize(event, ${jsId}, 'sw')"></div>
     `;
 
     winEl.onmousedown = () => this.bringToFront(appId);
@@ -11428,13 +11433,28 @@ const OS = {
           name: this.windows[id].config.title,
           icon: UserAppHost.taskbarIcon(id)
         }))
+    ).concat(
+      /* Every other running window (PyStudio, .exe consoles, GUI programs,
+         drive and installer windows) — without an entry a minimized one of
+         these could never be restored. */
+      Object.keys(this.windows)
+        .filter(id => id.indexOf('uapp') !== 0 && !catalog.some(a => a.id === id))
+        .map(id => {
+          const cfg = this.windows[id].config || {};
+          const color = /^#[0-9a-fA-F]{3,8}$/.test(cfg.icon || '') ? cfg.icon : '#94a3b8';
+          return {
+            id,
+            name: cfg.title || id,
+            icon: '<svg viewBox="0 0 24 24" fill="' + color + '"><circle cx="12" cy="12" r="9"/></svg>'
+          };
+        })
     );
 
     container.innerHTML = items.map(item => {
       const isRunning = !!this.windows[item.id];
       const isActive = this.activeWindowId === item.id && !this.windows[item.id]?.el.classList.contains('minimized');
       return `
-        <div class="taskbar-item ${isRunning ? 'running' : ''} ${isActive ? 'active' : ''}" onclick="OS.handleTaskbarItemClick('${item.id}')" title="${SecurityUtils.escapeHTML(item.name)}">
+        <div class="taskbar-item ${isRunning ? 'running' : ''} ${isActive ? 'active' : ''}" onclick="OS.handleTaskbarItemClick(${SecurityUtils.escapeHTML(JSON.stringify(String(item.id)))})" title="${SecurityUtils.escapeHTML(item.name)}">
           ${item.icon}
         </div>
       `;
@@ -12103,6 +12123,7 @@ osscc+:. \`\`\`\`\`:++sso         UI: Fluent Glass + Android Softness
     };
     addItem('Open', () => this.openVirtualFile(name));
     if (!isDir) {
+      const dirPath = `C:/Users/Hamid/${this.explorerDir}`;
       if (/\.exe$/i.test(name) && typeof InstallerApp !== 'undefined') {
         addItem('Install…', () => InstallerApp.launch(`${dirPath}/${name}`, name));
       }
@@ -12179,12 +12200,16 @@ osscc+:. \`\`\`\`\`:++sso         UI: Fluent Glass + Android Softness
       setTimeout(() => AppStudio.loadDoc(pkg), 160);
     } else if (name.endsWith('.c')) {
       this.launchApp('c_studio');
-      const content = VFS.getFile(`C:/Users/Hamid/Desktop/${name}`);
+      // Read from the folder the file is actually in (was always Desktop).
+      const content = VFS.getFile(`${dirPath}/${name}`);
       setTimeout(() => {
         const ed = document.getElementById('c-studio-editor');
         if (ed && content !== null) {
           ed.value = content;
-          this.currentCFile = name;
+          // C Studio saves into Desktop, so — like Notepad — a file opened
+          // from another folder is an untitled buffer and can never
+          // overwrite a same-named Desktop file on save.
+          this.currentCFile = this.explorerDir === 'Desktop' ? name : null;
           this.cStudioDirty = false;
           this.updateCLineNumbers();
           this.updateCStudioTitle();
@@ -12642,8 +12667,17 @@ osscc+:. \`\`\`\`\`:++sso         UI: Fluent Glass + Android Softness
      Captures open windows (geometry, min/max, z-order) plus in-memory drafts
      of Notepad, C Studio and the Calculator directly from the live DOM.
      ========================================================================== */
+  /* Windows backed by a live emulator session or an in-memory result (.exe
+     consoles, GUI programs, installer results) cannot be rebuilt from their
+     id after a reload — restoring them produced empty "Starting…" shells. */
+  _isTransientWindow(id) {
+    return typeof id === 'string' &&
+      (id.indexOf('exe:') === 0 || id.indexOf('gui:') === 0 || id.indexOf('installed:') === 0);
+  },
+
   captureSessionSnapshot() {
-    const windows = Object.keys(this.windows).filter(id => id !== 'uapp_preview').map(id => {
+    const windows = Object.keys(this.windows)
+      .filter(id => id !== 'uapp_preview' && !this._isTransientWindow(id)).map(id => {
       const w = this.windows[id];
       return {
         app: id,
@@ -12714,6 +12748,7 @@ osscc+:. \`\`\`\`\`:++sso         UI: Fluent Glass + Android Softness
       const sorted = session.windows.slice().sort((a, b) => (a.z || 0) - (b.z || 0));
       sorted.forEach(wState => {
         if (!wState || typeof wState.app !== 'string') return;
+        if (this._isTransientWindow(wState.app)) return;   // older saves may list them
         this.launchApp(wState.app);
         const win = this.windows[wState.app];
         if (!win) return;
@@ -15392,6 +15427,16 @@ const DesktopIcons = {
     return { c: 0, r: 0 };
   },
 
+  /* Re-draw after the set of desktop items changed (state restore, App
+     Studio save, drive export, drag & drop import). Four callers relied on
+     this method, but it did not exist: each threw a TypeError — restoring
+     Main.aether at boot was rejected outright because of it. */
+  refresh() { this.render(); },
+  /* packIcons() ("Auto arrange") and deleteUserIcon() call save(); the
+     storage method is persist(). Without this alias both threw before
+     re-rendering — auto-arrange never worked. */
+  save() { return this.persist(); },
+
   render() {
     const container = document.getElementById('desktop-icons');
     if (!container) return;
@@ -16047,6 +16092,14 @@ const GuiApp = {
       OS.notify('Cannot run ' + name, 'Graphical .exe programs need the AetherOS desktop app.');
       return;
     }
+    const existing = this.idFor(fullPath);
+    if (this._apps[existing] && OS.windows[existing]) {
+      // Already running in its window: bring it forward instead of starting
+      // a second session (which leaked the first and doubled its input).
+      OS.launchApp(existing);
+      return;
+    }
+    this._dispose(existing);
     let snap;
     try { snap = await AetherBridge.guiStart(b64, '[]'); }
     catch (e) { snap = { ok: false, error: String(e && e.message || e) }; }
@@ -16086,26 +16139,44 @@ const GuiApp = {
 
   _el(appId, which) { return document.getElementById('gui-' + which + '-' + appId); },
 
-  async _afterOpen(appId, snap) {
+  async _afterOpen(appId, snap, tries) {
     const app = this._apps[appId];
-    if (!app) return;
+    if (!app || app.closed) return;
     const canvas = this._el(appId, 'canvas');
-    if (!canvas) { setTimeout(() => this._afterOpen(appId, snap), 80); return; }
+    if (!canvas) {
+      // Window not painted yet — retry briefly, but not forever (it may
+      // have been closed before it ever appeared).
+      if ((tries || 0) < 50) setTimeout(() => this._afterOpen(appId, snap, (tries || 0) + 1), 80);
+      return;
+    }
     this._wireInput(appId);
     this._render(appId, snap);
     // Poll loop: repaints from timers/animations; also detects exit.
-    app.timer = setInterval(() => this._tick(appId), 120);
+    if (!app.timer) app.timer = setInterval(() => this._tick(appId), 120);
   },
 
   async _tick(appId) {
     const app = this._apps[appId];
-    if (!app || app.closed) return;
+    if (!app || app.closed || app.polling) return;
+    // One poll at a time: a slow emulator step must not stack up requests.
+    app.polling = true;
     let snap;
     try { snap = await AetherBridge.guiPoll(app.sid); }
-    catch (e) { return; }   // transient; try again next tick
-    if (!snap || !snap.ok) return;
+    catch (e) { snap = null; }   // transient; try again next tick
+    finally { app.polling = false; }
+    if (this._apps[appId] !== app || !snap || !snap.ok) return;
     this._render(appId, snap);
     if (snap.exited) this._finish(appId, snap);
+  },
+
+  /* Stop and forget a session (used before replacing one for the same id). */
+  _dispose(appId) {
+    const app = this._apps[appId];
+    if (!app) return;
+    app.closed = true;
+    if (app.timer) { clearInterval(app.timer); app.timer = null; }
+    try { AetherBridge.guiStop(app.sid); } catch (e) {}
+    delete this._apps[appId];
   },
 
   _finish(appId, snap) {
@@ -16153,8 +16224,10 @@ const GuiApp = {
       if (st && !app.closed) st.textContent = (main.title || app.name) + ' · OpenGL';
       return;
     }
-    if (snap.rev != null && snap.rev === app.lastRev && !snap.exited) return; // nothing changed
-    app.lastRev = snap.rev;
+    // Nothing changed — or a reply that arrived out of order and is older
+    // than the frame already on screen (rev only ever increases).
+    if (snap.rev != null && snap.rev <= app.lastRev && !snap.exited) return;
+    if (snap.rev != null) app.lastRev = snap.rev;
 
     const main = this._mainWindow(snap);
     const canvas = this._el(appId, 'canvas');
@@ -16362,10 +16435,30 @@ const GuiApp = {
     const app = this._apps[appId];
     const canvas = this._el(appId, 'canvas');
     if (!canvas || !app) return;
+    if (canvas._guiWired) return;     // listeners are attached exactly once
+    canvas._guiWired = true;
+    /* Events go to the guest in order, one bridge call at a time. Mouse
+       moves are coalesced: while a call is in flight only the newest move
+       is kept (each call runs the emulator; a raw mousemove per pixel
+       queued hundreds of them). Clicks and keys are never dropped. */
+    const queue = [];
+    let busy = false;
+    const pump = () => {
+      if (busy || !queue.length) return;
+      if (app.closed || this._apps[appId] !== app) { queue.length = 0; return; }
+      busy = true;
+      const ev = queue.shift();
+      AetherBridge.guiEvent(app.sid, JSON.stringify(ev))
+        .then(s => { if (s && s.ok && this._apps[appId] === app) this._render(appId, s); })
+        .catch(() => {})
+        .finally(() => { busy = false; pump(); });
+    };
     const send = (ev) => {
       if (app.closed) return;
-      AetherBridge.guiEvent(app.sid, JSON.stringify(ev))
-        .then(s => { if (s && s.ok) this._render(appId, s); });
+      const last = queue[queue.length - 1];
+      if (ev.type === 'mousemove' && last && last.type === 'mousemove') queue[queue.length - 1] = ev;
+      else queue.push(ev);
+      pump();
     };
     const pos = (e) => {
       const r = canvas.getBoundingClientRect();
@@ -16409,6 +16502,11 @@ const GuiApp = {
   /* Adopt a GUI session that was started elsewhere (e.g. a GUI installer). */
   adopt(fullPath, name, snap) {
     const appId = this.idFor(fullPath);
+    if (this._apps[appId]) {
+      // A previous session under this id: stop it and close its window.
+      this._dispose(appId);
+      if (OS.windows[appId]) OS.closeWindow(appId);
+    }
     this._apps[appId] = { sid: snap.sid, path: fullPath, name: name, probe: {},
       mainHwnd: 0, closed: false, timer: null, lastRev: -1, lastGlRev: -1, ctrlEls: {} };
     OS.launchApp(appId);
@@ -16489,10 +16587,16 @@ const InstallerApp = {
     return { title: 'Installed — ' + (r.name || ''), w: 560, h: 380, icon: '#10b981', content: body };
   },
 
-  renderResults(appId) {
-    const host = document.getElementById('inst-list-' + SecurityUtils.escapeHTML(appId));
+  renderResults(appId, tries) {
+    // The id attribute holds the raw appId (HTML-escaping only protects the
+    // markup), so look it up unescaped — 'Tom's Setup' never rendered before.
+    const host = document.getElementById('inst-list-' + appId);
     const r = (this._results || {})[appId];
-    if (!host || !r) { if (host) return; setTimeout(() => this.renderResults(appId), 80); return; }
+    if (!host || !r) {
+      // Retry until the window is painted — but not forever (closed early).
+      if (!host && r && (tries || 0) < 50) setTimeout(() => this.renderResults(appId, (tries || 0) + 1), 80);
+      return;
+    }
     host.innerHTML = '';
     r.installed.forEach(prog => {
       const row = document.createElement('div');
@@ -16679,6 +16783,12 @@ const AetherAutosave = {
       try {
         await AetherBridge.platformInfo(); // warms the cache + api_version warning
         const r = await AetherBridge.stateLoad('Main');
+        // First launch: there is simply no Main.aether yet — not a failure.
+        // (Older OS.py builds report it only through the error text.)
+        if (r && !r.ok && (r.missing || /does not exist/i.test(String(r.error || '')))) {
+          this._restored = true;
+          return;
+        }
         if (!r || !r.ok) {
           this._restored = true;
           OS.notify('Restore failed', 'Your saved state could not be read: ' + ((r && r.error) || 'unknown error') + '. Starting from the browser-stored state.');
