@@ -40,7 +40,7 @@ Opens as a **native window**. It uses Edge WebView2 on Windows and WebKitGTK
 (or Qt) on Linux. It isn't a browser tab and doesn't run a local server.
 
 ### 💾 Virtual drives
-Creates sparse `.img` disk images of up to **4 GB**. Each one holds its own
+Creates sparse `.img` disk images of up to **8 GB**. Each one holds its own
 small filesystem (**AEFS**), so files you save to a drive use that drive's
 space. It also shows how much space each kind of file uses.
 
@@ -160,7 +160,7 @@ console output or window drawing commands that the desktop displays.
 | 🛠️ **[`install.py`](install.py)** | Installer | Checks your Python version and installs `pywebview` plus the optional `pypdf`/`wasmtime`. On Linux it checks for GTK/WebKitGTK or Qt and prints the command for your distro. It also confirms `NOO.py` loads, creates the data folders, and writes the `AetherOS.bat` / `AetherOS.sh` launchers. It **never deletes anything**. |
 | 🖥️ **[`OS.py`](OS.py)** | Shell and backend | Opens `OS.html` in a native window and provides the bridge: downloads, web fetching, PDF/DOCX readers, virtual drives with AEFS, atomic save states, blob storage, WebAssembly, and `.exe` calls handled by NOO. At startup it asks once for admin/root rights and keeps working without them if you decline. |
 | ⚙️ **[`NOO.py`](NOO.py)** | `.exe` engine | A self-contained Windows PE runtime in one file that uses only the standard library. It includes a PE/COFF parser, an x86/x86-64 CPU interpreter, virtual memory, a sandboxed `C:\`, a virtual registry, threads, SEH, and the common Win32 APIs, plus a window manager the desktop can display. |
-| 🎨 `OS.html` | Desktop UI | The interface that `OS.py` loads. It must sit next to `OS.py`. |
+| 🎨 **[`OS.html`](OS.html)** | Desktop UI | **AetherOS 10 Lumina**, the whole desktop in one offline file: window manager, taskbar and Start menu, draggable desktop icons, and a virtual file system with a Recycle Bin and autosave. Apps: C Studio, Command Prompt, Notepad, Paint, Calculator, Explorer, Settings (with an encrypted vault), SoundWave, Cinema, Gallery with a 3D viewer, PDF and Word readers, the Aether Web browser, My Computer, Task Manager, App Studio (Lua apps), PyStudio (Python + tkinter) and the Supe3D FPS Creator. It bundles Fengari (Lua) and Three.js, so it needs no internet. It must sit next to `OS.py`. |
 
 <details>
 <summary><b>🗂️ Created while running (not tracked in git)</b></summary>
