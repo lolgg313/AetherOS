@@ -106,7 +106,7 @@ def _import_noo():
 
 MAX_FETCH_BYTES = 64 * 1024 * 1024      # 64 MB hard cap per fetched resource
 FETCH_TIMEOUT = 25                       # seconds
-MAX_DRIVE_MB = 4096                      # 4 GB per virtual drive
+MAX_DRIVE_MB = 8192                      # 8 GB per virtual drive (matches the UI's limit)
 MAX_DRIVE_CHUNK = 8 * 1024 * 1024        # 8 MB per drive_read call
 MAX_B64_DOWNLOAD_BYTES = 512 * 1024 * 1024   # 512 MB hard cap for download_b64
 MAX_BLOB_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB hard cap per stored blob
@@ -933,7 +933,7 @@ class AetherApi:
 
     # ---- virtual drives ------------------------------------------------
     def drive_create(self, name, size_mb):
-        """Create a sparse virtual disk image (1..4096 MB). Refuses overwrite."""
+        """Create a sparse virtual disk image (1..8192 MB). Refuses overwrite."""
         try:
             os.makedirs(DRIVES_DIR, exist_ok=True)
             clean = sanitize_filename(name)
@@ -1220,7 +1220,10 @@ class AetherApi:
                     return {"ok": True, "state_json": bak_text,
                             "recovered_from_backup": True}
             if err == "missing":
-                return {"ok": False, "error": "Save '%s' does not exist." % clean}
+                # "missing" lets the shell tell "no save yet" (first launch)
+                # apart from a real read failure.
+                return {"ok": False, "missing": True,
+                        "error": "Save '%s' does not exist." % clean}
             if err is not None:
                 return {"ok": False, "error": "Save '%s' is corrupt (%s)." % (clean, err)}
             return {"ok": True, "state_json": text}
