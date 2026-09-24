@@ -31557,16 +31557,21 @@ class _WM:
             self.set_pos(w, 0, 0, 0, 0, 0, SWP_HIDEWINDOW | SWP_NOSIZE | SWP_NOMOVE |
                          SWP_NOZORDER | SWP_NOACTIVATE)
             return 1
+        if not was:
+            # Windows makes the window visible first, then applies the min/max state, so a
+            # WM_SIZE(SIZE_MINIMIZED) handler that hides the window (AutoHotkey does) wins
+            self.send(w.hwnd, WM_SHOWWINDOW, 1, 0)
+            self.set_pos(w, 0, 0, 0, 0, 0, SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE |
+                         (0 if cmd not in (4, 7, 8) else SWP_NOACTIVATE) | SWP_NOZORDER)
         if cmd in (3,) and self.is_top(w):
             self.maximize(w)
         elif cmd in (2, 6, 7, 11):
             self.minimize(w)
         elif cmd in (1, 9) and w.min_state:
             self.restore_(w)
+        if w.dead or not (w.style & WS_VISIBLE):
+            return 1 if was else 0
         if not was:
-            self.send(w.hwnd, WM_SHOWWINDOW, 1, 0)
-            self.set_pos(w, 0, 0, 0, 0, 0, SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE |
-                         (0 if cmd not in (4, 7, 8) else SWP_NOACTIVATE) | SWP_NOZORDER)
             if not (w.style & WS_CHILD) and cmd not in (4, 7, 8, 2, 6, 11) and \
                     not (w.exstyle & WS_EX_NOACTIVATE):
                 self.set_active(w.hwnd)
@@ -34524,6 +34529,11 @@ def _ctl_gfont(wm, w):
 
 
 def _notify(wm, w, code):
+    re_ = w.py.get("re")
+    if re_ is not None:                  # RichEdit: EN_CHANGE/UPDATE/SCROLL need the event mask
+        need = {0x300: 1, 0x400: 2, 0x601: 4, 0x602: 4}.get(code, 0)
+        if need and not re_["mask"] & need:
+            return 0
     par = w.parent
     if par is None or par is wm.desktop:
         par = wm.wnd(w.owner)
@@ -34537,6 +34547,19 @@ def _ctl_color(wm, w, msg, dc):
     par = w.parent if w.parent is not wm.desktop else wm.wnd(w.owner)
     if not dc.h:
         wm.gdi.add(dc)
+    re_ = w.py.get("re")
+    if re_ is not None:                  # RichEdit paints with its own background color
+        sysc = wm.gdi.sys_color
+        dc.text_color = sysc(COLOR_WINDOWTEXT)
+        if re_["bk"] is None:
+            dc.bk_color = sysc(COLOR_WINDOW)
+            return wm.gdi.sys_brush(COLOR_WINDOW).h
+        if not re_["brush"]:
+            b = _GBrush(0, re_["bk"])
+            b.stock = True
+            re_["brush"] = wm.gdi.add(b)
+        dc.bk_color = re_["bk"]
+        return re_["brush"]
     br = 0
     if par is not None and par is not wm.desktop:
         br = wm.send(par.hwnd, msg, dc.h, w.hwnd)
@@ -42104,6 +42127,7 @@ def _gui_install(k):
     _user_install3(k)
     _sysdlls_install(k)
     _cc_install(k)
+    _richedit_install(k)
 
 
 # -- displays: headless (PNG dump / scripted input), Tk, AetherOS web sessions ----------------------
@@ -43428,6 +43452,92 @@ def _sysdlls_install(k):
     R("Shell_NotifyIconA", "up", dlls=SH)(lambda c, m, d: _notify_icon(c, m, d, False))
     R("Shell_NotifyIconW", "up", dlls=SH)(lambda c, m, d: _notify_icon(c, m, d, True))
     R("Shell_NotifyIconGetRect", "pp", dlls=SH)(lambda c, a, r: 0x80004005)
+
+    # ---- uxtheme.dll: visual styles are reported as off, so apps use classic drawing ------
+    UX = ("uxtheme.dll",)
+    E_FAIL, E_NOTIMPL = 0x80004005, 0x80004001
+
+    def ux(names, sig, val):
+        R(names, sig, dlls=UX)(lambda c, *a: val)
+
+    ux("IsThemeActive IsAppThemed GetThemeAppProperties", "", 0)
+    ux("BufferedPaintInit BufferedPaintUnInit", "", 0)
+    ux("CloseThemeData IsThemeDialogTextureEnabled GetWindowTheme SetThemeAppProperties", "p", 0)
+    ux("OpenThemeData EnableThemeDialogTexture EndBufferedPaint", "pp", 0)
+    ux("OpenThemeDataEx OpenThemeDataForDpi SetWindowTheme IsThemePartDefined "
+       "IsThemeBackgroundPartiallyTransparent BufferedPaintSetAlpha DrawThemeParentBackground",
+       "ppp", 0)
+    ux("BeginBufferedPaint", "ppppp", 0)                   # NULL: callers fall back to plain GDI
+    ux("GetThemeColor GetThemeInt GetThemeEnumValue GetThemeBool", "ppppp", E_FAIL)
+    ux("DrawThemeBackground DrawThemeBackgroundEx GetThemeFont GetCurrentThemeName "
+       "GetThemeTransitionDuration", "pppppp", E_FAIL)
+    ux("GetThemePartSize GetThemeMargins GetThemePosition", "ppppppp", E_NOTIMPL)
+    ux("DrawThemeText", "ppppppppp", E_FAIL)
+    ux("DrawThemeEdge", "pppppppp", E_FAIL)
+    ux("GetThemeSysSize", "pu", 0)
+    ux("GetThemeSysBool", "pu", 0)
+
+    @R("GetThemeSysColor", "pu", dlls=UX)
+    def _GetThemeSysColor(c, h, idx):
+        return p.gdi.sys_color(idx) if getattr(p, "gdi", None) is not None else 0
+
+    @R("GetThemeBackgroundContentRect GetThemeBackgroundExtent", "pppppp", dlls=UX)
+    def _GetThemeBgRect(c, h, hdc, part, state, src, dst):
+        if not (src and dst):
+            return 0x80070057
+        M_.write(dst, bytes(M_.read(src, 16)))
+        return 0
+
+    # ---- dwmapi.dll: desktop composition is off --------------------------------------------
+    DWM = ("dwmapi.dll",)
+
+    @R("DwmIsCompositionEnabled", "p", dlls=DWM)
+    def _DwmIsCompositionEnabled(c, pb):
+        if pb:
+            M_.write32(pb, 0)
+        return 0
+
+    @R("DwmGetWindowAttribute", "pupu", dlls=DWM)
+    def _DwmGetWindowAttribute(c, hwnd, attr, pv, cb):
+        wm = getattr(p, "wm", None)
+        w = wm.wnd(hwnd) if wm is not None else None
+        if w is None:
+            return 0x80070006                              # E_HANDLE
+        if attr == 9 and pv and cb >= 16:                  # DWMWA_EXTENDED_FRAME_BOUNDS
+            x, y = wm.screen_origin(w)
+            M_.write(pv, struct.pack("<iiii", x, y, x + w.w, y + w.h))
+            return 0
+        if attr in (1, 14) and pv and cb >= 4:             # NCRENDERING_ENABLED / CLOAKED
+            M_.write32(pv, 0)
+            return 0
+        return 0x80070057
+
+    R("DwmSetWindowAttribute", "pupu", dlls=DWM)(lambda c, h, a, pv, cb: 0)
+    R("DwmExtendFrameIntoClientArea", "pp", dlls=DWM)(lambda c, h, m: 0x80263001)
+    R("DwmEnableBlurBehindWindow", "pp", dlls=DWM)(lambda c, h, b: 0)
+    R("DwmFlush", "", dlls=DWM)(lambda c: 0)
+    R("DwmEnableComposition", "u", dlls=DWM)(lambda c, u: 0)
+    R("DwmDefWindowProc", "ppppp", dlls=DWM)(lambda c, h, m, w, l, r: 0)
+
+    @R("DwmGetColorizationColor", "pp", dlls=DWM)
+    def _DwmGetColorizationColor(c, pc, pb):
+        if pc:
+            M_.write32(pc, 0xC43A6EA5)
+        if pb:
+            M_.write32(pb, 0)
+        return 0
+
+    # ---- ole32 clipboard / drag-and-drop: accepted, no OLE data transfer ------------------
+    OLE = ("ole32.dll",)
+    R("OleFlushClipboard", "", dlls=OLE)(lambda c: 0)
+    R("OleSetClipboard", "p", dlls=OLE)(lambda c, d: 0)
+    R("OleGetClipboard", "p", dlls=OLE)(lambda c, pp: (M_.write(pp, bytes(8 if p.cpu_mode == 64 else 4)) if pp else None)
+                                         or 0x800401D0)       # CLIPBRD_E_CANT_OPEN
+    R("OleIsCurrentClipboard", "p", dlls=OLE)(lambda c, d: 1)  # S_FALSE
+    R("RegisterDragDrop", "pp", dlls=OLE)(lambda c, h, t: 0)
+    R("RevokeDragDrop", "p", dlls=OLE)(lambda c, h: 0)
+    R("DoDragDrop", "pppp", dlls=OLE)(lambda c, d, s, ok, eff: 0x40101)   # DRAGDROP_S_CANCEL
+    R("ReleaseStgMedium", "p", dlls=OLE)(lambda c, m: 0)
 
 
 # ==============================================================================
@@ -47298,6 +47408,482 @@ def _cc_install_bars(k, notify, NMHDR_SZ, hfont, gfont, paint, IL, py_class):
         return 0
 
 
+# ==========================================================================================
+# 10n. RichEdit (riched20 / riched32 / msftedit): the Edit control engine plus the
+#      EM_* extensions apps use (EX selection, text ranges, streaming, find, RTF text)
+# ==========================================================================================
+def _rtf_to_text(src):
+    """Plain text of an RTF document (formatting dropped, \\par/\\line/\\tab kept)."""
+    out = []
+    i, n = 0, len(src)
+    skip_depth = None            # group depth at which a destination is being skipped
+    depth = 0
+    uc = 1                       # chars to skip after \\uN
+    pending_skip = 0
+    skip_dest = {"fonttbl", "colortbl", "stylesheet", "info", "pict", "object", "header",
+                 "footer", "headerl", "headerr", "footerl", "footerr", "listtable",
+                 "listoverridetable", "rsidtbl", "generator", "xmlnstbl", "themedata",
+                 "colorschememapping", "latentstyles", "datastore", "fldinst", "bkmkstart",
+                 "bkmkend", "revtbl", "pgdsctbl", "filetbl", "mmathPr", "operator"}
+    while i < n:
+        ch = src[i]
+        if ch == "{":
+            depth += 1
+            i += 1
+            if src.startswith("\\*", i) and skip_depth is None:
+                skip_depth = depth
+            continue
+        if ch == "}":
+            if skip_depth is not None and depth == skip_depth:
+                skip_depth = None
+            depth -= 1
+            i += 1
+            continue
+        if ch == "\\":
+            i += 1
+            if i >= n:
+                break
+            c2 = src[i]
+            if c2 in "\\{}":
+                if skip_depth is None:
+                    if pending_skip:
+                        pending_skip -= 1
+                    else:
+                        out.append(c2)
+                i += 1
+                continue
+            if c2 == "'":
+                hx = src[i + 1:i + 3]
+                i += 3
+                if skip_depth is None:
+                    if pending_skip:
+                        pending_skip -= 1
+                    else:
+                        try:
+                            out.append(bytes([int(hx, 16)]).decode("cp1252", "replace"))
+                        except ValueError:
+                            pass
+                continue
+            if c2 in "\r\n":
+                if skip_depth is None:
+                    out.append("\r\n")
+                i += 1
+                continue
+            if c2 == "~":
+                out.append("\xa0") if skip_depth is None else None
+                i += 1
+                continue
+            if not c2.isalpha():
+                i += 1
+                continue
+            j = i
+            while j < n and src[j].isalpha():
+                j += 1
+            word = src[i:j]
+            k_ = j
+            if k_ < n and (src[k_] == "-" or src[k_].isdigit()):
+                k_ += 1
+                while k_ < n and src[k_].isdigit():
+                    k_ += 1
+            arg = src[j:k_]
+            i = k_
+            if i < n and src[i] == " ":
+                i += 1
+            if skip_depth is not None:
+                continue
+            if word in skip_dest:
+                skip_depth = depth
+                continue
+            if word in ("par", "line", "sect", "page"):
+                out.append("\r\n")
+            elif word == "tab":
+                out.append("\t")
+            elif word == "uc":
+                uc = int(arg or 1)
+            elif word == "u":
+                v = int(arg or 0)
+                out.append(chr(v + 0x10000 if v < 0 else v))
+                pending_skip = uc
+            elif word in ("emdash", "endash"):
+                out.append("\u2014" if word == "emdash" else "\u2013")
+            elif word in ("lquote", "rquote"):
+                out.append("\u2018" if word == "lquote" else "\u2019")
+            elif word in ("ldblquote", "rdblquote"):
+                out.append("\u201c" if word == "ldblquote" else "\u201d")
+            elif word == "bullet":
+                out.append("\u2022")
+            continue
+        if ch in "\r\n":
+            i += 1
+            continue
+        if skip_depth is None:
+            if pending_skip:
+                pending_skip -= 1
+            else:
+                out.append(ch)
+        i += 1
+    text = "".join(out)
+    if text.endswith("\r\n"):
+        text = text[:-2]
+    return text
+
+
+def _text_to_rtf(text):
+    body = []
+    for ch in text.replace("\r\n", "\n"):
+        o = ord(ch)
+        if ch == "\n":
+            body.append("\\par\n")
+        elif ch in "\\{}":
+            body.append("\\" + ch)
+        elif ch == "\t":
+            body.append("\\tab ")
+        elif o < 0x80:
+            body.append(ch)
+        elif o < 0x100:
+            body.append("\\'%02x" % o)
+        else:
+            body.append("\\u%d?" % (o if o < 0x8000 else o - 0x10000))
+    return ("{\\rtf1\\ansi\\ansicpg1252\\deff0{\\fonttbl{\\f0\\fnil Segoe UI;}}"
+            "\\uc1\\pard\\f0\\fs18 " + "".join(body) + "\\par\n}")
+
+
+def _richedit_install(k):
+    p = k.p
+    wm = p.wm
+    M_ = p.mem
+    ps = wm.ps
+    ep = _edit_proc(wm)
+    RE_DLLS = ("riched20.dll", "riched32.dll", "msftedit.dll")
+
+    def rst(w):
+        s = w.py.get("re")
+        if s is None:
+            s = w.py["re"] = {"mask": 0, "bk": None, "brush": 0, "opts": 0, "mode": 1,
+                              "zoom": (0, 0), "undo": 100}
+        return s
+
+    def es(w):
+        e = w.py.get("edit")
+        if e is None:
+            e = w.py["edit"] = _EditState()
+        return e
+
+    def put(text, wide_):
+        data = text.encode("utf-16-le") + b"\0\0" if wide_ else \
+            text.encode("utf-8", "replace") + b"\0"
+        a = wm.scratch(len(data) + 2)
+        M_.write(a, data)
+        return a
+
+    def call_edit(w, msg, wp, text, wide_):
+        mark = wm.scratch_mark()
+        try:
+            return ep(w.hwnd, msg, wp, put(text, wide_), wide_)
+        finally:
+            wm.scratch_release(mark)
+
+    def sel(w):
+        e = es(w)
+        return min(e.ss, e.se), max(e.ss, e.se)
+
+    def set_sel(w, a, b, wide_):
+        return ep(w.hwnd, 0xB1, a & 0xFFFFFFFF, b & 0xFFFFFFFF, wide_)
+
+    def text_of(w):
+        return w.text
+
+    def write_text(dst, text, cch, wide_):
+        """Copy text (NUL-terminated, at most cch units incl. NUL) -> units written."""
+        if not dst or cch <= 0:
+            return 0
+        if wide_:
+            text = text[:cch - 1]
+            M_.write(dst, text.encode("utf-16-le") + b"\0\0")
+            return len(text)
+        data = text.encode("utf-8", "replace")[:cch - 1]           # ANSI code page is UTF-8
+        M_.write(dst, data + b"\0")
+        return len(data)
+
+    def find(w, lp, wide_, ex):
+        flags_ = 0
+        cmin, cmax = _s32(M_.read32(lp)), _s32(M_.read32(lp + 4))
+        pat = wm.gstr(wm.rp(lp + 8), wide_)
+        return cmin, cmax, pat, flags_
+
+    def do_find(w, flags_, cmin, cmax, pat):
+        t = text_of(w)
+        if not pat:
+            return -1
+        down = bool(flags_ & 1)
+        case = bool(flags_ & 4)
+        whole = bool(flags_ & 2)
+        hay, needle = (t, pat) if case else (t.lower(), pat.lower())
+        end = len(t) if cmax < 0 else min(cmax, len(t))
+        if down:
+            i = hay.find(needle, max(0, cmin))
+            while i >= 0:
+                if i + len(needle) > end:
+                    return -1
+                if not whole or ((i == 0 or not hay[i - 1].isalnum()) and
+                                 (i + len(needle) >= len(hay) or
+                                  not hay[i + len(needle)].isalnum())):
+                    return i
+                i = hay.find(needle, i + 1)
+            return -1
+        lo = 0 if cmax < 0 else max(0, cmax)
+        i = hay.rfind(needle, lo, max(0, cmin) if cmin >= 0 else len(t))
+        while i >= 0:
+            if not whole or ((i == 0 or not hay[i - 1].isalnum()) and
+                             (i + len(needle) >= len(hay) or not hay[i + len(needle)].isalnum())):
+                return i
+            i = hay.rfind(needle, lo, i + len(needle) - 1)
+        return -1
+
+    def stream_in(w, fmt, lp, wide_):
+        cookie = wm.rp(lp)
+        cb = wm.rp(lp + (12 if ps == 8 else 8))       # EDITSTREAM is pack(4)
+        data = bytearray()
+        mark = wm.scratch_mark()
+        try:
+            buf = wm.scratch(4096)
+            pcb = wm.scratch(8)
+            for _ in range(1 << 16):
+                M_.write32(pcb, 0)
+                r = p.call_guest(cb, [cookie, buf, 4096, pcb]) & 0xFFFFFFFF
+                got = M_.read32(pcb)
+                if r:
+                    M_.write32(lp + ps, r)                       # dwError
+                    break
+                if got == 0:
+                    break
+                data += M_.read(buf, min(got, 4096))
+        finally:
+            wm.scratch_release(mark)
+        raw = bytes(data)
+        if fmt & 2 or raw.lstrip().startswith(b"{\\rtf"):
+            text = _rtf_to_text(raw.decode("cp1252", "replace"))
+        elif fmt & 0x10:
+            text = raw.decode("utf-16-le", "replace")
+        else:
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                text = raw.decode("cp1252", "replace")
+        text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+        if fmt & 0x8000:                                         # SFF_SELECTION
+            call_edit(w, 0xC2, 1, text, True)
+        else:
+            call_edit(w, 0x0C, 0, text, True)
+            set_sel(w, 0, 0, wide_)
+        return len(text)
+
+    def stream_out(w, fmt, lp, wide_):
+        cookie = wm.rp(lp)
+        cb = wm.rp(lp + (12 if ps == 8 else 8))       # EDITSTREAM is pack(4)
+        t = text_of(w)
+        if fmt & 0x8000:
+            a, b = sel(w)
+            t = t[a:b]
+        if fmt & 2:
+            raw = _text_to_rtf(t).encode("cp1252", "replace")
+        elif fmt & 0x10:
+            raw = t.encode("utf-16-le")
+        else:
+            raw = t.encode("utf-8", "replace")
+        mark = wm.scratch_mark()
+        try:
+            buf = wm.scratch(4096)
+            pcb = wm.scratch(8)
+            off = 0
+            while off < len(raw):
+                chunk = raw[off:off + 4096]
+                M_.write(buf, chunk)
+                M_.write32(pcb, 0)
+                r = p.call_guest(cb, [cookie, buf, len(chunk), pcb]) & 0xFFFFFFFF
+                if r:
+                    M_.write32(lp + ps, r)
+                    break
+                done = M_.read32(pcb)
+                if done == 0:
+                    break
+                off += done
+        finally:
+            wm.scratch_release(mark)
+        return len(t)
+
+    def make_proc(wide_cls):
+        def proc(hwnd, msg, wp, lp, wide):
+            w = wm.wnd(hwnd)
+            if w is None:
+                return 0
+            s = rst(w)
+            tw = wide_cls                                        # charset of text in EM_*
+            if msg == 0x0001:                                    # WM_CREATE
+                r = ep(hwnd, msg, wp, lp, wide)
+                es(w).limit = 32767
+                return r
+            if msg == 0x000C and lp:                             # WM_SETTEXT: RTF auto-detect
+                t = wm.gstr(lp, wide)
+                if t.lstrip().startswith("{\\rtf"):
+                    return call_edit(w, 0x0C, 0, _rtf_to_text(t), True)
+                return ep(hwnd, msg, wp, lp, wide)
+            if msg == 0x0087:                                    # WM_GETDLGCODE
+                return ep(hwnd, msg, wp, lp, wide)
+            if msg < 0x400 or msg >= 0x500:
+                return ep(hwnd, msg, wp, lp, wide)
+            if msg == 0x434:                                     # EM_EXGETSEL
+                a, b = sel(w)
+                if lp:
+                    M_.write(lp, struct.pack("<ii", a, b))
+                return 0
+            if msg == 0x437:                                     # EM_EXSETSEL
+                a, b = _s32(M_.read32(lp)), _s32(M_.read32(lp + 4))
+                if a == 0 and b == -1:
+                    b = len(w.text)
+                if a < 0:
+                    a = b = len(w.text)
+                set_sel(w, a, b, wide)
+                return sel(w)[1]
+            if msg == 0x435:                                     # EM_EXLIMITTEXT
+                es(w).limit = lp if lp else 65536
+                return 0
+            if msg == 0x436:                                     # EM_EXLINEFROMCHAR
+                return ep(hwnd, 0xC9, lp, 0, wide)
+            if msg == 0x44B:                                     # EM_GETTEXTRANGE
+                a, b = _s32(M_.read32(lp)), _s32(M_.read32(lp + 4))
+                t = w.text
+                b = len(t) if b < 0 else min(b, len(t))
+                a = max(0, min(a, b))
+                return write_text(wm.rp(lp + 8), t[a:b], b - a + 1, tw)
+            if msg == 0x43E:                                     # EM_GETSELTEXT
+                a, b = sel(w)
+                return write_text(lp, w.text[a:b], b - a + 1, tw)
+            if msg == 0x442:                                     # EM_SELECTIONTYPE
+                a, b = sel(w)
+                return 0 if a == b else (1 if b - a == 1 else 1 | 4)
+            if msg == 0x445:                                     # EM_SETEVENTMASK
+                old, s["mask"] = s["mask"], lp & 0xFFFFFFFF
+                return old
+            if msg == 0x43B:
+                return s["mask"]
+            if msg == 0x443:                                     # EM_SETBKGNDCOLOR
+                old = s["bk"] if s["bk"] is not None else wm.gdi.sys_color(COLOR_WINDOW)
+                s["bk"] = None if wp else lp & 0xFFFFFF
+                s["brush"] = 0
+                wm.invalidate(w, None, True)
+                return old
+            if msg in (0x444, 0x447, 0x448, 0x44C, 0x4CA, 0x4E1, 0x446, 0x4DF):
+                return 1                                         # char/para formats etc.
+            if msg in (0x43A, 0x43D):                            # EM_GETCHARFORMAT/PARAFORMAT
+                return 0
+            if msg == 0x44D:                                     # EM_SETOPTIONS
+                op = wp & 0xFFFF
+                s["opts"] = lp if op == 1 else (s["opts"] | lp if op == 2 else
+                                                s["opts"] & ~lp if op == 3 else s["opts"] ^ lp)
+                if s["opts"] & 0x800:                            # ECO_READONLY
+                    ep(hwnd, 0xCF, 1, 0, wide)
+                return s["opts"]
+            if msg == 0x44E:
+                return s["opts"]
+            if msg == 0x459:                                     # EM_SETTEXTMODE
+                s["mode"] = wp
+                return 0
+            if msg == 0x45A:
+                return s["mode"] or 1
+            if msg == 0x452:                                     # EM_SETUNDOLIMIT
+                s["undo"] = wp
+                return wp
+            if msg == 0x4E0:                                     # EM_GETZOOM
+                if wp:
+                    M_.write32(wp, s["zoom"][0])
+                if lp:
+                    M_.write32(lp, s["zoom"][1])
+                return 1
+            if msg in (0x45B, 0x478, 0x4CC, 0x43F, 0x4C8):       # AUTOURL, LANGOPT, EDITSTYLE
+                return 0
+            if msg == 0x479:
+                return 0
+            if msg == 0x4CD:                                     # EM_GETEDITSTYLE
+                return 0
+            if msg == 0x43C:                                     # EM_GETOLEINTERFACE
+                if lp:
+                    M_.write(lp, bytes(ps))
+                return 0
+            if msg == 0x432:                                     # EM_CANPASTE
+                return 1
+            if msg == 0x440:                                     # EM_PASTESPECIAL
+                return ep(hwnd, 0x302, 0, 0, wide)
+            if msg in (0x454, 0x455):                            # EM_REDO / EM_CANREDO
+                return 0
+            if msg == 0x455:
+                return 0
+            if msg == 0x45E:                                     # EM_GETTEXTEX
+                cb_, fl_, cp = struct.unpack("<IIi", M_.read(wp, 12))
+                t = w.text
+                if fl_ & 2:                                      # GT_SELECTION
+                    a, b = sel(w)
+                    t = t[a:b]
+                if not (fl_ & 1):                                # !GT_USECRLF: CR only
+                    t = t.replace("\r\n", "\r")
+                if cp == 1200:
+                    return write_text(lp, t, cb_ // 2, True)
+                return write_text(lp, t, cb_, False)
+            if msg == 0x45F:                                     # EM_GETTEXTLENGTHEX
+                fl_, cp = struct.unpack("<Ii", M_.read(wp, 8)) if wp else (0, 1200)
+                t = w.text if fl_ & 1 else w.text.replace("\r\n", "\r")
+                if fl_ & 16 and cp != 1200:                      # GTL_NUMBYTES
+                    return len(t.encode("utf-8", "replace"))
+                return len(t)
+            if msg == 0x461:                                     # EM_SETTEXTEX
+                fl_, cp = struct.unpack("<Ii", M_.read(wp, 8))
+                t = wm.gstr(lp, cp == 1200) if lp else ""
+                if t.lstrip().startswith("{\\rtf"):
+                    t = _rtf_to_text(t)
+                if fl_ & 2:                                      # ST_SELECTION
+                    call_edit(w, 0xC2, 1, t, True)
+                else:
+                    call_edit(w, 0x0C, 0, t, True)
+                return 1
+            if msg == 0x449:                                     # EM_STREAMIN
+                return stream_in(w, wp, lp, wide)
+            if msg == 0x44A:                                     # EM_STREAMOUT
+                return stream_out(w, wp, lp, wide)
+            if msg in (0x438, 0x47B, 0x44F, 0x47C):              # EM_FINDTEXT(EX)(W)
+                wide_t = msg in (0x47B, 0x47C) or tw
+                cmin, cmax, pat, _f = find(w, lp, wide_t, msg in (0x44F, 0x47C))
+                i = do_find(w, wp, cmin, cmax, pat)
+                if msg in (0x44F, 0x47C):
+                    off = 8 + ps
+                    M_.write(lp + off, struct.pack("<ii", i, i + len(pat) if i >= 0 else -1))
+                return i & 0xFFFFFFFF
+            if msg == 0x4DD:                                     # EM_GETSCROLLPOS
+                f = _ctl_gfont(wm, w)
+                if lp:
+                    M_.write(lp, struct.pack("<ii", es(w).xoff, es(w).top * f.height))
+                return 1
+            if msg == 0x4DE:                                     # EM_SETSCROLLPOS
+                f = _ctl_gfont(wm, w)
+                y = _s32(M_.read32(lp + 4))
+                ep(hwnd, 0xB6, 0, y // max(1, f.height) - es(w).top, wide)
+                return 1
+            if msg == 0x4E2:                                     # EM_SHOWSCROLLBAR
+                return 0
+            return ep(hwnd, msg, wp, lp, wide)
+        return proc
+
+    for name in ("RichEdit20W", "RICHEDIT50W", "RICHEDIT60W"):
+        wm.py_class(name, make_proc(True), style=0x8 | 0x40 | 1 | 2)
+    for name in ("RichEdit20A", "RichEdit", "RICHEDIT"):
+        wm.py_class(name, make_proc(False), style=0x8 | 0x40 | 1 | 2)
+
+    # the DLLs themselves: loading them is how apps register the classes
+    k.reg("CreateTextServices", "ppp", dlls=RE_DLLS)(lambda c, a, b, pp: 0x80004001)
+    k.reg("REExtendedRegisterClass", "", dlls=RE_DLLS)(lambda c: 1)
+    k.reg("RichEditANSIWndProc", "pupp", "p", dlls=RE_DLLS)(
+        lambda c, h, m, wp, lp: wm.send(h & 0xFFFFFFFF, m, wp, lp))
+
+
 # Bitmap glyphs rasterized from the DejaVu fonts (c) Bitstream / DejaVu
 # authors (Bitstream Vera / DejaVu license); regenerate with tools/mkfonts.py
 _NOO_FONT_B64 = (
@@ -49132,7 +49718,7 @@ class NOOProcess:
         dll, name = self._thunk_ids.get(api_id, ("?", "?"))
         if dll == "!missing!":
             full = name
-            self.missing_imports[full] += 1
+            self.missing_imports[full] = self.missing_imports.get(full, 0) + 1
             self.log.warn("call to unresolved import %s — returning 0" % full)
             self.last_error = _ERROR_CALL_NOT_IMPLEMENTED
             return 0
