@@ -66,7 +66,7 @@ BLOBS_DIR = os.path.join(BASE_DIR, "aether_storage", "blobs")
 # NOO.py is absent (the .exe features simply report themselves unavailable).
 NOO_FILE = os.path.join(BASE_DIR, "NOO.py")
 MAX_EXE_BYTES = 64 * 1024 * 1024         # 64 MB hard cap for a probed/run .exe
-EXE_INSTRUCTION_CAP = 20_000_000         # runaway-guard for emulated programs
+EXE_INSTRUCTION_CAP = 1_000_000_000      # runaway-guard for emulated programs (~5 min)
 _NOO_MODULE = None
 _NOO_TRIED = False
 _NOO_LOCK = threading.Lock()

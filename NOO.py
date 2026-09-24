@@ -4730,7 +4730,7 @@ class NOOSandbox:
                  allow_process_spawn=False,  # CreateProcess — refused regardless unless True
                  allow_registry_write=True,  # writes go to the VIRTUAL registry only
                  max_memory_mb=256,
-                 max_instructions=50_000_000,
+                 max_instructions=None,  # None/0: no cap (like a real OS)
                  env=None):               # extra guest environment variables
         self.fs_root = fs_root
         self.allow_host_fs = allow_host_fs
@@ -14587,6 +14587,10 @@ def _k32_install(k):
         if mod.kind == "internal":
             if api.lookup_any(mod.name, nm) is None and not api.is_data_export(mod.name, nm) \
                     and api.data_export_value(mod.name, nm) is None:
+                if p.__dict__.get("packer_phase"):
+                    # a packer stub rebuilding the import table: give it a stub that
+                    # reports the call instead of letting the stub abort the program
+                    return p.missing_thunk(mod.name, nm)
                 # like an older Windows without that export: callers fall back
                 return k.err(ERROR_PROC_NOT_FOUND)
             dv = api.data_export_value(mod.name, nm)
@@ -16641,6 +16645,10 @@ def _k32_install(k):
     @R("CancelIoEx", "pp")
     def _cancelioex(c, h, ov):
         return k.err(1168)                          # ERROR_NOT_FOUND: nothing pending
+
+    @R("CancelSynchronousIo", "p")
+    def _cancelsyncio(c, h):
+        return k.err(1168)                          # no synchronous I/O is ever pending
 
     @R("FlushFileBuffers", "p")
     def _flushfb(c, h):
@@ -42130,6 +42138,7 @@ def _gui_install(k):
     _richedit_install(k)
     _shell_install(k)
     _comdlg_install(k)
+    _sysmore_install(k)
 
 
 # -- displays: headless (PNG dump / scripted input), Tk, AetherOS web sessions ----------------------
@@ -50629,6 +50638,359 @@ def _comdlg_install(k):
         return p.heap_realloc(HEAP(), pv, n)
 
 
+# ==========================================================================================
+# 10q. More system surface: volumes/devices/process queries (kernel32), crypt32, setupapi /
+#      cfgmgr32 (no devices present), advapi32 key/signature stubs
+# ==========================================================================================
+def _sysmore_install(k):
+    R = k.reg
+    p = k.p
+    M_ = p.mem
+    VOL_GUID = "\\\\?\\Volume{4e4f4f00-0000-0000-0000-100000000000}\\"
+
+    def cur_proc(h):
+        return h in (0xFFFFFFFF, M64) or h == getattr(p, "self_handle", None)
+
+    # ---- volumes / DOS devices -------------------------------------------------------------
+    for w_ in (False, True):
+        sfx = "W" if w_ else "A"
+
+        def _first_vol(c, buf, cch, _w=w_):
+            if k.put(buf, cch, VOL_GUID, _w) >= cch:
+                p.last_error = 206                              # ERROR_FILENAME_EXCED_RANGE
+                return M64 if p.cpu_mode == 64 else 0xFFFFFFFF
+            return p.handles.add({"vol": 1}, "findvolume")
+        R("FindFirstVolume" + sfx, "pu", "p")(_first_vol)
+
+        def _vol_for_mount(c, mp, buf, cch, _w=w_):
+            m = k.s(mp, _w).upper()
+            if not m.startswith("C:"):
+                return k.err(2)
+            return 1 if k.put(buf, cch, VOL_GUID, _w) < cch else k.err(206)
+        R("GetVolumeNameForVolumeMountPoint" + sfx, "ppu")(_vol_for_mount)
+
+        def _query_dos(c, name, buf, cch, _w=w_):
+            n = k.s(name, _w).upper().rstrip("\\") if name else None
+            if n is None:
+                text = "C:\0PhysicalDrive0\0"
+            elif n == "C:":
+                text = "\\Device\\HarddiskVolume1\0"
+            elif n == "PHYSICALDRIVE0":
+                text = "\\Device\\Harddisk0\\DR0\0"
+            else:
+                return k.err(2)
+            data = (text + "\0").encode("utf-16-le" if _w else "utf-8")
+            units = len(text) + 1
+            if not buf or cch < units:
+                return k.err(122)
+            M_.write(buf, data)
+            return units
+        R("QueryDosDevice" + sfx, "ppu")(_query_dos)
+
+        R("DefineDosDevice" + sfx, "upp")(lambda c, f, n, t: 1)
+        R("DeleteVolumeMountPoint" + sfx, "p")(lambda c, a: k.err(5))
+        R("SetVolumeMountPoint" + sfx, "pp")(lambda c, a, b: k.err(5))
+        R("SetVolumeLabel" + sfx, "pp")(lambda c, a, b: k.err(5))
+
+        def _qfpin(c, h, flags, buf, pcch, _w=w_):
+            if not pcch:
+                return k.err(87)
+            path = p.exe_win_path if cur_proc(h) else None
+            if path is None:
+                ch = getattr(p, "child_image_path", None)
+                path = ch(h) if callable(ch) else None
+            if path is None:
+                return k.err(6)
+            if flags & 1:                                       # PROCESS_NAME_NATIVE
+                path = "\\Device\\HarddiskVolume1" + path[2:]
+            cch = M_.read32(pcch)
+            r = k.put(buf, cch, path, _w)
+            if r >= cch:
+                return k.err(122)
+            M_.write32(pcch, r)
+            return 1
+        R("QueryFullProcessImageName" + sfx, "pupp")(_qfpin)
+
+    R("FindNextVolumeA FindNextVolumeW", "ppu")(lambda c, h, b, n: k.err(18))
+    R("FindVolumeClose", "p")(lambda c, h: (p.handles.close(h), 1)[1])
+
+    @R("DeviceIoControl", "pupupupp")
+    def _DeviceIoControl(c, h, code, inb, insz, outb, outsz, pret, ov):
+        if pret:
+            M_.write32(pret, 0)
+        return k.err(1)                                          # ERROR_INVALID_FUNCTION
+
+    # ---- process memory (own process only) ---------------------------------------------
+    @R("ReadProcessMemory", "ppppp")
+    def _ReadProcessMemory(c, h, addr, buf, n, pread):
+        if not cur_proc(h):
+            return k.err(5)
+        try:
+            M_.write(buf, bytes(M_.read(addr, n)))
+        except Exception:
+            return k.err(299)                                    # ERROR_PARTIAL_COPY
+        if pread:
+            k.wptr(pread, n)
+        return 1
+
+    @R("WriteProcessMemory", "ppppp")
+    def _WriteProcessMemory(c, h, addr, buf, n, pw):
+        if not cur_proc(h):
+            return k.err(5)
+        try:
+            M_.write(addr, bytes(M_.read(buf, n)))
+        except Exception:
+            return k.err(299)
+        if pw:
+            k.wptr(pw, n)
+        return 1
+
+    # ---- versions / languages ----------------------------------------------------------
+    @R("GetProductInfo", "uuuup")
+    def _GetProductInfo(c, a, b, cc, d, out):
+        if out:
+            M_.write32(out, 0x30)                                # PRODUCT_PROFESSIONAL
+        return 1
+
+    R("GetThreadUILanguage", "", "i")(lambda c: 0x409)
+    R("SetThreadUILanguage", "u", "i")(lambda c, l: 0x409)
+    R("GetUserDefaultUILanguage GetSystemDefaultUILanguage", "", "i")(lambda c: 0x409)
+
+    @R("VerSetConditionMask", "Quu", "q")
+    def _VerSetConditionMask(c, mask, type_bits, cond):
+        cond &= 7
+        if not cond:
+            return mask
+        for i in range(8):
+            if type_bits & (1 << i):
+                mask |= cond << (i * 3)
+        return mask
+
+    def _enum_ui(c, proc, flags, lp, wide):
+        if not proc:
+            return k.err(87)
+        text = "en-US" if flags & 0x8 else "0409"                # MUI_LANGUAGE_NAME
+        a = p.heap_alloc(p.process_heap_handle, 32)
+        M_.write(a, text.encode("utf-16-le") + b"\0\0" if wide else text.encode() + b"\0\0")
+        try:
+            p.call_guest(proc, [a, lp])
+        finally:
+            p.heap_free(p.process_heap_handle, a)
+        return 1
+    R("EnumUILanguagesA", "pup")(lambda c, pr, f, lp: _enum_ui(c, pr, f, lp, False))
+    R("EnumUILanguagesW", "pup")(lambda c, pr, f, lp: _enum_ui(c, pr, f, lp, True))
+
+    # ---- advapi32: keys and signatures are never valid here -----------------------------
+    ADV = ("advapi32.dll", "cryptsp.dll")
+    R("CryptImportKey", "ppupup", dlls=ADV)(lambda c, *a: k.err(0x80090003 & 0xFFFFFFFF))
+    R("CryptVerifySignatureA CryptVerifySignatureW", "ppuppu", dlls=ADV)(
+        lambda c, *a: k.err(0x80090006))                         # NTE_BAD_SIGNATURE
+    R("CryptGetUserKey", "pup", dlls=ADV)(lambda c, *a: k.err(0x8009000D))
+    R("CryptGenKey", "puup", dlls=ADV)(lambda c, *a: k.err(0x80090009))
+    R("CryptExportKey", "ppuupp", dlls=ADV)(lambda c, *a: k.err(0x80090003))
+    R("CryptEncrypt", "ppiuppu", dlls=ADV)(lambda c, *a: k.err(0x80090003))
+    R("CryptDecrypt", "ppiupp", dlls=ADV)(lambda c, *a: k.err(0x80090003))
+    R("CryptDeriveKey", "ppuup", dlls=ADV)(lambda c, *a: k.err(0x80090003))
+    R("CryptSetKeyParam", "puppu", dlls=ADV)(lambda c, *a: k.err(0x80090003))
+
+    # ---- crypt32 ------------------------------------------------------------------------
+    C32 = ("crypt32.dll",)
+    import base64 as _b64
+
+    def _bin2str(c, data, n, flags, out, pcch, wide):
+        raw = bytes(M_.read(data, n)) if data and n else b""
+        fmt = flags & 0xFFFF
+        nocrlf = flags & 0x40000000
+        if fmt in (1, 0, 3):                                     # BASE64 / HEADER / REQHEADER
+            s = _b64.b64encode(raw).decode()
+            lines = [s[i:i + 64] for i in range(0, len(s), 64)] or [""]
+            s = "" if not s else ("".join(lines) if nocrlf else "\r\n".join(lines) + "\r\n")
+            if fmt == 0:
+                s = "-----BEGIN CERTIFICATE-----\r\n" + s + "-----END CERTIFICATE-----\r\n"
+        elif fmt in (4, 0xC):                                    # HEX / HEXRAW
+            s = raw.hex() if fmt == 0xC else " ".join("%02x" % b for b in raw)
+        elif fmt == 2:                                           # BINARY
+            s = raw.decode("latin-1")
+        else:
+            return k.err(87)
+        if not pcch:
+            return k.err(87)
+        cch = M_.read32(pcch)
+        need = len(s) + 1
+        if not out:
+            M_.write32(pcch, need)
+            return 1
+        if cch < need:
+            M_.write32(pcch, need)
+            return k.err(234)
+        M_.write(out, s.encode("utf-16-le") + b"\0\0" if wide else s.encode("latin-1") + b"\0")
+        M_.write32(pcch, len(s))
+        return 1
+    R("CryptBinaryToStringA", "puupp", dlls=C32)(lambda c, *a: _bin2str(c, *a, False))
+    R("CryptBinaryToStringW", "puupp", dlls=C32)(lambda c, *a: _bin2str(c, *a, True))
+
+    def _str2bin(c, s_ptr, cch, flags, out, pcb, pskip, pflags, wide):
+        s = k.s(s_ptr, wide) if not cch else (
+            bytes(M_.read(s_ptr, cch * (2 if wide else 1))).decode("utf-16-le" if wide
+                                                                  else "latin-1"))
+        fmt = flags & 0xFFFF
+        try:
+            if fmt in (0, 1, 3, 6, 7):
+                body = "".join(ln for ln in s.splitlines() if not ln.startswith("-----"))
+                raw = _b64.b64decode("".join(body.split()) + "===", validate=False)
+            elif fmt in (4, 5, 0xC, 0xA, 0xB):
+                raw = bytes.fromhex("".join(ch for ch in s if ch in "0123456789abcdefABCDEF"))
+            elif fmt == 2:
+                raw = s.encode("latin-1")
+            else:
+                return k.err(87)
+        except Exception:
+            return k.err(13)                                     # ERROR_INVALID_DATA
+        if not pcb:
+            return k.err(87)
+        cap = M_.read32(pcb)
+        M_.write32(pcb, len(raw))
+        if pskip:
+            M_.write32(pskip, 0)
+        if pflags:
+            M_.write32(pflags, fmt)
+        if not out:
+            return 1
+        if cap < len(raw):
+            return k.err(234)
+        M_.write(out, raw)
+        return 1
+    R("CryptStringToBinaryA", "puuppp" + "p", dlls=C32)(lambda c, *a: _str2bin(c, *a, False))
+    R("CryptStringToBinaryW", "puuppp" + "p", dlls=C32)(lambda c, *a: _str2bin(c, *a, True))
+
+    # DPAPI: a reversible wrapper (the blob only needs to round-trip on this machine)
+    DPAPI_TAG = b"NOODPAPI"
+
+    def _blob_in(a):
+        n = M_.read32(a)
+        ptr = k.p.mem.read64(a + 8) if p.cpu_mode == 64 else M_.read32(a + 4)
+        return bytes(M_.read(ptr, n)) if n and ptr else b""
+
+    def _blob_out(a, data):
+        buf = p.heap_alloc(p.process_heap_handle, max(1, len(data)))
+        M_.write(buf, data)
+        M_.write32(a, len(data))
+        k.wptr(a + (8 if p.cpu_mode == 64 else 4), buf)
+
+    @R("CryptProtectData", "ppppppp", dlls=C32)
+    def _CryptProtectData(c, din, desc, ent, res, prompt, flags, dout):
+        if not din or not dout:
+            return k.err(87)
+        data = _blob_in(din)
+        key = _blob_in(ent) if ent else b""
+        body = bytes(b ^ (key[i % len(key)] if key else 0x5A) for i, b in enumerate(data))
+        _blob_out(dout, DPAPI_TAG + struct.pack("<I", len(key)) + body)
+        return 1
+
+    @R("CryptUnprotectData", "ppppppp", dlls=C32)
+    def _CryptUnprotectData(c, din, pdesc, ent, res, prompt, flags, dout):
+        if not din or not dout:
+            return k.err(87)
+        data = _blob_in(din)
+        if not data.startswith(DPAPI_TAG):
+            return k.err(13)
+        key = _blob_in(ent) if ent else b""
+        body = data[12:]
+        _blob_out(dout, bytes(b ^ (key[i % len(key)] if key else 0x5A) for i, b in enumerate(body)))
+        if pdesc:
+            k.wptr(pdesc, 0)
+        return 1
+
+    # certificate stores: present but empty; message/signature decoding reports "no data"
+    R("CertOpenStore", "ppupp", "p", dlls=C32)(lambda c, *a: p.handles.add({}, "certstore"))
+    R("CertOpenSystemStoreA CertOpenSystemStoreW", "pp", "p", dlls=C32)(
+        lambda c, *a: p.handles.add({}, "certstore"))
+    R("CertCloseStore", "pu", dlls=C32)(lambda c, h, f: 1)
+    R("CertEnumCertificatesInStore", "pp", "p", dlls=C32)(lambda c, *a: k.err(0x80092004))
+    R("CertFindCertificateInStore", "puuupp", "p", dlls=C32)(lambda c, *a: k.err(0x80092004))
+    R("CertFreeCertificateContext CertFreeCRLContext CertFreeCertificateChain", "p",
+      dlls=C32)(lambda c, a: 1)
+    R("CertDuplicateCertificateContext", "p", "p", dlls=C32)(lambda c, a: a)
+    R("CertGetNameStringA CertGetNameStringW", "puupup", dlls=C32)(
+        lambda c, ctx, t, f, pt, buf, cch: (M_.write(buf, b"\0\0") if buf and cch else None, 1)[1])
+    R("CertGetCertificateChain", "ppppppp" + "p", dlls=C32)(lambda c, *a: k.err(0x800B010A))
+    R("CertVerifyCertificateChainPolicy", "pppp", dlls=C32)(lambda c, *a: 0)
+    R("CertCreateCertificateContext", "upu", "p", dlls=C32)(lambda c, *a: k.err(0x8009310B))
+    R("CertAddCertificateContextToStore CertAddEncodedCertificateToStore", "ppup", dlls=C32)(
+        lambda c, *a: k.err(0x8009310B))
+    R("CryptQueryObject", "upuuupppppp", dlls=C32)(lambda c, *a: k.err(0x80092009))
+    R("CryptMsgOpenToDecode", "uuuppp", "p", dlls=C32)(lambda c, *a: k.err(0x80092009))
+    R("CryptMsgUpdate", "ppuu", dlls=C32)(lambda c, *a: k.err(0x80092009))
+    R("CryptMsgGetParam", "puupp", dlls=C32)(lambda c, *a: k.err(0x80092009))
+    R("CryptMsgClose", "p", dlls=C32)(lambda c, a: 1)
+    R("CryptDecodeObject", "uppuupp"[:7], dlls=C32)(lambda c, *a: k.err(0x80092009))
+    R("CryptDecodeObjectEx", "uppuuppp", dlls=C32)(lambda c, *a: k.err(0x80092009))
+    R("CryptEncodeObjectEx", "uppuppp", dlls=C32)(lambda c, *a: k.err(0x80092009))
+    R("CryptHashCertificate", "puupupp"[:7], dlls=C32)(lambda c, *a: k.err(0x80090008))
+    R("CertNameToStrA CertNameToStrW", "upupu", dlls=C32)(
+        lambda c, t, n, f, buf, cch: (M_.write(buf, b"\0\0") if buf and cch else None, 1)[1])
+    R("PFXImportCertStore", "ppu", "p", dlls=C32)(lambda c, *a: k.err(0x80092009))
+
+    # ---- setupapi / cfgmgr32: a machine with no enumerable devices -------------------------
+    SA = ("setupapi.dll",)
+    CM = ("setupapi.dll", "cfgmgr32.dll")
+    CR_NO_SUCH_DEVNODE, CR_NO_SUCH_VALUE = 0x0D, 0x25
+    R("SetupDiGetClassDevsA SetupDiGetClassDevsW", "pppu", "p", dlls=SA)(
+        lambda c, *a: p.handles.add({"devs": []}, "devinfo"))
+    R("SetupDiGetClassDevsExA SetupDiGetClassDevsExW", "pppuppp", "p", dlls=SA)(
+        lambda c, *a: p.handles.add({"devs": []}, "devinfo"))
+    R("SetupDiCreateDeviceInfoList", "pp", "p", dlls=SA)(
+        lambda c, *a: p.handles.add({"devs": []}, "devinfo"))
+    R("SetupDiDestroyDeviceInfoList", "p", dlls=SA)(lambda c, h: (p.handles.close(h), 1)[1])
+    R("SetupDiEnumDeviceInfo", "pup", dlls=SA)(lambda c, *a: k.err(259))
+    R("SetupDiEnumDeviceInterfaces", "pppup", dlls=SA)(lambda c, *a: k.err(259))
+    R("SetupDiGetDeviceInterfaceDetailA SetupDiGetDeviceInterfaceDetailW", "pppupp", dlls=SA)(
+        lambda c, *a: k.err(259))
+    R("SetupDiGetDeviceRegistryPropertyA SetupDiGetDeviceRegistryPropertyW", "ppuppup",
+      dlls=SA)(lambda c, *a: k.err(13))
+    R("SetupDiGetDevicePropertyW", "pppppupu", dlls=SA)(lambda c, *a: k.err(1168))
+    R("SetupDiGetDeviceInstanceIdA SetupDiGetDeviceInstanceIdW", "pppup", dlls=SA)(
+        lambda c, *a: k.err(13))
+    R("SetupDiOpenDevRegKey", "ppuuuu", "p", dlls=SA)(
+        lambda c, *a: (M64 if p.cpu_mode == 64 else 0xFFFFFFFF))
+    R("SetupDiClassGuidsFromNameA SetupDiClassGuidsFromNameW", "ppup", dlls=SA)(
+        lambda c, n, g, sz, req: (M_.write32(req, 0) if req else None, 1)[1])
+    R("SetupDiCallClassInstaller", "upp", dlls=SA)(lambda c, *a: k.err(5))
+    R("SetupDiSetClassInstallParamsA SetupDiSetClassInstallParamsW", "pppu", dlls=SA)(
+        lambda c, *a: 1)
+    R("SetupDiChangeState", "pp", dlls=SA)(lambda c, *a: k.err(5))
+    R("SetupDiGetClassDescriptionA SetupDiGetClassDescriptionW", "ppup", dlls=SA)(
+        lambda c, *a: k.err(13))
+    R("CM_Get_Child CM_Get_Sibling CM_Get_Parent", "ppu", dlls=CM)(
+        lambda c, out, dn, f: (M_.write32(out, 0) if out else None, CR_NO_SUCH_DEVNODE)[1])
+    R("CM_Get_Child_Ex CM_Get_Sibling_Ex CM_Get_Parent_Ex", "ppup", dlls=CM)(
+        lambda c, out, dn, f, m: (M_.write32(out, 0) if out else None, CR_NO_SUCH_DEVNODE)[1])
+    R("CM_Locate_DevNodeA CM_Locate_DevNodeW", "ppu", dlls=CM)(
+        lambda c, out, i, f: (M_.write32(out, 0) if out else None, CR_NO_SUCH_DEVNODE)[1])
+    R("CM_Get_Device_IDA CM_Get_Device_IDW", "ppuu", dlls=CM)(lambda c, *a: CR_NO_SUCH_DEVNODE)
+    R("CM_Get_Device_ID_Size", "puu", dlls=CM)(lambda c, *a: CR_NO_SUCH_DEVNODE)
+    R("CM_Get_DevNode_Status", "ppuu", dlls=CM)(lambda c, *a: CR_NO_SUCH_DEVNODE)
+    R("CM_Get_DevNode_Registry_PropertyA CM_Get_DevNode_Registry_PropertyW", "uuppppu"[:6],
+      dlls=CM)(lambda c, *a: CR_NO_SUCH_VALUE)
+    R("CM_Get_DevNode_PropertyW", "upppupu"[:6], dlls=CM)(lambda c, *a: CR_NO_SUCH_VALUE)
+
+    def _cm_list_size(c, plen, a, f):
+        if plen:
+            M_.write32(plen, 1)
+        return 0
+    R("CM_Get_Device_ID_List_SizeA CM_Get_Device_ID_List_SizeW", "ppu", dlls=CM)(_cm_list_size)
+    R("CM_Get_Device_Interface_List_SizeA CM_Get_Device_Interface_List_SizeW", "pppu",
+      dlls=CM)(lambda c, plen, g, i, f: _cm_list_size(c, plen, g, f))
+
+    def _cm_list(c, a, buf, n, f):
+        if buf and n:
+            M_.write(buf, b"\0\0\0\0")
+        return 0
+    R("CM_Get_Device_ID_ListA CM_Get_Device_ID_ListW", "ppuu", dlls=CM)(_cm_list)
+    R("CM_Get_Device_Interface_ListA CM_Get_Device_Interface_ListW", "pppuu", dlls=CM)(
+        lambda c, g, i, buf, n, f: _cm_list(c, g, buf, n, f))
+
+
 # Bitmap glyphs rasterized from the DejaVu fonts (c) Bitstream / DejaVu
 # authors (Bitstream Vera / DejaVu license); regenerate with tools/mkfonts.py
 _NOO_FONT_B64 = (
@@ -52096,6 +52458,7 @@ class NOOProcess:
         self._thunk_ids = {}         # api_id -> (dll, name)
         self._next_api_id = [1]
         self.missing_imports = {}    # dll!name -> count
+        self.packer_phase = False    # set in setup() for UPX-style packed images
 
         # COM runtime state (v0.4)
         self.com_classes = {}        # clsid_bytes -> class descriptor
@@ -52457,10 +52820,17 @@ class NOOProcess:
         else:
             self.__dict__["_last_error"] = v & 0xFFFFFFFF
 
+    _PACKER_STUB_APIS = frozenset(("loadlibrarya", "loadlibraryw", "getprocaddress",
+                                   "virtualprotect", "virtualalloc", "virtualfree",
+                                   "getmodulehandlea", "getmodulehandlew", "loadlibraryexa",
+                                   "loadlibraryexw", "flushinstructioncache", "exitprocess"))
+
     def dispatch_api(self, api_id, cpu):
         if api_id == CALLBACK_RETURN_API_ID:
             raise NOOCallbackReturn()
         dll, name = self._thunk_ids.get(api_id, ("?", "?"))
+        if self.packer_phase and name.lower() not in self._PACKER_STUB_APIS:
+            self.packer_phase = False              # the unpacked program is running now
         if dll == "!missing!":
             full = name
             self.missing_imports[full] = self.missing_imports.get(full, 0) + 1
@@ -52646,6 +53016,16 @@ class NOOProcess:
                            "on demand by the guest" % self.exe_host_path)
         self.cpu_mode = 64 if pe.is64 else 32
         self.mem.high_ok = pe.is64
+        # executable packers (UPX, MPRESS, ASPack, ...) rebuild the import table with
+        # LoadLibrary/GetProcAddress and abort on the first NULL; while their stub runs,
+        # unknown exports of built-in DLLs resolve to logging stubs (as Wine's stubs do)
+        names = [getattr(sec, "name", "") for sec in pe.sections]
+        self.packer_phase = any(str(nm).lower().startswith(pfx) for nm in names for pfx in
+                                ("upx", ".mpress", ".aspack", ".adata", ".petite", ".nsp",
+                                 "pec", ".packed", ".rlpack", "mew"))
+        if self.packer_phase:
+            self.log.info("packed executable (sections %s): stub imports tolerated"
+                          % ", ".join(str(n) for n in names))
 
         base = self.map_pe_image(pe)
         # the C runtime's data exports must exist before imports are bound,
@@ -53767,7 +54147,7 @@ class NOOProcess:
         self.log.info("starting virtual Windows environment "
                       "(host: %s, interpreter: pure Python)" % HOST_SYSTEM)
         self.log.ok("memory manager / cpu interpreter / api dispatcher: online")
-        max_instr = self.sandbox.max_instructions
+        max_instr = self.sandbox.max_instructions or float("inf")
         slice_n = 20000
         try:
             self._startup_notify()
@@ -53919,7 +54299,7 @@ class NOOProcess:
                                 t.cpu.step()
                                 self.instruction_count += 1
                         if (self.instruction_count - start_count
-                                > self.sandbox.max_instructions):
+                                > (self.sandbox.max_instructions or float("inf"))):
                             self.log.error("instruction budget exhausted — stopping")
                             return "exited"
                     except NOOYield:
@@ -56188,8 +56568,8 @@ def main(argv=None):
                     help="host directory used as the guest C:\\ (default: a temp dir)")
     ap.add_argument("--allow-network", action="store_true",
                     help="allow the guest to open real network sockets")
-    ap.add_argument("--max-instructions", type=int, default=50_000_000,
-                    help="instruction budget before the guest is stopped")
+    ap.add_argument("--max-instructions", type=int, default=0,
+                    help="instruction budget before the guest is stopped (0 = unlimited)")
     args = ap.parse_args(argv)
 
     if args.self_test:
