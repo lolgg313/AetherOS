@@ -646,6 +646,7 @@ class VirtualMemory:
 
     def __init__(self, log=None, limit_mb=256):
         self.pages = {}        # page_no -> bytearray(PAGE_SIZE)
+        self.loop_heads = set()  # guest addresses that start a hot loop
         self.perms = {}        # page_no -> perm bits
         self.regions = []      # list of [base, size, perm, tag]
         self.log = log or NOOLog(verbose=False)
@@ -656,11 +657,17 @@ class VirtualMemory:
         self.wp = {}           # writable (and not code) page_no -> bytearray
         self.bcache = {}       # compiled blocks: eip -> block function (shared by threads)
         self.code_pages = {}   # page_no -> set of block eips compiled from that page
+        self.dyn = {}          # page_no -> refresh fn: contents computed on every read
+        self.high_ok = False   # 64-bit process: allocations may go above 4 GB
 
     # -- permission tables ---------------------------------------------------
     def _refresh(self, pg):
         p = self.pages.get(pg)
         perm = self.perms.get(pg, 0)
+        if pg in self.dyn:                 # always take the slow path (live data)
+            self.rp.pop(pg, None)
+            self.wp.pop(pg, None)
+            return
         if p is not None and perm & MEM_READ:
             self.rp[pg] = p
         else:
@@ -688,53 +695,91 @@ class VirtualMemory:
         self._refresh(pg)
 
     # -- allocation ----------------------------------------------------------
-    def _find_gap(self, size, lo=0x10000, hi=0x7FFF0000):
+    # Committed pages are demand-zero: `perms` records every committed page,
+    # the bytearray in `pages` is created on first touch (so programs can
+    # commit/reserve large ranges, like Go's heap or a JIT's code arena,
+    # without paying for them). Reserved-but-uncommitted ranges exist only in
+    # `regions` (perm None) and fault on access, exactly like Windows.
+    def range_free(self, addr, size):
+        end = addr + size
+        for base, rsize, _p, _t in self.regions:
+            if base < end and addr < base + rsize:
+                return False
+        return not any(((addr + off) >> 12) in self.perms for off in range(0, size, PAGE_SIZE))
+
+    def _find_gap(self, size, lo=0x10000, hi=0x7FFF0000, align=PAGE_SIZE):
         size = (size + PAGE_SIZE - 1) & PAGE_MASK
-        addr = lo
+        addr = (lo + align - 1) & ~(align - 1)
         for base, rsize, _p, _t in sorted(self.regions):
+            if base + rsize <= addr:
+                continue
             if addr + size <= base:
                 return addr
-            addr = max(addr, (base + rsize + PAGE_SIZE - 1) & PAGE_MASK)
+            addr = (base + rsize + align - 1) & ~(align - 1)
         if addr + size <= hi:
             return addr
+        if self.high_ok and hi < 0x100000000:
+            return self._find_gap(size, 0x100000000, 0x7FFFFFFE0000, align)
         raise NOOMemoryFault("virtual address space exhausted (no %d-byte gap)" % size)
 
-    def alloc(self, size, perm=MEM_READ | MEM_WRITE, addr=None, tag=""):
+    def alloc(self, size, perm=MEM_READ | MEM_WRITE, addr=None, tag="", commit=True,
+              align=PAGE_SIZE):
         size = max(1, (size + PAGE_SIZE - 1) & PAGE_MASK)
-        if self.committed + size > self.limit:
-            raise NOOMemoryFault("sandbox memory limit (%d MB) exceeded"
-                                 % (self.limit // 0x100000))
         if addr is None:
-            addr = self._find_gap(size)
+            addr = self._find_gap(size, align=align)
         addr &= PAGE_MASK
+        if commit:
+            for off in range(0, size, PAGE_SIZE):
+                pg = (addr + off) // PAGE_SIZE
+                if pg in self.code_pages:
+                    self.invalidate_code(pg)
+                if pg not in self.perms or self.perms[pg] != perm:
+                    self.exec_epoch += 1
+                self.perms[pg] = perm
+                self._refresh(pg)
+        self.regions.append([addr, size, perm if commit else None, tag])
+        return addr
+
+    def page(self, pg):
+        """The bytearray of a committed page (materialized on demand)."""
+        p = self.pages.get(pg)
+        if p is None:
+            if pg not in self.perms:
+                raise NOOMemoryFault("access to unmapped page %#x" % (pg << 12), addr=pg << 12)
+            if self.committed + PAGE_SIZE > self.limit:
+                raise NOOMemoryFault("sandbox memory limit (%d MB) exceeded"
+                                     % (self.limit // 0x100000), addr=pg << 12)
+            p = self.pages[pg] = bytearray(PAGE_SIZE)
+            self.committed += PAGE_SIZE
+            self._refresh(pg)
+        return p
+
+    def commit(self, addr, size, perm):
         for off in range(0, size, PAGE_SIZE):
-            pg = (addr + off) // PAGE_SIZE
-            if pg not in self.pages:
-                self.pages[pg] = bytearray(PAGE_SIZE)
-                self.committed += PAGE_SIZE
-                self.exec_epoch += 1
-            elif pg in self.code_pages:
+            pg = ((addr & PAGE_MASK) + off) // PAGE_SIZE
+            if pg in self.code_pages:
                 self.invalidate_code(pg)
             self.perms[pg] = perm
+            self.exec_epoch += 1
             self._refresh(pg)
-        self.regions.append([addr, size, perm, tag])
-        return addr
+
+    def decommit(self, addr, size):
+        for off in range(0, size, PAGE_SIZE):
+            pg = ((addr & PAGE_MASK) + off) // PAGE_SIZE
+            if pg in self.code_pages:
+                self.invalidate_code(pg)
+            if self.pages.pop(pg, None) is not None:
+                self.committed -= PAGE_SIZE
+            self.perms.pop(pg, None)
+            self.rp.pop(pg, None)
+            self.wp.pop(pg, None)
+            self.exec_epoch += 1
 
     def free(self, addr):
         addr &= PAGE_MASK
         for r in list(self.regions):
             if r[0] == addr:
-                base, size = r[0], r[1]
-                for off in range(0, size, PAGE_SIZE):
-                    pg = (base + off) // PAGE_SIZE
-                    if pg in self.code_pages:
-                        self.invalidate_code(pg)
-                    if self.pages.pop(pg, None) is not None:
-                        self.committed -= PAGE_SIZE
-                    self.perms.pop(pg, None)
-                    self.rp.pop(pg, None)
-                    self.wp.pop(pg, None)
-                    self.exec_epoch += 1
+                self.decommit(r[0], r[1])
                 self.regions.remove(r)
                 return True
         return False
@@ -752,7 +797,7 @@ class VirtualMemory:
         return True
 
     def is_mapped(self, addr):
-        return (addr // PAGE_SIZE) in self.pages
+        return (addr // PAGE_SIZE) in self.perms
 
     def region_of(self, addr):
         for base, size, perm, tag in self.regions:
@@ -764,8 +809,11 @@ class VirtualMemory:
     def _check(self, addr, need, eip=None):
         pg = addr // PAGE_SIZE
         if pg not in self.pages:
-            raise NOOMemoryFault("read/write of unmapped address %#x" % addr,
-                                 addr=addr, eip=eip)
+            if pg not in self.perms:
+                raise NOOMemoryFault("read/write of unmapped address %#x" % addr,
+                                     addr=addr, eip=eip)
+            if self.perms[pg] & need:
+                self.page(pg)                  # demand-zero page: first touch
         if not (self.perms.get(pg, 0) & need):
             raise NOOMemoryFault("protection fault at %#x (need %s)" % (addr, need),
                                  addr=addr, eip=eip)
@@ -782,6 +830,9 @@ class VirtualMemory:
             pg = addr // PAGE_SIZE
             off = addr % PAGE_SIZE
             n = min(size, PAGE_SIZE - off)
+            f = self.dyn.get(pg)
+            if f is not None:
+                f()
             out += self.pages[pg][off:off + n]
             addr += n
             size -= n
@@ -1036,7 +1087,7 @@ class _Mem:
 class _Ins:
     """One decoded guest instruction awaiting code generation."""
     __slots__ = ("start", "next", "emit", "fread", "fkill", "fwrite", "term",
-                 "live_out", "text", "sync_before")
+                 "live_out", "text", "sync_before", "succ")
 
     def __init__(self, start):
         self.start = start
@@ -1049,6 +1100,7 @@ class _Ins:
         self.live_out = _FALL
         self.text = ""
         self.sync_before = False
+        self.succ = None           # static successors of a direct branch
 
 
 class _BlockMeta:
@@ -1067,6 +1119,7 @@ class _Gen:
         # or ("mat",) (local fl holds packed flags)
         self.fstate = None
         self.dirty = False
+        self.region = False
         self.ind = "        "
 
     # -- plumbing -------------------------------------------------------------
@@ -1217,6 +1270,8 @@ class _Gen:
         st = self.fstate
         if st is None:
             return "c.flags_value()"
+        if st[0] == "dyn":
+            return "_mat(fk, fa, fb, fr, fs, fl)"
         if st[0] == "mat":
             return "fl"
         return "_mat(%d, fa, fb, fr, %d, 0)" % (st[1], st[2])
@@ -1238,6 +1293,8 @@ class _Gen:
         st = self.fstate
         if st is None:
             return "c.cond(%d)" % cc
+        if st[0] == "dyn":
+            return "_CC_FN[%d](_mat(fk, fa, fb, fr, fs, fl))" % cc
         if st[0] == "mat":
             return _CC_SRC[cc]
         k, s = st[1], st[2]
@@ -1274,7 +1331,12 @@ class _Gen:
         if not self.dirty:
             return
         st = self.fstate
-        if st[0] == "mat":
+        if self.region:
+            if st[0] == "mat":
+                self.L("fk = 0")
+            else:
+                self.L("fk = %d; fs = %d" % (st[1], st[2]))
+        elif st[0] == "mat":
             self.L("c.fk = 0; c.fl = fl")
         else:
             self.L("c.fk = %d; c.fa = fa; c.fb = fb; c.fr = fr; c.fs = %d" % (st[1], st[2]))
@@ -1282,7 +1344,11 @@ class _Gen:
 
     def clobber(self):
         """A helper updated the CPU's flags directly."""
-        self.fstate = None
+        if self.region:
+            self.L("fk, fa, fb, fr, fs, fl = c.fk, c.fa, c.fb, c.fr, c.fs, c.fl")
+            self.fstate = ("dyn",)
+        else:
+            self.fstate = None
         self.dirty = False
 
 
@@ -1539,7 +1605,9 @@ class _DecoderMixin:
             def e(g, ins, cc=cc, rel=rel):
                 tgt = (ins.next + rel) & (M64 if mode64 else 0xFFFFFFFF)
                 g.L("c.eip = %d if %s else %d" % (tgt, g.cond(cc), ins.next))
-            return done(e, "jcc", fread=_CC_READS[cc], term=True)
+            r_ = done(e, "jcc", fread=_CC_READS[cc], term=True)
+            r_.succ = ((r_.next + rel) & (M64 if mode64 else 0xFFFFFFFF), r_.next)
+            return r_
         if op in (0x80, 0x81, 0x82, 0x83):             # group 1
             size = 8 if op in (0x80, 0x82) else osz
             reg, rmo = modrm()
@@ -1842,7 +1910,9 @@ class _DecoderMixin:
                 elif op == 0xE1:
                     c += " and (%s)" % g.cond(4)
                 g.L("c.eip = %d if %s else %d" % (tgt, c, ins.next))
-            return done(e, "loop", fread=F_ZF if op in (0xE0, 0xE1) else 0, term=True)
+            r_ = done(e, "loop", fread=F_ZF if op in (0xE0, 0xE1) else 0, term=True)
+            r_.succ = ((r_.next + rel) & (M64 if mode64 else 0xFFFFFFFF), r_.next)
+            return r_
         if op == 0xE8:                                 # call rel32
             rel = _imm_s(imm(32), 32)
 
@@ -1855,7 +1925,9 @@ class _DecoderMixin:
 
             def e(g, ins, rel=rel):
                 g.L("c.eip = %d" % ((ins.next + rel) & (M64 if mode64 else 0xFFFFFFFF)))
-            return done(e, "jmp", term=True)
+            r_ = done(e, "jmp", term=True)
+            r_.succ = ((r_.next + rel) & (M64 if mode64 else 0xFFFFFFFF),)
+            return r_
         if op == 0xF4:                                 # hlt
             def e(g, ins):
                 g.L("c.halted = True")
@@ -2056,7 +2128,9 @@ class _DecoderMixin:
             def e(g, ins, cc=cc, rel=rel):
                 tgt = (ins.next + rel) & (M64 if mode64 else 0xFFFFFFFF)
                 g.L("c.eip = %d if %s else %d" % (tgt, g.cond(cc), ins.next))
-            return done(e, "jcc", fread=_CC_READS[cc], term=True)
+            r_ = done(e, "jcc", fread=_CC_READS[cc], term=True)
+            r_.succ = ((r_.next + rel) & (M64 if mode64 else 0xFFFFFFFF), r_.next)
+            return r_
         if 0x90 <= op <= 0x9F:                         # setcc
             reg, rmo = modrm()
             o = gop(rmo, 8)
@@ -3906,6 +3980,7 @@ class CPU(_DecoderMixin, _SSEMixin, _FPUMixin):
     """
 
     _BLOCK_MAX = 64
+    use_regions = True
 
     def __init__(self, mem, mode=32, log=None):
         if mode not in (32, 64):
@@ -4066,7 +4141,212 @@ class CPU(_DecoderMixin, _SSEMixin, _FPUMixin):
     def _fetch_code(self, a, n):
         return self.mem.read_exec(a, n, a)
 
+    # -- loop regions ------------------------------------------------------------------
+    # A loop body (the blocks that reach a back-edge target through direct
+    # branches) is compiled into ONE Python function that iterates internally,
+    # so a hot loop no longer returns to the dispatcher on every iteration.
+    _REGION_BLOCKS = 24
+    _REGION_INSNS = 700
+    _REGION_SLICE = 20000
+
+    def _decode_block(self, eip, max_ins):
+        insns = []
+        p = eip
+        try:
+            while len(insns) < max_ins:
+                ins = self._decode(p)
+                insns.append(ins)
+                p = ins.next
+                if ins.term:
+                    break
+        except NOOCPUFault:
+            pass
+        return insns
+
+    @staticmethod
+    def _succs(insns):
+        last = insns[-1]
+        if not last.term:
+            return (last.next,)
+        return last.succ or ()
+
+    def _note_back_edges(self, eip, insns):
+        if not insns:
+            return
+        last = insns[-1]
+        for tgt in self._succs(insns):
+            if tgt <= last.start and eip - 0x10000 <= tgt:
+                heads = self.mem.loop_heads
+                if tgt not in heads:
+                    heads.add(tgt)
+                    if tgt != eip:
+                        blk = self.mem.bcache.get(tgt)
+                        if blk is not None and not getattr(blk, "_noo_region", False):
+                            del self.mem.bcache[tgt]      # rebuilt as a region
+
+    def _compile_region(self, head):
+        blocks = {}
+        order = []
+        work = [head]
+        total = 0
+        while work and len(blocks) < self._REGION_BLOCKS:
+            a = work.pop(0)
+            if a in blocks or not (head - 0x10000 <= a <= head + 0x10000):
+                continue
+            insns = self._decode_block(a, self._BLOCK_MAX)
+            if not insns:
+                continue
+            blocks[a] = insns
+            order.append(a)
+            total += len(insns)
+            if total > self._REGION_INSNS:
+                break
+            work.extend(self._succs(insns))
+        # keep the loop body: blocks from which the head is reachable
+        reach = {head}
+        changed = True
+        while changed:
+            changed = False
+            for a in order:
+                if a not in reach and any(s in reach for s in self._succs(blocks[a])):
+                    reach.add(a)
+                    changed = True
+        body = sorted(a for a in order if a in reach)
+        if head not in blocks or (len(body) == 1 and head not in self._succs(blocks[head])):
+            return None
+        key = ("region", self.mode, head,
+               tuple((a, self.mem.read(a, max(1, blocks[a][-1].next - a))) for a in body))
+        fn = _CPU_CODE_CACHE.get(key)
+        if fn is None:
+            fn = self._gen_region(head, body, blocks)
+            if len(_CPU_CODE_CACHE) > 60000:
+                _CPU_CODE_CACHE.clear()
+            _CPU_CODE_CACHE[key] = fn
+        for a in body:
+            end = blocks[a][-1].next
+            for pg in range(a >> 12, ((end - 1 if end > a else a) >> 12) + 1):
+                self.mem.mark_code(pg, head)
+        return fn
+
+    # helpers that read or write c.regs / c's flags: such instructions run with
+    # the region's register/flag locals written back and reloaded around them
+    _REG_SAFE_ATTRS = ("mem", "eip", "seg_fs", "seg_gs", "df", "mxcsr", "mmx", "ftop", "ftag",
+                       "fpu_cw", "fpu_sw", "halted", "instructions")
+
+    def _gen_region(self, head, body, blocks):
+        import copy as _copy
+        meta = _BlockMeta()
+        meta.starts = []
+        meta.fstates = []
+        line_marks = []
+        rl = ", ".join("r%d" % i for i in range(16))
+        hdr = ["def _blk(c):",
+               "    R = c.regs; RP = c.mem.rp; WP = c.mem.wp; X = c.xmm",
+               "    %s = R" % rl,
+               "    fk, fa, fb, fr, fs, fl = c.fk, c.fa, c.fb, c.fr, c.fs, c.fl",
+               "    n = 0",
+               "    _inR = False",
+               "    pc = %d" % head,
+               "    try:",
+               "        while True:"]
+        out = []
+        helper_re = re.compile(r"\bc\.(?!(?:%s)\b)(?!_f)[A-Za-z_]" % "|".join(self._REG_SAFE_ATTRS))
+        bare_r = re.compile(r"\bR\b(?!\[)")
+        reg_re = re.compile(r"\bR\[(\d+)\]")
+        eip_re = re.compile(r"^(\s*)c\.eip = ")
+        for bi, a in enumerate(body):
+            insns = blocks[a]
+            live = _FALL
+            for ins in reversed(insns):
+                ins.live_out = live
+                live = (live & ~ins.fkill) | ins.fread
+            g = _Gen(self)
+            g.region = True
+            g.fstate = ("dyn",)
+            g.ind = "                "
+            g.ntmp = 1000 * bi
+            out.append("            if pc == %d:" % a)
+            for ins in insns:
+                trial = _copy.copy(g)
+                trial.out = []
+                ins.emit(trial, ins)
+                text = "\n".join(trial.out)
+                helper = bool(helper_re.search(text) or bare_r.search(text))
+                line_marks.append(len(hdr) + len(out) + 1)
+                meta.starts.append(ins.start)
+                g.out = []
+                g.L("pass  # %#x %s" % (ins.start, ins.text))
+                if helper:
+                    g.sync()
+                    g.L("c.fk, c.fa, c.fb, c.fr, c.fs, c.fl = fk, fa, fb, fr, fs, fl")
+                    g.L("R[:] = (%s); _inR = True" % rl)
+                    meta.fstates.append(None)
+                    g.region = False
+                    g.fstate = None
+                    g.dirty = False
+                    ins.emit(g, ins)
+                    g.sync()
+                    g.L("%s = R; _inR = False" % rl)
+                    g.L("fk, fa, fb, fr, fs, fl = c.fk, c.fa, c.fb, c.fr, c.fs, c.fl")
+                    g.region = True
+                    g.fstate = ("dyn",)
+                    g.dirty = False
+                    out.extend(g.out)
+                    if ins.term:
+                        out.append(g.ind + "pc = c.eip")
+                else:
+                    meta.fstates.append(g.fstate)
+                    ins.emit(g, ins)
+                    for ln in g.out:
+                        ln = reg_re.sub(r"r\1", ln)
+                        ln = eip_re.sub(r"\1pc = ", ln)
+                        out.append(ln)
+                g.out = []
+            g.sync()
+            last = insns[-1]
+            if not last.term:
+                g.L("pc = %d" % last.next)
+            g.L("n += %d" % len(insns))
+            out.extend(reg_re.sub(r"r\1", ln) for ln in g.out)
+        out.append("            if n >= %d or pc not in _S: break" % self._REGION_SLICE)
+        meta.lines = line_marks
+        meta.n = len(meta.starts)
+        src = "\n".join(hdr + out + [
+            "    except BaseException as _e:",
+            "        if not _inR:",
+            "            R[:] = (%s)" % rl,
+            "            c.fk, c.fa, c.fb, c.fr, c.fs, c.fl = fk, fa, fb, fr, fs, fl",
+            "        c.instructions += n",
+            "        c._blk_exc(_e, _META)",
+            "        raise",
+            "    R[:] = (%s)" % rl,
+            "    c.fk, c.fa, c.fb, c.fr, c.fs, c.fl = fk, fa, fb, fr, fs, fl",
+            "    c.eip = pc",
+            "    c.instructions += n"])
+        meta.src = src
+        ns = {"_META": meta, "U16": _U16, "U32": _U32, "U64": _U64,
+              "P16": _P16, "P32": _P32, "P64": _P64, "_mat": _mat,
+              "_CC_FN": _CC_FN, "_szp": _szp, "_shift_op": _shift_op, "_shd": _shd,
+              "_sx": _sx, "_f32": _f32, "_f64": _f64, "_b32": _b32, "_b64": _b64,
+              "_PAR": _PAR, "math": math, "M128": M128, "NOOCPUFault": NOOCPUFault,
+              "_f80_to_float": _f80_to_float, "_float_to_f80": _float_to_f80}
+        ns.update(_SSE_NS)
+        ns["_S"] = frozenset(body)
+        code = compile(src, "<noo-region %#x>" % head, "exec")
+        exec(code, ns)
+        fn = ns["_blk"]
+        fn._noo_region = True
+        meta.code = fn.__code__
+        return fn
+
     def _compile(self, eip, max_ins):
+        if eip in self.mem.loop_heads and self.use_regions:
+            try:
+                r = self._compile_region(eip)
+            except NOOCPUFault:
+                r = None
+            if r is not None:
+                return r
         insns = []
         p = eip
         try:
@@ -4099,6 +4379,15 @@ class CPU(_DecoderMixin, _SSEMixin, _FPUMixin):
         fn = cached
         for pg in range(eip >> 12, ((p - 1 if p > eip else eip) >> 12) + 1):
             self.mem.mark_code(pg, eip)
+        if self.use_regions:
+            self._note_back_edges(eip, insns)
+            if eip in self.mem.loop_heads:              # a self-loop: region now
+                try:
+                    r = self._compile_region(eip)
+                except NOOCPUFault:
+                    r = None
+                if r is not None:
+                    return r
         return fn
 
     def _gen_block(self, eip, insns, end):
@@ -4164,7 +4453,10 @@ class CPU(_DecoderMixin, _SSEMixin, _FPUMixin):
         if frame is not None and st is not None:
             loc = frame.f_locals
             try:
-                if st[0] == "mat":
+                if st[0] == "dyn":
+                    self.fk, self.fa, self.fb, self.fr, self.fs, self.fl = \
+                        loc["fk"], loc["fa"], loc["fb"], loc["fr"], loc["fs"], loc["fl"]
+                elif st[0] == "mat":
                     self._set_flags(loc["fl"])
                 else:
                     self.fk, self.fa, self.fb, self.fr, self.fs = \
@@ -9217,6 +9509,12 @@ def _crt_install(crt):
     def _p_wpgmptr(c):
         return crt.data_addrs[("msvcrt.dll", "_wpgmptr")]
 
+    # the remaining msvcrt __p__<data> accessors
+    for _nm in ("__initenv", "__winitenv", "_osver", "_winver", "_winmajor", "_winminor",
+                "_iob", "_pctype", "_pwctype", "_dstbias", "_HUGE", "_adjust_fdiv"):
+        R("__p_" + _nm, "", "p")(
+            lambda c, _nm=_nm: crt.data_addrs.get(("msvcrt.dll", _nm.lower()), 0))
+
     @R("_get_pgmptr", "p")
     def _get_pgmptr(c, out):
         crt.wptr(out, crt.pgm_a)
@@ -12915,6 +13213,18 @@ class _SEH:
                 else:
                     if self._next_frame32(t, s):
                         return
+                s["phase"] = "cont"                 # RtlDispatchException: continue
+                s["ci"] = 0                         # handlers run after frame dispatch
+                continue
+            if ph == "cont":
+                if s.get("ci", 0) < len(self.continue_handlers):
+                    h = self.continue_handlers[s["ci"]]
+                    s["ci"] += 1
+                    s["await"] = "cont"
+                    self._call(cpu, h, [s["ep"]], self.ret_thunk, s["sp"])
+                    return
+                if s.get("resume"):
+                    self._continue_execution(t, s)
                 s["phase"] = "filter"
                 continue
             if ph == "filter":
@@ -13057,6 +13367,15 @@ class _SEH:
             raise NOOError("SEH return thunk reached with no active dispatch")
         r = cpu.regs[RAX] & 0xFFFFFFFF
         kind = s.get("await")
+        if kind == "cont":
+            if r == 0xFFFFFFFF:                     # EXCEPTION_CONTINUE_EXECUTION
+                self._continue_execution(t, s)
+            self._next(t, s)
+            raise NOOContextSet()
+        if kind == "vectored" and r == 0xFFFFFFFF and self.continue_handlers:
+            s["phase"], s["ci"], s["resume"] = "cont", 0, True
+            self._next(t, s)
+            raise NOOContextSet()
         if kind == "vectored" or kind == "filter":
             if r == 0xFFFFFFFF:                     # EXCEPTION_CONTINUE_EXECUTION
                 self._continue_execution(t, s)
@@ -13071,6 +13390,10 @@ class _SEH:
                 if flags & EXCEPTION_NONCONTINUABLE:
                     self._pop_state(t, s)
                     return self.begin_nested_noncontinuable(t, s)
+                if self.continue_handlers:
+                    s["phase"], s["ci"], s["resume"] = "cont", 0, True
+                    self._next(t, s)
+                    raise NOOContextSet()
                 self._continue_execution(t, s)
             # 1 = ContinueSearch, 2 = NestedException, 3 = Collided: keep searching
         self._next(t, s)
@@ -13445,6 +13768,7 @@ class _Unwinder:
 
 
 _K32_DLLS = ("kernel32.dll", "kernelbase.dll")
+_TRACE = bool(os.environ.get("NOO_TRACE"))
 INFINITE = 0xFFFFFFFF
 WAIT_OBJECT_0, WAIT_TIMEOUT, WAIT_FAILED, WAIT_ABANDONED = 0, 0x102, 0xFFFFFFFF, 0x80
 ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE = 2, 3, 5, 6
@@ -13502,6 +13826,7 @@ class _K32:
         self.console_title = ""
         self.cursor = [0, 0]
         self.file_meta = {}          # handle -> dict(path, append, access)
+        self.wait_hooks = {}         # wait kind -> fn(thread) -> bool
 
     # ------------------------------------------------------------------------
     def reg(self, names, sig="", ret="i", dlls=_K32_DLLS, cc="stdcall"):
@@ -13632,6 +13957,8 @@ class _K32:
             return False
         if kind == "process":
             return obj.get("exited", True)
+        if kind == "ktimer":
+            return obj.ready(take)
         return True if kind is not None else None
 
     def _try_wait(self, handles, wait_all, tid):
@@ -13690,6 +14017,9 @@ class _K32:
             return False
         if kind == "sleep":
             return now >= w[1]
+        hook = self.wait_hooks.get(kind)
+        if hook is not None:
+            return hook(t)
         if kind == "pipe":
             _k, pipe, buf, n, pread, deadline = w
             if not pipe.buf and pipe.writers > 0:
@@ -13752,6 +14082,22 @@ class _K32:
                 self.p.last_error = 1460          # ERROR_TIMEOUT
             return True
         return None
+
+    def next_deadline(self, t):
+        """Earliest time a blocked thread could become runnable by itself."""
+        w = t.waiting_on
+        if not w:
+            return None
+        best = w[-1] if isinstance(w[-1], float) else None
+        if w[0] == "sleep":
+            best = w[1]
+        if w[0] == "kwait":
+            for h in w[1]:
+                obj = self.p.handles.get(h)
+                due = getattr(obj, "due", None)
+                if due is not None and (best is None or due < best):
+                    best = due
+        return best
 
     def _cs_fields(self, addr, st):
         """Mirror the owner into the guest CRITICAL_SECTION (some code peeks)."""
@@ -14141,14 +14487,16 @@ def _k32_install(k):
         return _gmfn(c, h, buf, n, True)
 
     def _gpa(c, h, name):
+        if not h:
+            h = p.image_base
         if name < 0x10000:
-            mod = p.modules.by_handle.get(h)
-            if mod is not None and mod.kind == "pe":
-                a = mod.export_ordinals.get(name)
-                return a or k.err(ERROR_PROC_NOT_FOUND)
-            return k.err(ERROR_PROC_NOT_FOUND)
+            if p.modules.by_handle.get(h) is None:
+                return k.err(ERROR_MOD_NOT_FOUND)
+            return p.modules.resolve(h, None, name) or k.err(ERROR_PROC_NOT_FOUND)
         nm = c.mem.read_cstring(name, 512).decode("latin-1")
         mod = p.modules.by_handle.get(h)
+        if _TRACE:
+            p.log.info("[trace] GetProcAddress(%s, %s)" % (mod.name if mod else hex(h), nm))
         if mod is None:
             return k.err(ERROR_MOD_NOT_FOUND)
         if mod.kind == "internal":
@@ -14160,13 +14508,7 @@ def _k32_install(k):
             if dv is not None or api.is_data_export(mod.name, nm):
                 return p.data_export_cell(mod.name, nm)
             return p.api_thunk(mod.name, nm)
-        a = mod.exports.get(nm)
-        if not a:
-            fwd = getattr(mod, "forwards", {}).get(nm)
-            if fwd:
-                return p.modules.resolve_forward(fwd) or k.err(ERROR_PROC_NOT_FOUND)
-            return k.err(ERROR_PROC_NOT_FOUND)
-        return a
+        return p.modules.resolve(h, nm, None) or k.err(ERROR_PROC_NOT_FOUND)
 
     @R("GetProcAddress", "pp", "p")
     def _getprocaddress(c, h, name):
@@ -14305,76 +14647,97 @@ def _k32_install(k):
     # =====================================================================
     # memory
     # =====================================================================
-    MEM_RESERVE_, MEM_COMMIT_, MEM_RELEASE_ = 0x2000, 0x1000, 0x8000
-    k.vregions = {}                              # base -> [size, protect, state]
+    MEM_RESERVE_, MEM_COMMIT_, MEM_RELEASE_, MEM_DECOMMIT_ = 0x2000, 0x1000, 0x8000, 0x4000
+    MEM_RESET_, MEM_RESET_UNDO_ = 0x80000, 0x1000000
+    k.vregions = {}                              # base -> AllocationProtect
+    ERROR_INVALID_ADDRESS = 487
+
+    def _region_containing(a):
+        return p.mem.region_of(a)
 
     @R("VirtualAlloc", "pzuu", "p")
     def _valloc(c, addr, size, typ, prot):
+        mem = p.mem
         if size == 0:
             return k.err(ERROR_INVALID_PARAMETER)
-        perm = _prot_from_win(prot)
-        size = (size + 0xFFF) & ~0xFFF
-        if addr:
-            base = addr & ~0xFFF
-            if all(p.mem.is_mapped(base + o) for o in range(0, size, 0x1000)):
-                # commit inside an existing reservation
-                p.mem.protect(base, size, perm)
-                for b0, ent in k.vregions.items():
-                    if b0 <= base < b0 + ent[0]:
-                        ent[2] = MEM_COMMIT_
-                return base
-            if any(p.mem.is_mapped(base + o) for o in range(0, size, 0x1000)):
-                return k.err(ERROR_INVALID_PARAMETER)
-            base = (addr & ~0xFFFF) if not (typ & MEM_COMMIT_) or True else base
-            base = addr & ~0xFFF
-            try:
-                a = p.mem.alloc(size, perm, addr=base, tag="VirtualAlloc")
-            except NOOMemoryFault:
-                return k.err(ERROR_NOT_ENOUGH_MEMORY)
-        else:
-            try:
-                a = p.mem.alloc(size + 0x10000, perm, tag="VirtualAlloc")
-            except NOOMemoryFault:
-                return k.err(ERROR_NOT_ENOUGH_MEMORY)
-            # 64K allocation granularity: free the slack before the aligned base
-            aligned = (a + 0xFFFF) & ~0xFFFF
-            if aligned != a:
-                p.mem.free(a)
-                a = p.mem.alloc(size, perm, addr=aligned, tag="VirtualAlloc")
+        if typ & (MEM_RESET_ | MEM_RESET_UNDO_):
+            return addr if mem.is_mapped(addr) else k.err(ERROR_INVALID_ADDRESS)
+        if not typ & (MEM_COMMIT_ | MEM_RESERVE_):
+            return k.err(ERROR_INVALID_PARAMETER)
+        perm = _prot_from_win(prot & 0xFF)
+        if typ & MEM_RESERVE_ or not addr:
+            if addr:
+                base = addr & ~0xFFFF
+                end = (addr + size + 0xFFF) & ~0xFFF
+                if not mem.range_free(base, end - base):
+                    return k.err(ERROR_INVALID_ADDRESS)
             else:
-                p.mem.free(a)
-                a = p.mem.alloc(size, perm, addr=aligned, tag="VirtualAlloc")
-        k.vregions[a] = [size, prot, MEM_COMMIT_ if typ & MEM_COMMIT_ else MEM_RESERVE_]
-        return a
+                end = None
+                try:
+                    base = mem._find_gap((size + 0xFFFF) & ~0xFFFF, align=0x10000)
+                except NOOMemoryFault:
+                    return k.err(ERROR_NOT_ENOUGH_MEMORY)
+                end = base + ((size + 0xFFF) & ~0xFFF)
+            mem.alloc(end - base, perm, addr=base, tag="VirtualAlloc",
+                      commit=bool(typ & MEM_COMMIT_))
+            k.vregions[base] = prot
+            return base
+        # commit inside an existing reservation
+        base = addr & ~0xFFF
+        end = (addr + size + 0xFFF) & ~0xFFF
+        for a in range(base, end, 0x1000):
+            if _region_containing(a) is None:
+                return k.err(ERROR_INVALID_ADDRESS)
+        mem.commit(base, end - base, perm)
+        return base
 
     @R("VirtualAllocEx", "ppzuu", "p")
     def _vallocex(c, h, addr, size, typ, prot):
         return _valloc(c, addr, size, typ, prot)
 
+    @R("VirtualAlloc2 VirtualAlloc2FromApp", "ppzuupu", "p")
+    def _valloc2(c, h, addr, size, typ, prot, params, n):
+        return _valloc(c, addr, size, typ, prot)
+
     @R("VirtualFree", "pzu")
     def _vfree(c, addr, size, typ):
+        mem = p.mem
         if typ & MEM_RELEASE_:
-            k.vregions.pop(addr, None)
-            return 1 if p.mem.free(addr) else k.err(ERROR_INVALID_PARAMETER)
-        return 1                                  # decommit: keep the pages
+            reg = _region_containing(addr)
+            if size or reg is None or reg[0] != (addr & ~0xFFF):
+                return k.err(ERROR_INVALID_PARAMETER)
+            k.vregions.pop(reg[0], None)
+            mem.free(reg[0])
+            return 1
+        if typ & MEM_DECOMMIT_:
+            reg = _region_containing(addr)
+            if reg is None:
+                return k.err(ERROR_INVALID_ADDRESS)
+            if not size:
+                if reg[0] != (addr & ~0xFFF):
+                    return k.err(ERROR_INVALID_PARAMETER)
+                size = reg[1]
+            base = addr & ~0xFFF
+            mem.decommit(base, ((addr + size + 0xFFF) & ~0xFFF) - base)
+            return 1
+        return k.err(ERROR_INVALID_PARAMETER)
 
     @R("VirtualFreeEx", "ppzu")
     def _vfreeex(c, h, addr, size, typ):
         return _vfree(c, addr, size, typ)
 
     def _cur_prot(addr):
-        for b0, ent in k.vregions.items():
-            if b0 <= addr < b0 + ent[0]:
-                pass
-        perm = p.mem.perms.get(addr >> 12, 0)
-        return _prot_to_win(perm) if addr >> 12 in p.mem.pages else 1
+        perm = p.mem.perms.get(addr >> 12)
+        return _prot_to_win(perm) if perm is not None else 1
 
     @R("VirtualProtect", "pzup")
     def _vprot(c, addr, size, prot, oldp):
-        if not p.mem.is_mapped(addr):
-            return k.err(487)                      # ERROR_INVALID_ADDRESS
+        base = addr & ~0xFFF
+        end = (addr + max(size, 1) + 0xFFF) & ~0xFFF
+        if not all(p.mem.is_mapped(a) for a in range(base, end, 0x1000)):
+            return k.err(ERROR_INVALID_ADDRESS)
         old = _cur_prot(addr)
-        p.mem.protect(addr, size, _prot_from_win(prot))
+        p.mem.protect(base, end - base, _prot_from_win(prot & 0xFF))
         if oldp:
             c.mem.write32(oldp, old)
         return 1
@@ -14384,27 +14747,36 @@ def _k32_install(k):
         return _vprot(c, addr, size, prot, oldp)
 
     def _vquery(c, addr, buf, n):
-        pg = addr & ~0xFFF
-        reg = p.mem.region_of(addr)
+        mem = p.mem
         x64 = p.cpu_mode == 64
+        top = 0x7FFFFFFEFFFF if x64 else 0x7FFEFFFF
+        pg = addr & ~0xFFF
+        if addr > top:
+            return k.err(ERROR_INVALID_PARAMETER)
+        reg = mem.region_of(pg)
         if reg is None:
-            # free region: find the next mapped region
-            nxt = min([r[0] for r in p.mem.regions if r[0] > pg] + [pg + 0x10000])
+            nxt = min([r[0] for r in mem.regions if r[0] > pg] + [top + 1])
             vals = (pg, 0, 0, nxt - pg, 0x10000, 1, 0)
         else:
-            base, size, perm, tag = reg
-            prot = _prot_to_win(p.mem.perms.get(pg >> 12, perm))
+            base, size, _perm, tag = reg
+            cur = mem.perms.get(pg >> 12)
             end = pg
-            while end < base + size and p.mem.perms.get(end >> 12) == p.mem.perms.get(pg >> 12):
+            while end < base + size and mem.perms.get(end >> 12) == cur:
                 end += 0x1000
-            typ = 0x1000000 if tag.startswith("image") else 0x20000
-            vals = (pg, base, prot, end - pg, 0x1000, prot, typ)
+            state = 0x1000 if cur is not None else 0x2000
+            prot = _prot_to_win(cur) if cur is not None else 0
+            typ = 0x1000000 if tag.startswith("image") else \
+                (0x40000 if tag == "mapping" else 0x20000)
+            aprot = k.vregions.get(base) or (_prot_to_win(_perm) if _perm is not None else 4)
+            vals = (pg, base, aprot, end - pg, state, prot, typ)
         b0, ab, ap, rs, st, pr, ty = vals
         if x64:
             data = struct.pack("<QQI4xQIII4x", b0, ab, ap, rs, st, pr, ty)
         else:
             data = struct.pack("<IIIIIII", b0, ab, ap, rs, st, pr, ty)
-        c.mem.write(buf, data[:n])
+        if n < len(data):
+            return k.err(24)                         # ERROR_BAD_LENGTH
+        c.mem.write(buf, data)
         return len(data)
 
     @R("VirtualQuery", "ppz", "z")
@@ -15917,6 +16289,8 @@ def _k32_install(k):
         return h in STD or p.handles.kind(h) in ("conin", "conout")
 
     def create_file(c, path, access, share, disp, flags):
+        if _TRACE:
+            p.log.info("[trace] CreateFile(%r, acc=%#x, disp=%d, flags=%#x)" % (path, access, disp, flags))
         up = path.upper().replace("/", "\\")
         if up in ("CONIN$", "\\\\.\\CONIN$"):
             return p.handles.add(k.null_dev, "conin")
@@ -16336,8 +16710,66 @@ def _k32_install(k):
                                      ino >> 32, ino & 0xFFFFFFFF))
         return 1
 
+    def _dir_entries(d):
+        names = [".", ".."] if len(d.path.rstrip("\\")) > 2 else []
+        try:
+            names += sorted(os.listdir(d.host), key=lambda s_: s_.upper())
+        except OSError:
+            pass
+        return names
+
+    def _dir_info(h, cls, buf, size):
+        d = p.handles.get(h, "dir")
+        if d is None:
+            return k.err(ERROR_INVALID_PARAMETER)
+        if cls in (11, 15, 20) or not hasattr(d, "enum"):
+            d.enum = _dir_entries(d)
+            d.pos = 0
+        if d.pos >= len(d.enum):
+            return k.err(ERROR_NO_MORE_FILES)
+        out = bytearray()
+        last = None
+        while d.pos < len(d.enum):
+            name = d.enum[d.pos]
+            full = d.host if name == "." else (os.path.dirname(d.host) if name == ".." else
+                                               os.path.join(d.host, name))
+            try:
+                st = os.stat(full)
+            except OSError:
+                d.pos += 1
+                continue
+            ct, at, mt = times_of(st)
+            attrs = attrs_of(full, st) or FA_NORMAL
+            isdir = attrs & FA_DIR
+            eof = 0 if isdir else st.st_size
+            alloc = (eof + 4095) & ~4095
+            nm = name.encode("utf-16-le")
+            common = struct.pack("<IIqqqqqqII", 0, 0, ct, at, mt, mt, eof, alloc, attrs, len(nm))
+            if cls in (10, 11):                     # FILE_ID_BOTH_DIR_INFO
+                ent = common + struct.pack("<IBB", 0, 0, 0) + bytes(24) + bytes(2) + \
+                    struct.pack("<q", st.st_ino & 0x7FFFFFFFFFFFFFFF) + nm
+            elif cls in (14, 15):                   # FILE_FULL_DIR_INFO
+                ent = common + struct.pack("<I", 0) + nm
+            else:                                   # FILE_ID_EXTD_DIR_INFO
+                ent = common + struct.pack("<II", 0, 0) + (st.st_ino & M64).to_bytes(16, "little") + nm
+            ent = bytearray(ent)
+            pad = (-len(ent)) & 7
+            if len(out) + len(ent) > size:
+                break
+            if last is not None:
+                struct.pack_into("<I", out, last, len(out) - last)
+            last = len(out)
+            out += ent + bytes(pad if len(out) + len(ent) + pad <= size else 0)
+            d.pos += 1
+        if last is None:
+            return k.err(234)                       # ERROR_MORE_DATA
+        p.mem.write(buf, bytes(out))
+        return 1
+
     @R("GetFileInformationByHandleEx", "pupu")
     def _gfibhx(c, h, cls, buf, size):
+        if cls in (10, 11, 14, 15, 19, 20):
+            return _dir_info(h, cls, buf, size)
         st, host = _hstat(h)
         if st is None:
             return 0
@@ -16361,6 +16793,8 @@ def _k32_install(k):
         elif cls == 0x12:                           # FileIdInfo
             data = struct.pack("<Q", 0x4E4F4F21) + (st.st_ino & M64).to_bytes(16, "little")
         else:
+            if _TRACE:
+                p.log.info("[trace] GetFileInformationByHandleEx: class %d not supported" % cls)
             return k.err(ERROR_INVALID_PARAMETER)
         if size < len(data):
             return k.err(ERROR_INSUFFICIENT_BUFFER)
@@ -16438,6 +16872,8 @@ def _k32_install(k):
 
     # -- attributes --------------------------------------------------------------------
     def _gfa(path):
+        if _TRACE:
+            p.log.info("[trace] GetFileAttributes(%r)" % path)
         host = resolve(path)
         if host is None:
             return 0xFFFFFFFF
@@ -16456,6 +16892,8 @@ def _k32_install(k):
         return _gfa(k.ws_(name))
 
     def _gfax(path, out):
+        if _TRACE:
+            p.log.info("[trace] GetFileAttributesEx(%r)" % path)
         host = resolve(path)
         if host is None:
             return 0
@@ -19038,6 +19476,429 @@ def _k32_install(k):
     def _wvspw(c, buf, fmt, va):
         return _wsprintf(buf, fmt, _VaList(c, va), True)
 
+    # =====================================================================
+    # waitable timers
+    # =====================================================================
+    class _KTimer:
+        def __init__(self, manual):
+            self.manual = bool(manual)
+            self.signaled = False
+            self.due = None               # time.monotonic() deadline
+            self.period = 0.0             # seconds
+
+        def ready(self, take):
+            now = time.monotonic()
+            if not self.signaled and self.due is not None and now >= self.due:
+                self.signaled = True
+                if self.period:
+                    self.due = max(self.due + self.period, now)
+                else:
+                    self.due = None
+            if self.signaled:
+                if take and not self.manual:
+                    self.signaled = False
+                return True
+            return False
+
+    def _ctimer(manual, name):
+        return _create_named("ktimer", name, lambda: _KTimer(manual))
+
+    @R("CreateWaitableTimerA", "pip", "p")
+    def _cwta(c, sa, manual, name):
+        return _ctimer(manual, k.cs_(name) if name else None)
+
+    @R("CreateWaitableTimerW", "pip", "p")
+    def _cwtw(c, sa, manual, name):
+        return _ctimer(manual, k.ws_(name) if name else None)
+
+    @R("CreateWaitableTimerExA", "ppuu", "p")
+    def _cwtxa(c, sa, name, flags, acc):
+        return _ctimer(flags & 1, k.cs_(name) if name else None)
+
+    @R("CreateWaitableTimerExW", "ppuu", "p")
+    def _cwtxw(c, sa, name, flags, acc):
+        return _ctimer(flags & 1, k.ws_(name) if name else None)
+
+    @R("OpenWaitableTimerA", "uip", "p")
+    def _owta(c, acc, inh, name):
+        return _open_named("ktimer", k.cs_(name))
+
+    @R("OpenWaitableTimerW", "uip", "p")
+    def _owtw(c, acc, inh, name):
+        return _open_named("ktimer", k.ws_(name))
+
+    def _set_timer(h, pdue, period):
+        tm = p.handles.get(h, "ktimer")
+        if tm is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        due = _s64(p.mem.read64(pdue))
+        now = time.monotonic()
+        if due < 0:
+            delay = -due / 10_000_000.0
+        else:
+            delay = max(0.0, _unix_from_ft(due) - time.time())
+        tm.due = now + delay
+        tm.period = (period & 0x7FFFFFFF) / 1000.0
+        tm.signaled = False
+        p.last_error = 0
+        return 1
+
+    @R("SetWaitableTimer", "ppippi")
+    def _swt(c, h, pdue, period, cb, arg, resume):
+        return _set_timer(h, pdue, period)
+
+    @R("SetWaitableTimerEx", "ppipppu")
+    def _swtx(c, h, pdue, period, cb, arg, wake, delay):
+        return _set_timer(h, pdue, period)
+
+    @R("CancelWaitableTimer", "p")
+    def _cancwt(c, h):
+        tm = p.handles.get(h, "ktimer")
+        if tm is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        tm.due = None
+        return 1
+
+    # timer queues (callbacks on pool threads) ------------------------------------------
+    @R("CreateTimerQueue", "", "p")
+    def _ctq(c):
+        return p.handles.add({"timers": []}, "timerq")
+
+    @R("DeleteTimerQueue DeleteTimerQueueEx", "pp")
+    def _dtq(c, h, ev):
+        return 1
+
+    @R("DeleteTimerQueueTimer", "ppp")
+    def _dtqt(c, q, t_, ev):
+        ent = p.handles.get(t_, "tqtimer")
+        if ent is not None:
+            ent["dead"] = True
+        return 1
+
+    @R("ChangeTimerQueueTimer", "ppuu")
+    def _chtqt(c, q, t_, due, period):
+        ent = p.handles.get(t_, "tqtimer")
+        if ent is not None:
+            ent["due"], ent["period"] = due, period
+        return 1
+
+    # =====================================================================
+    # I/O completion ports
+    # =====================================================================
+    import collections as _collections
+
+    class _KPort:
+        def __init__(self):
+            self.q = _collections.deque()
+
+    k.port_assoc = {}                       # file handle -> (port, key)
+
+    @R("CreateIoCompletionPort", "ppzu", "p")
+    def _ciocp(c, fh, existing, key, nthreads):
+        if existing:
+            port = p.handles.get(existing, "kport")
+            if port is None:
+                return k.err(ERROR_INVALID_PARAMETER)
+            if fh not in (0xFFFFFFFF, M64):
+                k.port_assoc[fh] = (port, key)
+            return existing
+        port = _KPort()
+        h = p.handles.add(port, "kport")
+        if fh not in (0xFFFFFFFF, M64, 0):
+            k.port_assoc[fh] = (port, key)
+        return h
+
+    @R("PostQueuedCompletionStatus", "puzp")
+    def _pqcs(c, h, nbytes, key, ov):
+        port = p.handles.get(h, "kport")
+        if port is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        port.q.append((nbytes, key, ov))
+        return 1
+
+    def _gqcs_fill(t, port, pbytes, pkey, pov):
+        nbytes, key, ov = port.q.popleft()
+        p.mem.write32(pbytes, nbytes)
+        k.wptr(pkey, key)
+        k.wptr(pov, ov)
+        return 1
+
+    def _gqcsx_fill(t, port, ents, count, premoved):
+        ps = k.ptr_size()
+        n = 0
+        while port.q and n < count:
+            nbytes, key, ov = port.q.popleft()
+            e = ents + n * (4 * ps)
+            k.wptr(e, key)
+            k.wptr(e + ps, ov)
+            k.wptr(e + 2 * ps, 0)
+            p.mem.write32(e + 3 * ps, nbytes)
+            n += 1
+        p.mem.write32(premoved, n)
+        return 1
+
+    def _iocp_wait(c, port, timeout, fill):
+        if port.q:
+            return fill()
+        if timeout == 0:
+            return k.err(WAIT_TIMEOUT)
+        t = p.current_thread
+        deadline = None if timeout == INFINITE else time.monotonic() + timeout / 1000.0
+        t.state = "blocked"
+        t.waiting_on = ("iocp", port, fill, deadline)
+        c.regs[RAX] = 0
+        raise NOOYield()
+
+    def _iocp_wake(t):
+        _k, port, fill, deadline = t.waiting_on
+        if port.q:
+            t.cpu.regs[RAX] = fill()
+            return True
+        if deadline is not None and time.monotonic() >= deadline:
+            p.last_error = WAIT_TIMEOUT
+            t.cpu.regs[RAX] = 0
+            return True
+        return False
+
+    k.wait_hooks["iocp"] = _iocp_wake
+
+    @R("GetQueuedCompletionStatus", "ppppu")
+    def _gqcs(c, h, pbytes, pkey, pov, timeout):
+        port = p.handles.get(h, "kport")
+        if port is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        t = p.current_thread
+        return _iocp_wait(c, port, timeout, lambda: _gqcs_fill(t, port, pbytes, pkey, pov))
+
+    @R("GetQueuedCompletionStatusEx", "ppupui")
+    def _gqcsx(c, h, ents, count, premoved, timeout, alertable):
+        port = p.handles.get(h, "kport")
+        if port is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        t = p.current_thread
+        return _iocp_wait(c, port, timeout, lambda: _gqcsx_fill(t, port, ents, count, premoved))
+
+    @R("SetFileCompletionNotificationModes", "pu")
+    def _sfcnm(c, h, flags):
+        return 1
+
+    @R("BindIoCompletionCallback", "ppu")
+    def _bicc(c, h, fn, flags):
+        return 1
+
+    # =====================================================================
+    # thread contexts (debuggers, Go's async preemption, JITs)
+    # =====================================================================
+    def _thread_of(h):
+        if h in (0xFFFFFFFE, 0xFFFFFFFFFFFFFFFE):
+            return p.current_thread
+        return p.handles.get(h, "thread")
+
+    @R("GetThreadContext", "pp")
+    def _gtc2(c, h, ctx):
+        t = _thread_of(h)
+        if t is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        flags_off = 0x30 if p.cpu_mode == 64 else 0
+        flags = p.mem.read32(ctx + flags_off)
+        cpu = t.cpu
+        if t is p.current_thread:
+            regs = list(cpu.regs)
+            sp = regs[RSP]
+            ret = p.mem.read64(sp) if p.cpu_mode == 64 else p.mem.read32(sp)
+            regs[RSP] = sp + (8 if p.cpu_mode == 64 else 12)
+            p.seh.write_context(cpu, ctx, regs, ret)
+        else:
+            eip = cpu.eip
+            regs = list(cpu.regs)
+            if getattr(cpu, "_yield_pending", False):
+                # blocked inside an API call: report the user-mode return point
+                sp = regs[RSP]
+                eip = p.mem.read64(sp) if p.cpu_mode == 64 else p.mem.read32(sp)
+                regs[RSP] = sp + (8 if p.cpu_mode == 64 else 4) + getattr(cpu, "_yield_clean", 0)
+            p.seh.write_context(cpu, ctx, regs, eip)
+        p.mem.write32(ctx + flags_off, flags or (0x10001F if p.cpu_mode == 64 else 0x1003F))
+        return 1
+
+    @R("SetThreadContext", "pp")
+    def _stc2(c, h, ctx):
+        t = _thread_of(h)
+        if t is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        if t is p.current_thread:
+            p.seh.load_context(t.cpu, ctx)
+            raise NOOContextSet()
+        if getattr(t.cpu, "_yield_pending", False):
+            return 1                        # parked in an API call: keep its state
+        p.seh.load_context(t.cpu, ctx)
+        return 1
+
+    @R("Wow64GetThreadContext Wow64SetThreadContext", "pp")
+    def _w64tc(c, h, ctx):
+        return k.err(ERROR_NOT_SUPPORTED)
+
+    @R("GetThreadSelectorEntry", "pup")
+    def _gtse(c, h, sel, out):
+        return k.err(ERROR_NOT_SUPPORTED)
+
+    # =====================================================================
+    # misc: WER, fail-fast, PEB access, power notifications
+    # =====================================================================
+    @R("WerGetFlags", "pp", "i")
+    def _wergf(c, h, out):
+        if out:
+            p.mem.write32(out, getattr(k, "wer_flags", 0))
+        return 0
+
+    @R("WerSetFlags", "u", "i")
+    def _wersf(c, flags):
+        k.wer_flags = flags
+        return 0
+
+    @R("WerRegisterMemoryBlock WerRegisterFile WerRegisterRuntimeExceptionModule "
+       "WerUnregisterMemoryBlock WerUnregisterFile WerUnregisterRuntimeExceptionModule "
+       "WerRegisterExcludedMemoryBlock WerUnregisterExcludedMemoryBlock", "pu", "i")
+    def _werreg(c, a, b_):
+        return 0
+
+    @R("RaiseFailFastException", "ppu", "v")
+    def _rffe(c, rec, ctx, flags):
+        code = p.mem.read32(rec) if rec else 0xC0000409
+        p.log.error("RaiseFailFastException(0x%08X) — process terminated" % code)
+        raise NOOExitProcess(code)
+
+    @R("RtlGetCurrentPeb", "", "p", dlls=NT)
+    def _rgcp(c):
+        return p.peb_addr
+
+    @R("RtlGetNtVersionNumbers", "ppp", "v", dlls=NT)
+    def _rgnvn(c, maj, mn, build):
+        if maj:
+            p.mem.write32(maj, 10)
+        if mn:
+            p.mem.write32(mn, 0)
+        if build:
+            p.mem.write32(build, 0xF0000000 | 19045)
+
+    @R("NtCurrentTeb", "", "p", dlls=NT)
+    def _ncteb(c):
+        return p.current_thread.teb
+
+    @R("PowerRegisterSuspendResumeNotification", "upp", dlls=("powrprof.dll",))
+    def _prsrn(c, flags, recip, out):
+        if out:
+            k.wptr(out, p.handles.add({}, "powernotify"))
+        return 0
+
+    @R("PowerUnregisterSuspendResumeNotification", "p", dlls=("powrprof.dll",))
+    def _pursrn(c, h):
+        return 0
+
+    @R("RegisterPowerSettingNotification", "ppu", "p", dlls=("user32.dll",))
+    def _rpsn(c, h, guid, flags):
+        return p.handles.add({}, "powernotify")
+
+    @R("UnregisterPowerSettingNotification", "p", dlls=("user32.dll",))
+    def _upsn(c, h):
+        return 1
+
+    @R("SetThreadExecutionState", "u")
+    def _stes(c, flags):
+        return 0x80000000
+
+    @R("GetSystemPowerStatus", "p")
+    def _gsps(c, buf):
+        p.mem.write(buf, struct.pack("<BBBBII", 1, 0xFF, 0xFF, 0, 0xFFFFFFFF, 0xFFFFFFFF))
+        return 1
+
+    @R("GetActiveProcessorCount GetMaximumProcessorCount", "u")
+    def _gapc(c, grp):
+        return os.cpu_count() or 1
+
+    @R("GetActiveProcessorGroupCount GetMaximumProcessorGroupCount", "")
+    def _gapgc(c):
+        return 1
+
+    @R("GetNumaHighestNodeNumber", "p")
+    def _gnhnn(c, out):
+        p.mem.write32(out, 0)
+        return 1
+
+    @R("GetLogicalProcessorInformation", "pp")
+    def _glpi(c, buf, plen):
+        n = os.cpu_count() or 1
+        esz = 32 if p.cpu_mode == 64 else 24
+        need = esz * (n + 1)
+        have = p.mem.read32(plen)
+        p.mem.write32(plen, need)
+        if have < need or not buf:
+            return k.err(ERROR_INSUFFICIENT_BUFFER)
+        blob = b""
+        for i in range(n):                          # RelationProcessorCore per CPU
+            mask = struct.pack("<Q" if p.cpu_mode == 64 else "<I", 1 << i)
+            blob += (mask + struct.pack("<I", 0) + (b"\0" * 4 if p.cpu_mode == 64 else b"")
+                     + b"\1").ljust(esz, b"\0")
+        allmask = (1 << n) - 1
+        mask = struct.pack("<Q" if p.cpu_mode == 64 else "<I", allmask)
+        blob += (mask + struct.pack("<I", 1) + (b"\0" * 4 if p.cpu_mode == 64 else b"")
+                 ).ljust(esz, b"\0")                # RelationNumaNode
+        p.mem.write(buf, blob)
+        return 1
+
+    # =====================================================================
+    # KUSER_SHARED_DATA (0x7FFE0000): times read directly by programs
+    # (Go's nanotime, the CRT's GetTickCount fast paths, ...)
+    # =====================================================================
+    def _kuser_install():
+        mem = p.mem
+        base = 0x7FFE0000
+        pg = base >> 12
+        if mem.is_mapped(base):
+            return
+        try:
+            mem.alloc(0x1000, MEM_READ, addr=base, tag="kuser_shared_data")
+            page = mem.page(pg)
+        except Exception:
+            return
+        page[0x004:0x008] = struct.pack("<I", 0x0FA00000)          # TickCountMultiplier
+        page[0x02C:0x030] = struct.pack("<HH", 0x8664 if p.cpu_mode == 64 else 0x14C,
+                                        0x8664 if p.cpu_mode == 64 else 0x14C)
+        root = "C:\\Windows".encode("utf-16-le")
+        page[0x030:0x030 + len(root)] = root
+        page[0x244:0x248] = struct.pack("<I", 0x200000)             # LargePageMinimum
+        page[0x260:0x264] = struct.pack("<I", 19045)                # NtBuildNumber
+        page[0x264:0x26C] = struct.pack("<IB", 1, 1)                # NtProductType, valid
+        page[0x26C:0x274] = struct.pack("<II", 10, 0)               # NtMajor/MinorVersion
+        for f in (2, 3, 6, 7, 8, 10, 12, 13, 14):                   # ProcessorFeatures
+            page[0x274 + f] = 1
+        page[0x2F0:0x2F4] = struct.pack("<I", 0x100)                # SuiteMask
+        page[0x2F8:0x2FC] = struct.pack("<I", 1)                    # ActiveConsoleId
+        page[0x308:0x30C] = struct.pack("<I", 0x80000)              # NumberOfPhysicalPages
+
+        def refresh():
+            now = time.monotonic() - k.boot
+            it = int(now * 10_000_000)
+            st = _ft_from_unix(time.time())
+            bias = int(time.timezone * 10_000_000)
+            ticks = int(now * 1000 / 15.625)
+            page[0x000:0x004] = struct.pack("<I", int(now * 1000) & 0xFFFFFFFF)
+            page[0x008:0x014] = struct.pack("<IiI", it & 0xFFFFFFFF, it >> 32, it >> 32)
+            page[0x014:0x020] = struct.pack("<IiI", st & 0xFFFFFFFF, st >> 32, st >> 32)
+            page[0x020:0x02C] = struct.pack("<IiI", bias & 0xFFFFFFFF, bias >> 32, bias >> 32)
+            page[0x320:0x32C] = struct.pack("<IiI", ticks & 0xFFFFFFFF, ticks >> 32, ticks >> 32)
+
+        refresh()
+        mem.dyn[pg] = refresh
+        mem._refresh(pg)
+
+
+    @R("WSAEnumProtocolsA WSAEnumProtocolsW", "ppp", dlls=("ws2_32.dll",))
+    def _wsaenumprot(c, protos, buf, plen):
+        return 0                                    # no layered providers to report
+
+    if k.live:
+        _kuser_install()
+
 
 # ==============================================================================
 # 10e. MSVC exception runtime (vcruntime140 / msvcrt): C++ EH + x86 C SEH
@@ -19948,6 +20809,1946 @@ def _undecorate_type(raw):
 
 
 # ==============================================================================
+# 10f. advapi32: registry, tokens / SIDs / security, crypto, event log, ETW
+# ==============================================================================
+
+_ADV = ("advapi32.dll", "kernelbase.dll", "api-ms-win-core-registry-l1-1-0.dll",
+        "api-ms-win-security-base-l1-1-0.dll", "sechost.dll")
+_REG_T = {0: "REG_NONE", 1: "REG_SZ", 2: "REG_EXPAND_SZ", 3: "REG_BINARY", 4: "REG_DWORD",
+          5: "REG_DWORD_BIG_ENDIAN", 6: "REG_LINK", 7: "REG_MULTI_SZ", 11: "REG_QWORD"}
+_REG_N = {v: k for k, v in _REG_T.items()}
+_HIVES = {0x80000000: "HKCR", 0x80000001: "HKCU", 0x80000002: "HKLM", 0x80000003: "HKU",
+          0x80000005: "HKLM"}
+_HIVE_PREFIX = {0x80000005: "SYSTEM\\CurrentControlSet\\Hardware Profiles\\Current"}
+_PRIVS = {"SeCreateTokenPrivilege": 2, "SeAssignPrimaryTokenPrivilege": 3,
+          "SeLockMemoryPrivilege": 4, "SeIncreaseQuotaPrivilege": 5,
+          "SeMachineAccountPrivilege": 6, "SeTcbPrivilege": 7, "SeSecurityPrivilege": 8,
+          "SeTakeOwnershipPrivilege": 9, "SeLoadDriverPrivilege": 10,
+          "SeSystemProfilePrivilege": 11, "SeSystemtimePrivilege": 12,
+          "SeProfileSingleProcessPrivilege": 13, "SeIncreaseBasePriorityPrivilege": 14,
+          "SeCreatePagefilePrivilege": 15, "SeCreatePermanentPrivilege": 16,
+          "SeBackupPrivilege": 17, "SeRestorePrivilege": 18, "SeShutdownPrivilege": 19,
+          "SeDebugPrivilege": 20, "SeAuditPrivilege": 21, "SeSystemEnvironmentPrivilege": 22,
+          "SeChangeNotifyPrivilege": 23, "SeRemoteShutdownPrivilege": 24,
+          "SeUndockPrivilege": 25, "SeSyncAgentPrivilege": 26,
+          "SeEnableDelegationPrivilege": 27, "SeManageVolumePrivilege": 28,
+          "SeImpersonatePrivilege": 29, "SeCreateGlobalPrivilege": 30,
+          "SeTrustedCredManAccessPrivilege": 31, "SeRelabelPrivilege": 32,
+          "SeIncreaseWorkingSetPrivilege": 33, "SeTimeZonePrivilege": 34,
+          "SeCreateSymbolicLinkPrivilege": 35}
+_SID_USER = "S-1-5-21-1004336348-1177238915-682003330-1000"
+_SID_NAMES = {_SID_USER: ("NOO", "NOO-PC", 1), "S-1-5-32-544": ("Administrators", "BUILTIN", 4),
+              "S-1-5-32-545": ("Users", "BUILTIN", 4), "S-1-1-0": ("Everyone", "", 5),
+              "S-1-5-18": ("SYSTEM", "NT AUTHORITY", 5), "S-1-5-11": ("Authenticated Users",
+                                                                   "NT AUTHORITY", 5),
+              "S-1-5-4": ("INTERACTIVE", "NT AUTHORITY", 5),
+              "S-1-16-12288": ("High Mandatory Level", "Mandatory Label", 10)}
+_MEMBER_SIDS = {_SID_USER, "S-1-5-32-544", "S-1-5-32-545", "S-1-1-0", "S-1-5-11", "S-1-5-4"}
+
+
+def _sid_bytes(s):
+    parts = s.split("-")
+    auth = int(parts[2])
+    subs = [int(x) & 0xFFFFFFFF for x in parts[3:]]
+    return bytes([1, len(subs)]) + auth.to_bytes(6, "big") + b"".join(
+        struct.pack("<I", x) for x in subs)
+
+
+def _sid_str(b):
+    n = b[1]
+    auth = int.from_bytes(b[2:8], "big")
+    subs = struct.unpack("<%dI" % n, b[8:8 + 4 * n])
+    return "S-%d-%d" % (b[0], auth) + "".join("-%d" % x for x in subs)
+
+
+def _adv_install(k):
+    R = k.reg
+    p = k.p
+    reg = p.registry
+    M_ = p.mem
+
+    # ---------------------------------------------------------------------------
+    # registry
+    # ---------------------------------------------------------------------------
+    def hkey(h):
+        """-> (hive, path) or None."""
+        hh = h & 0xFFFFFFFF if (h >> 32) in (0, 0xFFFFFFFF) else h
+        if hh in _HIVES:
+            return _HIVES[hh], _HIVE_PREFIX.get(hh, "")
+        ent = p.handles.get(h, "regkey")
+        return ent
+
+    def join(a, b):
+        b = (b or "").strip("\\")
+        if not a:
+            return b
+        return a + "\\" + b if b else a
+
+    def root_vals(hive):
+        return p.__dict__.setdefault("_reg_root_values", {}).setdefault(hive, {})
+
+    def entry(hive, path, create=False):
+        if not path.strip("\\"):
+            return {"sub": reg.hives[hive], "values": root_vals(hive)}
+        return reg._entry(hive, path, create)
+
+    def exists(hive, path):
+        return entry(hive, path) is not None
+
+    def s(a, wide):
+        return k.s(a, wide) if a else ""
+
+    def open_key(h, sub, out, create=False, wide=False):
+        base = hkey(h)
+        if base is None:
+            return ERROR_INVALID_HANDLE
+        hive, path = base
+        full = join(path, sub)
+        disp = 2                                     # REG_OPENED_EXISTING_KEY
+        if not exists(hive, full):
+            if not create:
+                return ERROR_FILE_NOT_FOUND
+            if not p.sandbox.allow_registry_write:
+                p.log.warn("sandbox: registry write blocked (%s\\%s)" % (hive, full))
+                return ERROR_ACCESS_DENIED
+            entry(hive, full, True)
+            disp = 1                                 # REG_CREATED_NEW_KEY
+        if out:
+            k.wptr(out, p.handles.add((hive, full), "regkey"))
+        return (0, disp)
+
+    def ok(r):
+        return r[0] if isinstance(r, tuple) else r
+
+    @R("RegOpenKeyExA", "ppuup", dlls=_ADV)
+    def _roka(c, h, sub, opts, sam, out):
+        return ok(open_key(h, s(sub, False), out))
+
+    @R("RegOpenKeyExW", "ppuup", dlls=_ADV)
+    def _rokw(c, h, sub, opts, sam, out):
+        return ok(open_key(h, s(sub, True), out))
+
+    @R("RegOpenKeyA", "ppp", dlls=_ADV)
+    def _rok_a(c, h, sub, out):
+        return ok(open_key(h, s(sub, False), out))
+
+    @R("RegOpenKeyW", "ppp", dlls=_ADV)
+    def _rok_w(c, h, sub, out):
+        return ok(open_key(h, s(sub, True), out))
+
+    def create_ex(h, sub, out, pdisp):
+        r = open_key(h, sub, out, create=True)
+        if isinstance(r, tuple):
+            if pdisp:
+                M_.write32(pdisp, r[1])
+            return 0
+        return r
+
+    @R("RegCreateKeyExA", "ppupuuppp", dlls=_ADV)
+    def _rckxa(c, h, sub, res, cls, opts, sam, sa, out, pdisp):
+        return create_ex(h, s(sub, False), out, pdisp)
+
+    @R("RegCreateKeyExW", "ppupuuppp", dlls=_ADV)
+    def _rckxw(c, h, sub, res, cls, opts, sam, sa, out, pdisp):
+        return create_ex(h, s(sub, True), out, pdisp)
+
+    @R("RegCreateKeyA", "ppp", dlls=_ADV)
+    def _rcka(c, h, sub, out):
+        return create_ex(h, s(sub, False), out, 0)
+
+    @R("RegCreateKeyW", "ppp", dlls=_ADV)
+    def _rckw(c, h, sub, out):
+        return create_ex(h, s(sub, True), out, 0)
+
+    @R("RegCloseKey", "p", dlls=_ADV)
+    def _rclose(c, h):
+        if hkey(h) is None:
+            return ERROR_INVALID_HANDLE
+        if p.handles.kind(h) == "regkey":
+            p.handles.close(h)
+        return 0
+
+    @R("RegOpenCurrentUser", "up", dlls=_ADV)
+    def _rocu(c, sam, out):
+        k.wptr(out, p.handles.add(("HKCU", ""), "regkey"))
+        return 0
+
+    @R("RegOverridePredefKey RegDisablePredefinedCache RegDisablePredefinedCacheEx", "pp",
+       dlls=_ADV)
+    def _ropk(c, a, b_):
+        return 0
+
+    @R("RegFlushKey", "p", dlls=_ADV)
+    def _rflush(c, h):
+        return 0
+
+    @R("RegNotifyChangeKeyValue", "piupi", dlls=_ADV)
+    def _rncv(c, h, sub, flt, ev, async_):
+        return 0
+
+    @R("RegConnectRegistryA RegConnectRegistryW", "ppp", dlls=_ADV)
+    def _rconn(c, m_, h, out):
+        return 53                                   # ERROR_BAD_NETPATH
+
+    @R("RegSaveKeyA RegSaveKeyW RegLoadKeyA RegLoadKeyW RegUnLoadKeyA RegUnLoadKeyW "
+       "RegRestoreKeyA RegRestoreKeyW RegReplaceKeyA RegReplaceKeyW", "ppp", dlls=_ADV)
+    def _rsave(c, a, b_, d):
+        return 1314                                 # ERROR_PRIVILEGE_NOT_HELD
+
+    # value encoding --------------------------------------------------------------
+    def to_raw(vtype, data, wide):
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
+        if vtype in ("REG_SZ", "REG_EXPAND_SZ", "REG_LINK"):
+            return data.encode("utf-16-le") + b"\0\0" if wide else \
+                data.encode("utf-8", "replace") + b"\0"
+        if vtype == "REG_MULTI_SZ":
+            items = data if isinstance(data, (list, tuple)) else [x for x in str(data).split("\0") if x]
+            if wide:
+                return b"".join(x.encode("utf-16-le") + b"\0\0" for x in items) + b"\0\0"
+            return b"".join(x.encode("utf-8", "replace") + b"\0" for x in items) + b"\0"
+        if vtype == "REG_DWORD":
+            return struct.pack("<I", int(data) & 0xFFFFFFFF)
+        if vtype == "REG_DWORD_BIG_ENDIAN":
+            return struct.pack(">I", int(data) & 0xFFFFFFFF)
+        if vtype == "REG_QWORD":
+            return struct.pack("<Q", int(data) & M64)
+        if isinstance(data, str):
+            return data.encode("utf-8")
+        return bytes(data or b"")
+
+    def from_raw(t, raw, wide):
+        name = _REG_T.get(t, "REG_%d" % t)
+        if name in ("REG_SZ", "REG_EXPAND_SZ", "REG_LINK"):
+            txt = raw.decode("utf-16-le", "replace") if wide else raw.decode("utf-8", "replace")
+            return name, txt.split("\0", 1)[0]
+        if name == "REG_MULTI_SZ":
+            txt = raw.decode("utf-16-le", "replace") if wide else raw.decode("utf-8", "replace")
+            return name, [x for x in txt.split("\0") if x]
+        if name == "REG_DWORD" and len(raw) >= 4:
+            return name, struct.unpack("<I", raw[:4])[0]
+        if name == "REG_QWORD" and len(raw) >= 8:
+            return name, struct.unpack("<Q", raw[:8])[0]
+        return name, bytes(raw)
+
+    def find_value(ent, name):
+        up = (name or "").upper()
+        for kk, v in ent["values"].items():
+            if kk.upper() == up:
+                return kk, v
+        return None, None
+
+    def query(h, sub, name, ptype, data, pcb, wide, flags=0):
+        base = hkey(h)
+        if base is None:
+            return ERROR_INVALID_HANDLE
+        hive, path = base
+        ent = entry(hive, join(path, sub))
+        if ent is None:
+            return ERROR_FILE_NOT_FOUND
+        _kk, v = find_value(ent, name)
+        if v is None:
+            return ERROR_FILE_NOT_FOUND
+        vtype, val = v
+        if flags:                                   # RegGetValue type restriction
+            allowed = flags & 0xFFFF
+            bit = {"REG_NONE": 1, "REG_SZ": 2, "REG_EXPAND_SZ": 4, "REG_BINARY": 8,
+                   "REG_DWORD": 0x10, "REG_MULTI_SZ": 0x20, "REG_QWORD": 0x40}.get(vtype, 0)
+            if allowed != 0xFFFF and not allowed & bit:
+                return 1630                         # ERROR_UNSUPPORTED_TYPE
+            if vtype == "REG_EXPAND_SZ" and not flags & 0x10000000:   # !RRF_NOEXPAND
+                for kk2, vv in p.env.items():
+                    val = re.sub("%" + re.escape(kk2) + "%", lambda _m, vv=vv: vv, val,
+                                 flags=re.I)
+                vtype = "REG_SZ"
+        raw = to_raw(vtype, val, wide)
+        if ptype:
+            M_.write32(ptype, _REG_N.get(vtype, 3))
+        if pcb:
+            have = M_.read32(pcb)
+            M_.write32(pcb, len(raw))
+            if data:
+                if have < len(raw):
+                    return 234                      # ERROR_MORE_DATA
+                M_.write(data, raw)
+        elif data:
+            return ERROR_INVALID_PARAMETER
+        return 0
+
+    @R("RegQueryValueExA", "pppppp", dlls=_ADV)
+    def _rqvxa(c, h, name, res, ptype, data, pcb):
+        return query(h, "", s(name, False), ptype, data, pcb, False)
+
+    @R("RegQueryValueExW", "pppppp", dlls=_ADV)
+    def _rqvxw(c, h, name, res, ptype, data, pcb):
+        return query(h, "", s(name, True), ptype, data, pcb, True)
+
+    @R("RegGetValueA", "pppuppp", dlls=_ADV)
+    def _rgva(c, h, sub, name, flags, ptype, data, pcb):
+        return query(h, s(sub, False), s(name, False), ptype, data, pcb, False, flags or 0xFFFF)
+
+    @R("RegGetValueW", "pppuppp", dlls=_ADV)
+    def _rgvw(c, h, sub, name, flags, ptype, data, pcb):
+        return query(h, s(sub, True), s(name, True), ptype, data, pcb, True, flags or 0xFFFF)
+
+    def query_default(h, sub, data, pcb, wide):
+        r = query(h, sub, "", 0, data, pcb, wide)
+        if r == ERROR_FILE_NOT_FOUND and hkey(h) is not None:
+            base = hkey(h)
+            if exists(base[0], join(base[1], sub)):
+                empty = b"\0\0" if wide else b"\0"
+                if pcb:
+                    have = M_.read32(pcb)
+                    M_.write32(pcb, len(empty))
+                    if data and have >= len(empty):
+                        M_.write(data, empty)
+                return 0
+        return r
+
+    @R("RegQueryValueA", "pppp", dlls=_ADV)
+    def _rqva(c, h, sub, data, pcb):
+        return query_default(h, s(sub, False), data, pcb, False)
+
+    @R("RegQueryValueW", "pppp", dlls=_ADV)
+    def _rqvw(c, h, sub, data, pcb):
+        return query_default(h, s(sub, True), data, pcb, True)
+
+    def set_value(h, sub, name, t, data, n, wide):
+        if not p.sandbox.allow_registry_write:
+            p.log.warn("sandbox: registry write blocked")
+            return ERROR_ACCESS_DENIED
+        base = hkey(h)
+        if base is None:
+            return ERROR_INVALID_HANDLE
+        hive, path = base
+        full = join(path, sub)
+        ent = entry(hive, full, create=True)
+        raw = M_.read(data, n) if data and n else b""
+        vtype, val = from_raw(t, raw, wide)
+        kk, _v = find_value(ent, name)
+        ent["values"][kk if kk is not None else (name or "")] = (vtype, val)
+        return 0
+
+    @R("RegSetValueExA", "ppuupu", dlls=_ADV)
+    def _rsvxa(c, h, name, res, t, data, n):
+        return set_value(h, "", s(name, False), t, data, n, False)
+
+    @R("RegSetValueExW", "ppuupu", dlls=_ADV)
+    def _rsvxw(c, h, name, res, t, data, n):
+        return set_value(h, "", s(name, True), t, data, n, True)
+
+    @R("RegSetKeyValueA", "pppupu", dlls=_ADV)
+    def _rskva(c, h, sub, name, t, data, n):
+        return set_value(h, s(sub, False), s(name, False), t, data, n, False)
+
+    @R("RegSetKeyValueW", "pppupu", dlls=_ADV)
+    def _rskvw(c, h, sub, name, t, data, n):
+        return set_value(h, s(sub, True), s(name, True), t, data, n, True)
+
+    @R("RegSetValueA", "ppupu", dlls=_ADV)
+    def _rsva(c, h, sub, t, data, n):
+        txt = k.cs_(data)
+        return set_value(h, s(sub, False), "", 1, data, len(txt.encode()) + 1, False)
+
+    @R("RegSetValueW", "ppupu", dlls=_ADV)
+    def _rsvw(c, h, sub, t, data, n):
+        txt = k.ws_(data)
+        return set_value(h, s(sub, True), "", 1, data, 2 * len(txt) + 2, True)
+
+    def delete_value(h, sub, name):
+        base = hkey(h)
+        if base is None:
+            return ERROR_INVALID_HANDLE
+        ent = entry(base[0], join(base[1], sub))
+        if ent is None:
+            return ERROR_FILE_NOT_FOUND
+        kk, v = find_value(ent, name)
+        if v is None:
+            return ERROR_FILE_NOT_FOUND
+        del ent["values"][kk]
+        return 0
+
+    @R("RegDeleteValueA", "pp", dlls=_ADV)
+    def _rdva(c, h, name):
+        return delete_value(h, "", s(name, False))
+
+    @R("RegDeleteValueW", "pp", dlls=_ADV)
+    def _rdvw(c, h, name):
+        return delete_value(h, "", s(name, True))
+
+    @R("RegDeleteKeyValueA", "ppp", dlls=_ADV)
+    def _rdkva(c, h, sub, name):
+        return delete_value(h, s(sub, False), s(name, False))
+
+    @R("RegDeleteKeyValueW", "ppp", dlls=_ADV)
+    def _rdkvw(c, h, sub, name):
+        return delete_value(h, s(sub, True), s(name, True))
+
+    def delete_key(h, sub, tree=False):
+        base = hkey(h)
+        if base is None:
+            return ERROR_INVALID_HANDLE
+        hive, path = base
+        full = join(path, sub)
+        ent = entry(hive, full)
+        if ent is None:
+            return ERROR_FILE_NOT_FOUND
+        if tree:
+            if not sub:
+                ent["sub"].clear()
+                ent["values"].clear()
+                return 0
+        elif ent["sub"]:
+            return ERROR_ACCESS_DENIED              # key has subkeys
+        return 0 if reg.delete_key(hive, full) else ERROR_FILE_NOT_FOUND
+
+    @R("RegDeleteKeyA", "pp", dlls=_ADV)
+    def _rdka(c, h, sub):
+        return delete_key(h, s(sub, False))
+
+    @R("RegDeleteKeyW", "pp", dlls=_ADV)
+    def _rdkw(c, h, sub):
+        return delete_key(h, s(sub, True))
+
+    @R("RegDeleteKeyExA", "ppuu", dlls=_ADV)
+    def _rdkxa(c, h, sub, sam, res):
+        return delete_key(h, s(sub, False))
+
+    @R("RegDeleteKeyExW", "ppuu", dlls=_ADV)
+    def _rdkxw(c, h, sub, sam, res):
+        return delete_key(h, s(sub, True))
+
+    @R("RegDeleteTreeA SHDeleteKeyA", "pp", dlls=_ADV + ("shlwapi.dll",))
+    def _rdta(c, h, sub):
+        return delete_key(h, s(sub, False), tree=True)
+
+    @R("RegDeleteTreeW SHDeleteKeyW", "pp", dlls=_ADV + ("shlwapi.dll",))
+    def _rdtw(c, h, sub):
+        return delete_key(h, s(sub, True), tree=True)
+
+    def enum_key(h, i, name, pcch, pcls, pccls, pft, wide, cch=None):
+        base = hkey(h)
+        if base is None:
+            return ERROR_INVALID_HANDLE
+        ent = entry(*base)
+        if ent is None:
+            return ERROR_FILE_NOT_FOUND
+        keys = sorted(ent["sub"].keys(), key=str.upper)
+        if i >= len(keys):
+            return 259                              # ERROR_NO_MORE_ITEMS
+        nm = keys[i]
+        cap = cch if cch is not None else M_.read32(pcch)
+        if len(nm) + 1 > cap:
+            return 234
+        k.put(name, cap, nm, wide)
+        if pcch:
+            M_.write32(pcch, len(nm))
+        if pccls:
+            M_.write32(pccls, 0)
+        if pcls and pccls is None:
+            pass
+        if pft:
+            M_.write64(pft, _ft_from_unix(time.time()))
+        return 0
+
+    @R("RegEnumKeyExA", "pupppppp", dlls=_ADV)
+    def _rekxa(c, h, i, name, pcch, res, cls, pccls, pft):
+        return enum_key(h, i, name, pcch, cls, pccls, pft, False)
+
+    @R("RegEnumKeyExW", "pupppppp", dlls=_ADV)
+    def _rekxw(c, h, i, name, pcch, res, cls, pccls, pft):
+        return enum_key(h, i, name, pcch, cls, pccls, pft, True)
+
+    @R("RegEnumKeyA", "pupu", dlls=_ADV)
+    def _reka(c, h, i, name, cch):
+        return enum_key(h, i, name, 0, 0, 0, 0, False, cch)
+
+    @R("RegEnumKeyW", "pupu", dlls=_ADV)
+    def _rekw(c, h, i, name, cch):
+        return enum_key(h, i, name, 0, 0, 0, 0, True, cch)
+
+    def enum_value(h, i, name, pcch, ptype, data, pcb, wide):
+        base = hkey(h)
+        if base is None:
+            return ERROR_INVALID_HANDLE
+        ent = entry(*base)
+        if ent is None:
+            return ERROR_FILE_NOT_FOUND
+        vals = list(ent["values"].items())
+        if i >= len(vals):
+            return 259
+        nm, (vtype, val) = vals[i]
+        cap = M_.read32(pcch)
+        if len(nm) + 1 > cap:
+            return 234
+        k.put(name, cap, nm, wide)
+        M_.write32(pcch, len(nm))
+        raw = to_raw(vtype, val, wide)
+        if ptype:
+            M_.write32(ptype, _REG_N.get(vtype, 3))
+        if pcb:
+            have = M_.read32(pcb)
+            M_.write32(pcb, len(raw))
+            if data:
+                if have < len(raw):
+                    return 234
+                M_.write(data, raw)
+        return 0
+
+    @R("RegEnumValueA", "pupppppp", dlls=_ADV)
+    def _reva(c, h, i, name, pcch, res, ptype, data, pcb):
+        return enum_value(h, i, name, pcch, ptype, data, pcb, False)
+
+    @R("RegEnumValueW", "pupppppp", dlls=_ADV)
+    def _revw(c, h, i, name, pcch, res, ptype, data, pcb):
+        return enum_value(h, i, name, pcch, ptype, data, pcb, True)
+
+    def query_info(h, psub, pmaxsub, pvals, pmaxname, pmaxdata, pft, wide):
+        base = hkey(h)
+        if base is None:
+            return ERROR_INVALID_HANDLE
+        ent = entry(*base)
+        if ent is None:
+            return ERROR_FILE_NOT_FOUND
+        subs = list(ent["sub"].keys())
+        vals = list(ent["values"].items())
+        for ptr, v in ((psub, len(subs)), (pmaxsub, max((len(x) for x in subs), default=0)),
+                       (pvals, len(vals)), (pmaxname, max((len(x) for x, _ in vals), default=0)),
+                       (pmaxdata, max((len(to_raw(t, d, wide)) for _, (t, d) in vals), default=0))):
+            if ptr:
+                M_.write32(ptr, v)
+        if pft:
+            M_.write64(pft, _ft_from_unix(time.time()))
+        return 0
+
+    @R("RegQueryInfoKeyA", "pppppppppppp", dlls=_ADV)
+    def _rqika(c, h, cls, pcls, res, psub, pmaxsub, pmaxcls, pvals, pmaxname, pmaxdata, psd, pft):
+        if pcls:
+            M_.write32(pcls, 0)
+        if pmaxcls:
+            M_.write32(pmaxcls, 0)
+        if psd:
+            M_.write32(psd, 0)
+        return query_info(h, psub, pmaxsub, pvals, pmaxname, pmaxdata, pft, False)
+
+    @R("RegQueryInfoKeyW", "pppppppppppp", dlls=_ADV)
+    def _rqikw(c, h, cls, pcls, res, psub, pmaxsub, pmaxcls, pvals, pmaxname, pmaxdata, psd, pft):
+        if pcls:
+            M_.write32(pcls, 0)
+        if pmaxcls:
+            M_.write32(pmaxcls, 0)
+        if psd:
+            M_.write32(psd, 0)
+        return query_info(h, psub, pmaxsub, pvals, pmaxname, pmaxdata, pft, True)
+
+    # shlwapi SHGetValue / SHSetValue / SHRegGetValue (thin wrappers) ----------------------
+    SHLW = ("shlwapi.dll",)
+
+    @R("SHGetValueA", "pppppp", dlls=SHLW)
+    def _shgva(c, h, sub, name, ptype, data, pcb):
+        return query(h, s(sub, False), s(name, False), ptype, data, pcb, False)
+
+    @R("SHGetValueW", "pppppp", dlls=SHLW)
+    def _shgvw(c, h, sub, name, ptype, data, pcb):
+        return query(h, s(sub, True), s(name, True), ptype, data, pcb, True)
+
+    @R("SHSetValueA", "pppupu", dlls=SHLW)
+    def _shsva(c, h, sub, name, t, data, n):
+        return set_value(h, s(sub, False), s(name, False), t, data, n, False)
+
+    @R("SHSetValueW", "pppupu", dlls=SHLW)
+    def _shsvw(c, h, sub, name, t, data, n):
+        return set_value(h, s(sub, True), s(name, True), t, data, n, True)
+
+    @R("SHDeleteValueA", "ppp", dlls=SHLW)
+    def _shdva(c, h, sub, name):
+        return delete_value(h, s(sub, False), s(name, False))
+
+    @R("SHDeleteValueW", "ppp", dlls=SHLW)
+    def _shdvw(c, h, sub, name):
+        return delete_value(h, s(sub, True), s(name, True))
+
+    # ---------------------------------------------------------------------------
+    # users, tokens, SIDs, privileges
+    # ---------------------------------------------------------------------------
+    def put_n(buf, pcch, text, wide):
+        """Win32 in/out char count convention (count includes NUL on input)."""
+        cap = M_.read32(pcch) if pcch else 0
+        need = len(text) + 1
+        if cap < need or not buf:
+            if pcch:
+                M_.write32(pcch, need)
+            return k.err(ERROR_INSUFFICIENT_BUFFER)
+        k.put(buf, cap, text, wide)
+        M_.write32(pcch, need)
+        return 1
+
+    @R("GetUserNameA", "pp", dlls=_ADV)
+    def _guna(c, buf, pcch):
+        return put_n(buf, pcch, p.env.get("USERNAME", "NOO"), False)
+
+    @R("GetUserNameW", "pp", dlls=_ADV)
+    def _gunw(c, buf, pcch):
+        return put_n(buf, pcch, p.env.get("USERNAME", "NOO"), True)
+
+    @R("GetUserNameExA", "upp", dlls=("secur32.dll", "sspicli.dll"))
+    def _gunxa(c, fmt, buf, pcch):
+        name = p.env.get("USERNAME", "NOO")
+        return put_n(buf, pcch, "NOO-PC\\" + name if fmt == 2 else name, False)
+
+    @R("GetUserNameExW", "upp", dlls=("secur32.dll", "sspicli.dll"))
+    def _gunxw(c, fmt, buf, pcch):
+        name = p.env.get("USERNAME", "NOO")
+        return put_n(buf, pcch, "NOO-PC\\" + name if fmt == 2 else name, True)
+
+    def new_sid(text):
+        b = _sid_bytes(text)
+        a = p.heap_alloc(p.process_heap_handle, len(b))
+        M_.write(a, b)
+        return a
+
+    def read_sid(a):
+        n = M_.read8(a + 1)
+        return M_.read(a, 8 + 4 * n)
+
+    def sid_text(a):
+        try:
+            return _sid_str(read_sid(a))
+        except Exception:
+            return ""
+
+    @R("OpenProcessToken", "pup", dlls=_ADV)
+    def _opt(c, proc, acc, out):
+        k.wptr(out, p.handles.add({"kind": "primary"}, "token"))
+        return 1
+
+    @R("OpenThreadToken", "puip", dlls=_ADV)
+    def _ott(c, th, acc, self_, out):
+        return k.err(1008)                          # ERROR_NO_TOKEN (not impersonating)
+
+    @R("OpenProcessTokenEx GetCurrentProcessToken", "", "p", dlls=_ADV)
+    def _gcpt(c):
+        return M64 - 3                              # pseudo handle (-4)
+
+    @R("DuplicateToken", "pup", dlls=_ADV)
+    def _dupt(c, h, lvl, out):
+        k.wptr(out, p.handles.add({"kind": "impersonation"}, "token"))
+        return 1
+
+    @R("DuplicateTokenEx", "pupuup", dlls=_ADV)
+    def _duptx(c, h, acc, sa, lvl, typ, out):
+        k.wptr(out, p.handles.add({"kind": "primary" if typ == 1 else "impersonation"}, "token"))
+        return 1
+
+    @R("ImpersonateSelf", "u", dlls=_ADV)
+    def _imps(c, lvl):
+        return 1
+
+    @R("RevertToSelf", "", dlls=_ADV)
+    def _rts(c):
+        return 1
+
+    @R("ImpersonateLoggedOnUser SetThreadToken", "pp", dlls=_ADV)
+    def _ilou(c, a, b_):
+        return 1
+
+    @R("ImpersonateAnonymousToken", "p", dlls=_ADV)
+    def _iat(c, h):
+        return 1
+
+    @R("LogonUserA LogonUserW", "pppuup", dlls=_ADV)
+    def _logon(c, u, d, pw, t, prov, out):
+        return k.err(1326)                          # ERROR_LOGON_FAILURE
+
+    @R("CreateProcessAsUserA CreateProcessAsUserW CreateProcessWithLogonW "
+       "CreateProcessWithTokenW", "ppppiupppp", dlls=_ADV)
+    def _cpau(c, *a):
+        return k.err(ERROR_ACCESS_DENIED)
+
+    def token_info(cls):
+        ps = k.ptr_size()
+        if cls == 1:                                # TokenUser
+            sid = _sid_bytes(_SID_USER)
+            hdr = 2 * ps
+            return lambda base: struct.pack("<QQ" if ps == 8 else "<II", base + hdr, 0) + sid
+        if cls == 2:                                # TokenGroups
+            groups = ["S-1-5-32-544", "S-1-5-32-545", "S-1-1-0", "S-1-5-11", "S-1-5-4",
+                      "S-1-16-12288"]
+            attrs = [0xF, 0xF, 0x7, 0x7, 0x7, 0x60]
+
+            def build(base):
+                hdr = ps + 2 * ps * len(groups)
+                off = base + hdr
+                head = struct.pack("<Q" if ps == 8 else "<I", len(groups))
+                sids = b""
+                for gsid, at in zip(groups, attrs):
+                    sb = _sid_bytes(gsid)
+                    head += struct.pack("<QQ" if ps == 8 else "<II", off + len(sids), at)
+                    sids += sb
+                return head + sids
+            return build
+        if cls == 3:                                # TokenPrivileges
+            privs = [(23, 3), (19, 0), (25, 0), (34, 0), (33, 0), (20, 0)]
+            return lambda base: struct.pack("<I", len(privs)) + b"".join(
+                struct.pack("<IiI", luid, 0, at) for luid, at in privs)
+        if cls in (4, 5):                           # TokenOwner / TokenPrimaryGroup
+            sid = _sid_bytes(_SID_USER if cls == 5 else "S-1-5-32-544")
+            return lambda base: struct.pack("<Q" if ps == 8 else "<I", base + ps) + sid
+        if cls == 6:                                # TokenDefaultDacl
+            return lambda base: struct.pack("<Q" if ps == 8 else "<I", 0)
+        if cls == 7:                                # TokenSource
+            return lambda base: b"User32  " + struct.pack("<Ii", 0x3E7, 0)
+        if cls == 8:                                # TokenType
+            return lambda base: struct.pack("<I", 1)
+        if cls == 9:                                # TokenImpersonationLevel
+            return lambda base: struct.pack("<I", 2)
+        if cls == 10:                               # TokenStatistics
+            return lambda base: struct.pack("<IiIiqqIIIIIiI", 0x1234, 0, 0x3E7, 0, 0x7FFFFFFFFFFFFFFF,
+                                            0, 1, 0, 6, 6, 0, 0x3E7, 0)[:56].ljust(56, b"\0")
+        if cls == 12:                               # TokenSessionId
+            return lambda base: struct.pack("<I", 1)
+        if cls == 18:                               # TokenElevationType
+            return lambda base: struct.pack("<I", 1)
+        if cls == 19:                               # TokenLinkedToken
+            return None
+        if cls == 20:                               # TokenElevation
+            return lambda base: struct.pack("<I", 1)
+        if cls in (21, 22, 26, 29, 33):            # HasRestrictions/AccessInfo/UIAccess/AppContainer
+            return lambda base: struct.pack("<I", 0)
+        if cls == 25:                               # TokenIntegrityLevel
+            sid = _sid_bytes("S-1-16-12288")
+            return lambda base: struct.pack("<QQ" if ps == 8 else "<II", base + 2 * ps, 0x60) + sid
+        if cls == 24:                               # TokenVirtualizationEnabled
+            return lambda base: struct.pack("<I", 0)
+        return None
+
+    @R("GetTokenInformation", "puppp", dlls=_ADV)
+    def _gti(c, h, cls, buf, n, pret):
+        b = token_info(cls)
+        if b is None:
+            return k.err(ERROR_INVALID_PARAMETER)
+        data = b(buf or 0)
+        if pret:
+            M_.write32(pret, len(data))
+        if not buf or n < len(data):
+            return k.err(ERROR_INSUFFICIENT_BUFFER)
+        M_.write(buf, b(buf))
+        return 1
+
+    @R("SetTokenInformation", "pupu", dlls=_ADV)
+    def _sti(c, h, cls, buf, n):
+        return 1
+
+    @R("AdjustTokenPrivileges", "pipupp", dlls=_ADV)
+    def _atp(c, h, disable, new, n, prev, pret):
+        if prev and n >= 4:
+            M_.write32(prev, 0)
+        if pret:
+            M_.write32(pret, 4)
+        p.last_error = 0
+        return 1
+
+    @R("PrivilegeCheck", "ppp", dlls=_ADV)
+    def _pcheck(c, h, privs, out):
+        M_.write32(out, 1)
+        return 1
+
+    @R("LookupPrivilegeValueA", "ppp", dlls=_ADV)
+    def _lpva(c, sysname, name, luid):
+        v = _PRIVS.get(k.cs_(name))
+        if v is None:
+            return k.err(1313)                      # ERROR_NO_SUCH_PRIVILEGE
+        M_.write(luid, struct.pack("<Ii", v, 0))
+        return 1
+
+    @R("LookupPrivilegeValueW", "ppp", dlls=_ADV)
+    def _lpvw(c, sysname, name, luid):
+        v = _PRIVS.get(k.ws_(name))
+        if v is None:
+            return k.err(1313)
+        M_.write(luid, struct.pack("<Ii", v, 0))
+        return 1
+
+    def lpn(luid, buf, pcch, wide):
+        v = M_.read32(luid)
+        for nm, val in _PRIVS.items():
+            if val == v:
+                cap = M_.read32(pcch)
+                if cap < len(nm) + 1:
+                    M_.write32(pcch, len(nm) + 1)
+                    return k.err(ERROR_INSUFFICIENT_BUFFER)
+                k.put(buf, cap, nm, wide)
+                M_.write32(pcch, len(nm))
+                return 1
+        return k.err(1313)
+
+    @R("LookupPrivilegeNameA", "pppp", dlls=_ADV)
+    def _lpna(c, sysname, luid, buf, pcch):
+        return lpn(luid, buf, pcch, False)
+
+    @R("LookupPrivilegeNameW", "pppp", dlls=_ADV)
+    def _lpnw(c, sysname, luid, buf, pcch):
+        return lpn(luid, buf, pcch, True)
+
+    @R("AllocateAndInitializeSid", "puuuuuuuuup", dlls=_ADV)
+    def _aais(c, pauth, n, s0, s1, s2, s3, s4, s5, s6, s7, out):
+        auth = M_.read(pauth, 6)
+        subs = [s0, s1, s2, s3, s4, s5, s6, s7][:min(n, 8)]
+        b = bytes([1, len(subs)]) + auth + b"".join(struct.pack("<I", x) for x in subs)
+        a = p.heap_alloc(p.process_heap_handle, len(b))
+        M_.write(a, b)
+        k.wptr(out, a)
+        return 1
+
+    @R("FreeSid", "p", "p", dlls=_ADV)
+    def _fsid(c, sid):
+        p.heap_free(p.process_heap_handle, sid)
+        return 0
+
+    @R("InitializeSid", "ppu", dlls=_ADV)
+    def _isid(c, sid, pauth, n):
+        M_.write(sid, bytes([1, n]) + M_.read(pauth, 6))
+        return 1
+
+    @R("GetSidLengthRequired", "u", dlls=_ADV)
+    def _gslr(c, n):
+        return 8 + 4 * (n & 0xFF)
+
+    @R("GetLengthSid RtlLengthSid", "p", dlls=_ADV + ("ntdll.dll",))
+    def _gls(c, sid):
+        return 8 + 4 * M_.read8(sid + 1)
+
+    @R("IsValidSid RtlValidSid", "p", dlls=_ADV + ("ntdll.dll",))
+    def _ivs(c, sid):
+        return 1 if sid and M_.read8(sid) == 1 and M_.read8(sid + 1) <= 15 else 0
+
+    @R("EqualSid RtlEqualSid EqualPrefixSid", "pp", dlls=_ADV + ("ntdll.dll",))
+    def _eqs(c, a, b_):
+        return 1 if read_sid(a) == read_sid(b_) else 0
+
+    @R("CopySid RtlCopySid", "upp", dlls=_ADV + ("ntdll.dll",))
+    def _cps(c, n, dst, src):
+        b = read_sid(src)
+        if n < len(b):
+            return k.err(ERROR_INSUFFICIENT_BUFFER)
+        M_.write(dst, b)
+        return 1
+
+    @R("GetSidSubAuthority", "pu", "p", dlls=_ADV)
+    def _gssa(c, sid, i):
+        return sid + 8 + 4 * i
+
+    @R("GetSidSubAuthorityCount", "p", "p", dlls=_ADV)
+    def _gssac(c, sid):
+        return sid + 1
+
+    @R("GetSidIdentifierAuthority", "p", "p", dlls=_ADV)
+    def _gsia2(c, sid):
+        return sid + 2
+
+    @R("IsWellKnownSid", "pu", dlls=_ADV)
+    def _iwks(c, sid, t):
+        known = {22: "S-1-5-18", 26: "S-1-5-32-544", 27: "S-1-5-32-545", 1: "S-1-1-0",
+                 17: "S-1-5-11", 9: "S-1-5-4"}
+        return 1 if known.get(t) == sid_text(sid) else 0
+
+    @R("CreateWellKnownSid", "uppp", dlls=_ADV)
+    def _cwks(c, t, dom, sid, pcb):
+        known = {22: "S-1-5-18", 26: "S-1-5-32-544", 27: "S-1-5-32-545", 1: "S-1-1-0",
+                 17: "S-1-5-11", 9: "S-1-5-4", 66: "S-1-16-12288", 65: "S-1-16-8192"}
+        txt = known.get(t)
+        if txt is None:
+            return k.err(ERROR_INVALID_PARAMETER)
+        b = _sid_bytes(txt)
+        have = M_.read32(pcb)
+        M_.write32(pcb, len(b))
+        if have < len(b):
+            return k.err(ERROR_INSUFFICIENT_BUFFER)
+        M_.write(sid, b)
+        return 1
+
+    @R("CheckTokenMembership", "ppp", dlls=_ADV)
+    def _ctm(c, tok, sid, out):
+        M_.write32(out, 1 if sid_text(sid) in _MEMBER_SIDS else 0)
+        return 1
+
+    def sid_to_str(sid, out, wide):
+        txt = sid_text(sid)
+        if not txt:
+            return k.err(1337)                      # ERROR_INVALID_SID
+        data = txt.encode("utf-16-le") + b"\0\0" if wide else txt.encode() + b"\0"
+        a = p.heap_alloc(p.process_heap_handle, len(data))
+        M_.write(a, data)
+        k.wptr(out, a)
+        return 1
+
+    @R("ConvertSidToStringSidA", "pp", dlls=_ADV)
+    def _csssa(c, sid, out):
+        return sid_to_str(sid, out, False)
+
+    @R("ConvertSidToStringSidW", "pp", dlls=_ADV)
+    def _csssw(c, sid, out):
+        return sid_to_str(sid, out, True)
+
+    def str_to_sid(txt, out):
+        alias = {"BA": "S-1-5-32-544", "BU": "S-1-5-32-545", "WD": "S-1-1-0", "SY": "S-1-5-18",
+                 "AU": "S-1-5-11", "IU": "S-1-5-4"}
+        txt = alias.get(txt.upper(), txt)
+        if not re.fullmatch(r"S-1-\d+(-\d+)*", txt, re.I):
+            return k.err(1337)
+        k.wptr(out, new_sid(txt.upper()))
+        return 1
+
+    @R("ConvertStringSidToSidA", "pp", dlls=_ADV)
+    def _cstsa(c, s_, out):
+        return str_to_sid(k.cs_(s_), out)
+
+    @R("ConvertStringSidToSidW", "pp", dlls=_ADV)
+    def _cstsw(c, s_, out):
+        return str_to_sid(k.ws_(s_), out)
+
+    def lookup_sid(sid, name, pcch, dom, pcchd, puse, wide):
+        txt = sid_text(sid)
+        nm, dn, use = _SID_NAMES.get(txt, (None, None, None))
+        if nm is None:
+            return k.err(1332)                      # ERROR_NONE_MAPPED
+        cap, capd = M_.read32(pcch), M_.read32(pcchd)
+        if cap < len(nm) + 1 or capd < len(dn) + 1 or not name or not dom:
+            M_.write32(pcch, len(nm) + 1)
+            M_.write32(pcchd, len(dn) + 1)
+            return k.err(ERROR_INSUFFICIENT_BUFFER)
+        k.put(name, cap, nm, wide)
+        k.put(dom, capd, dn, wide)
+        M_.write32(pcch, len(nm))
+        M_.write32(pcchd, len(dn))
+        if puse:
+            M_.write32(puse, use)
+        return 1
+
+    @R("LookupAccountSidA", "ppppppp", dlls=_ADV)
+    def _lasa(c, sysn, sid, name, pcch, dom, pcchd, puse):
+        return lookup_sid(sid, name, pcch, dom, pcchd, puse, False)
+
+    @R("LookupAccountSidW", "ppppppp", dlls=_ADV)
+    def _lasw(c, sysn, sid, name, pcch, dom, pcchd, puse):
+        return lookup_sid(sid, name, pcch, dom, pcchd, puse, True)
+
+    def lookup_name(acct, sid, pcb, dom, pcchd, puse, wide):
+        nm = acct.split("\\")[-1].lower()
+        txt = None
+        for t, (n_, d_, u_) in _SID_NAMES.items():
+            if n_.lower() == nm:
+                txt = t
+        if txt is None and nm == p.env.get("USERNAME", "NOO").lower():
+            txt = _SID_USER
+        if txt is None:
+            return k.err(1332)
+        b = _sid_bytes(txt)
+        n_, d_, u_ = _SID_NAMES[txt]
+        have, capd = M_.read32(pcb), M_.read32(pcchd)
+        M_.write32(pcb, len(b))
+        if have < len(b) or capd < len(d_) + 1 or not sid:
+            M_.write32(pcchd, len(d_) + 1)
+            return k.err(ERROR_INSUFFICIENT_BUFFER)
+        M_.write(sid, b)
+        k.put(dom, capd, d_, wide)
+        M_.write32(pcchd, len(d_))
+        if puse:
+            M_.write32(puse, u_)
+        return 1
+
+    @R("LookupAccountNameA", "ppppppp", dlls=_ADV)
+    def _lana(c, sysn, acct, sid, pcb, dom, pcchd, puse):
+        return lookup_name(k.cs_(acct), sid, pcb, dom, pcchd, puse, False)
+
+    @R("LookupAccountNameW", "ppppppp", dlls=_ADV)
+    def _lanw(c, sysn, acct, sid, pcb, dom, pcchd, puse):
+        return lookup_name(k.ws_(acct), sid, pcb, dom, pcchd, puse, True)
+
+    # security descriptors / ACLs (accepted, minimal) ------------------------------------
+    @R("InitializeSecurityDescriptor", "pu", dlls=_ADV)
+    def _isd(c, sd, rev):
+        M_.write(sd, bytes(5 * k.ptr_size() if k.ptr_size() == 8 else 20))
+        M_.write8(sd, 1)
+        return 1
+
+    @R("IsValidSecurityDescriptor", "p", dlls=_ADV)
+    def _ivsd(c, sd):
+        return 1
+
+    @R("GetSecurityDescriptorLength", "p", dlls=_ADV)
+    def _gsdl(c, sd):
+        return 20
+
+    @R("SetSecurityDescriptorDacl SetSecurityDescriptorSacl", "pipi", dlls=_ADV)
+    def _ssdd(c, sd, present, acl, dflt):
+        return 1
+
+    @R("SetSecurityDescriptorOwner SetSecurityDescriptorGroup", "ppi", dlls=_ADV)
+    def _ssdo(c, sd, sid, dflt):
+        return 1
+
+    @R("SetSecurityDescriptorControl", "puu", dlls=_ADV)
+    def _ssdc(c, sd, mask, bits):
+        return 1
+
+    @R("GetSecurityDescriptorDacl GetSecurityDescriptorSacl", "pppp", dlls=_ADV)
+    def _gsdd(c, sd, ppresent, pacl, pdflt):
+        M_.write32(ppresent, 0)
+        if pacl:
+            k.wptr(pacl, 0)
+        if pdflt:
+            M_.write32(pdflt, 0)
+        return 1
+
+    @R("GetSecurityDescriptorOwner GetSecurityDescriptorGroup", "ppp", dlls=_ADV)
+    def _gsdo(c, sd, psid, pdflt):
+        k.wptr(psid, new_sid(_SID_USER))
+        if pdflt:
+            M_.write32(pdflt, 0)
+        return 1
+
+    @R("InitializeAcl", "puu", dlls=_ADV)
+    def _iacl(c, acl, n, rev):
+        M_.write(acl, struct.pack("<BBHHH", rev or 2, 0, n, 0, 0))
+        return 1
+
+    @R("AddAccessAllowedAce AddAccessDeniedAce", "puup", dlls=_ADV)
+    def _aaa2(c, acl, rev, mask, sid):
+        return 1
+
+    @R("AddAccessAllowedAceEx AddAccessDeniedAceEx AddMandatoryAce", "puuup", dlls=_ADV)
+    def _aaax(c, acl, rev, flags, mask, sid):
+        return 1
+
+    @R("GetAce", "pup", dlls=_ADV)
+    def _gace(c, acl, i, out):
+        return k.err(ERROR_INVALID_PARAMETER)
+
+    @R("GetAclInformation", "ppuu", dlls=_ADV)
+    def _gaclinfo(c, acl, buf, n, cls):
+        M_.write(buf, bytes(n))
+        return 1
+
+    @R("SetEntriesInAclA SetEntriesInAclW", "uppp", dlls=_ADV)
+    def _seia(c, n, entries, old, out):
+        a = p.heap_alloc(p.process_heap_handle, 8)
+        M_.write(a, struct.pack("<BBHHH", 2, 0, 8, 0, 0))
+        k.wptr(out, a)
+        return 0
+
+    def fake_sd(psd):
+        if psd:
+            a = p.heap_alloc(p.process_heap_handle, 64)
+            M_.write(a, bytes(64))
+            M_.write8(a, 1)
+            k.wptr(psd, a)
+
+    @R("GetNamedSecurityInfoA GetNamedSecurityInfoW", "puuppppp", dlls=_ADV)
+    def _gnsi(c, name, typ, info, powner, pgroup, pdacl, psacl, psd):
+        if powner:
+            k.wptr(powner, new_sid(_SID_USER))
+        if pgroup:
+            k.wptr(pgroup, new_sid("S-1-5-32-545"))
+        for ptr in (pdacl, psacl):
+            if ptr:
+                k.wptr(ptr, 0)
+        fake_sd(psd)
+        return 0
+
+    @R("GetSecurityInfo", "puuppppp", dlls=_ADV)
+    def _gsi2(c, h, typ, info, powner, pgroup, pdacl, psacl, psd):
+        return _gnsi(c, 0, typ, info, powner, pgroup, pdacl, psacl, psd)
+
+    @R("SetNamedSecurityInfoA SetNamedSecurityInfoW SetSecurityInfo", "puupppp", dlls=_ADV)
+    def _snsi(c, *a):
+        return 0
+
+    @R("GetFileSecurityA GetFileSecurityW", "puppp", dlls=_ADV)
+    def _gfs2(c, name, info, sd, n, pneed):
+        M_.write32(pneed, 20)
+        if n < 20:
+            return k.err(ERROR_INSUFFICIENT_BUFFER)
+        M_.write(sd, bytes(20))
+        M_.write8(sd, 1)
+        return 1
+
+    @R("SetFileSecurityA SetFileSecurityW SetKernelObjectSecurity", "pup", dlls=_ADV)
+    def _sfs2(c, name, info, sd):
+        return 1
+
+    @R("ConvertStringSecurityDescriptorToSecurityDescriptorA "
+       "ConvertStringSecurityDescriptorToSecurityDescriptorW", "pupp", dlls=_ADV)
+    def _cssd(c, s_, rev, psd, plen):
+        fake_sd(psd)
+        if plen:
+            M_.write32(plen, 64)
+        return 1
+
+    @R("ConvertSecurityDescriptorToStringSecurityDescriptorA", "puupp", dlls=_ADV)
+    def _csdsa(c, sd, rev, info, pout, plen):
+        return sid_to_str_sd(pout, plen, False)
+
+    @R("ConvertSecurityDescriptorToStringSecurityDescriptorW", "puupp", dlls=_ADV)
+    def _csdsw(c, sd, rev, info, pout, plen):
+        return sid_to_str_sd(pout, plen, True)
+
+    def sid_to_str_sd(pout, plen, wide):
+        txt = "O:BAG:BAD:(A;;GA;;;WD)"
+        data = txt.encode("utf-16-le") + b"\0\0" if wide else txt.encode() + b"\0"
+        a = p.heap_alloc(p.process_heap_handle, len(data))
+        M_.write(a, data)
+        k.wptr(pout, a)
+        if plen:
+            M_.write32(plen, len(txt) + 1)
+        return 1
+
+    @R("AccessCheck", "pppppppp", dlls=_ADV)
+    def _achk(c, sd, tok, desired, mapping, privs, plen, pgranted, pstatus):
+        M_.write32(pgranted, desired)
+        M_.write32(pstatus, 1)
+        return 1
+
+    @R("MapGenericMask", "pp", "v", dlls=_ADV)
+    def _mgm(c, pmask, mapping):
+        m_ = M_.read32(pmask)
+        gr, gw, ge, ga = struct.unpack("<IIII", M_.read(mapping, 16))
+        out = m_ & 0x0FFFFFFF
+        if m_ & 0x80000000:
+            out |= gr
+        if m_ & 0x40000000:
+            out |= gw
+        if m_ & 0x20000000:
+            out |= ge
+        if m_ & 0x10000000:
+            out |= ga
+        M_.write32(pmask, out)
+
+    @R("GetCurrentHwProfileA", "p", dlls=_ADV)
+    def _gchpa(c, buf):
+        M_.write(buf, struct.pack("<I", 1) + b"{4e4f4f21-0000-0000-0000-000000000001}\0".ljust(39, b"\0")
+                 + b"NOO Profile".ljust(80, b"\0"))
+        return 1
+
+    @R("GetCurrentHwProfileW", "p", dlls=_ADV)
+    def _gchpw(c, buf):
+        M_.write(buf, struct.pack("<I", 1) +
+                 "{4e4f4f21-0000-0000-0000-000000000001}".encode("utf-16-le").ljust(78, b"\0") +
+                 "NOO Profile".encode("utf-16-le").ljust(160, b"\0"))
+        return 1
+
+    # ---------------------------------------------------------------------------
+    # crypto (random numbers + hashes through the host's hashlib)
+    # ---------------------------------------------------------------------------
+    import hashlib as _hl
+    _ALG = {0x8001: "md2", 0x8002: "md4", 0x8003: "md5", 0x8004: "sha1", 0x800C: "sha256",
+            0x800D: "sha384", 0x800E: "sha512"}
+
+    @R("CryptAcquireContextA CryptAcquireContextW", "pppuu", dlls=_ADV)
+    def _cac(c, out, cont, prov, typ, flags):
+        k.wptr(out, p.handles.add({"prov": typ}, "cryptprov"))
+        return 1
+
+    @R("CryptReleaseContext", "pu", dlls=_ADV)
+    def _crc(c, h, flags):
+        p.handles.close(h)
+        return 1
+
+    @R("CryptGenRandom", "pup", dlls=_ADV)
+    def _cgr(c, h, n, buf):
+        M_.write(buf, os.urandom(n))
+        return 1
+
+    @R("SystemFunction036", "pu", "i", dlls=_ADV)
+    def _rtlgenrandom(c, buf, n):
+        M_.write(buf, os.urandom(n))
+        return 1
+
+    @R("ProcessPrng", "pz", dlls=("bcryptprimitives.dll",))
+    def _pprng(c, buf, n):
+        M_.write(buf, os.urandom(n))
+        return 1
+
+    @R("BCryptGenRandom", "ppuu", dlls=("bcrypt.dll",))
+    def _bcgr(c, alg, buf, n, flags):
+        M_.write(buf, os.urandom(n))
+        return 0
+
+    @R("CryptCreateHash", "pupup", dlls=_ADV)
+    def _cch(c, prov, alg, key, flags, out):
+        name = _ALG.get(alg)
+        try:
+            obj = _hl.new(name) if name else None
+        except (ValueError, TypeError):
+            obj = None
+        if obj is None:
+            return k.err(0x80090008)                # NTE_BAD_ALGID
+        k.wptr(out, p.handles.add({"h": obj, "alg": alg}, "crypthash"))
+        return 1
+
+    @R("CryptHashData", "ppuu", dlls=_ADV)
+    def _chd(c, h, data, n, flags):
+        ent = p.handles.get(h, "crypthash")
+        if ent is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        ent["h"].update(M_.read(data, n) if n else b"")
+        return 1
+
+    @R("CryptGetHashParam", "puppu", dlls=_ADV)
+    def _cghp(c, h, param, buf, plen, flags):
+        ent = p.handles.get(h, "crypthash")
+        if ent is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        if param == 2:                              # HP_HASHVAL
+            data = ent["h"].copy().digest()
+        elif param == 4:                            # HP_HASHSIZE
+            data = struct.pack("<I", ent["h"].digest_size)
+        elif param == 1:                            # HP_ALGID
+            data = struct.pack("<I", ent["alg"])
+        else:
+            return k.err(0x80090015)
+        have = M_.read32(plen)
+        M_.write32(plen, len(data))
+        if not buf:
+            return 1
+        if have < len(data):
+            return k.err(234)
+        M_.write(buf, data)
+        return 1
+
+    @R("CryptDestroyHash CryptDestroyKey", "p", dlls=_ADV)
+    def _cdh(c, h):
+        p.handles.close(h)
+        return 1
+
+    @R("CryptDuplicateHash", "pppp", dlls=_ADV)
+    def _cdph(c, h, res, flags, out):
+        ent = p.handles.get(h, "crypthash")
+        if ent is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        k.wptr(out, p.handles.add({"h": ent["h"].copy(), "alg": ent["alg"]}, "crypthash"))
+        return 1
+
+    # ---------------------------------------------------------------------------
+    # event log / ETW / services (accepted, logged)
+    # ---------------------------------------------------------------------------
+    @R("RegisterEventSourceA RegisterEventSourceW OpenEventLogA OpenEventLogW", "pp", "p",
+       dlls=_ADV)
+    def _res(c, srv, name):
+        return p.handles.add({}, "eventlog")
+
+    @R("DeregisterEventSource CloseEventLog", "p", dlls=_ADV)
+    def _des(c, h):
+        p.handles.close(h)
+        return 1
+
+    @R("ReportEventA", "puuuupuup", dlls=_ADV)
+    def _repa(c, h, typ, cat, eid, sid, n, size, strs, raw):
+        texts = [k.cs_(M_.read64(strs + 8 * i) if k.ptr_size() == 8 else M_.read32(strs + 4 * i))
+                 for i in range(min(n, 16))] if strs else []
+        p.log.info("[eventlog] %d: %s" % (eid & 0xFFFF, " | ".join(texts)))
+        return 1
+
+    @R("ReportEventW", "puuuupuup", dlls=_ADV)
+    def _repw(c, h, typ, cat, eid, sid, n, size, strs, raw):
+        texts = [k.ws_(M_.read64(strs + 8 * i) if k.ptr_size() == 8 else M_.read32(strs + 4 * i))
+                 for i in range(min(n, 16))] if strs else []
+        p.log.info("[eventlog] %d: %s" % (eid & 0xFFFF, " | ".join(texts)))
+        return 1
+
+    ETW = _ADV + ("ntdll.dll",)
+
+    @R("EventRegister EtwEventRegister", "pppp", dlls=ETW)
+    def _evreg(c, guid, cb, ctx, out):
+        if out:
+            M_.write64(out, 0x4E4F4F0000000000 | (len(p.__dict__.setdefault("_etw", [])) + 1))
+        p._etw.append(guid)
+        return 0
+
+    @R("EventUnregister EtwEventUnregister", "Q", dlls=ETW)
+    def _evunreg(c, h):
+        return 0
+
+    @R("EventEnabled EtwEventEnabled EventProviderEnabled EtwEventProviderEnabled",
+       "Qp", dlls=ETW)
+    def _evenabled(c, h, desc):
+        return 0
+
+    @R("EventWrite EventWriteTransfer EventWriteEx EtwEventWrite EtwEventWriteTransfer "
+       "EventWriteString EtwEventWriteString", "Qpup", dlls=ETW)
+    def _evwrite(c, h, desc, n, data):
+        return 0
+
+    @R("EventSetInformation EtwEventSetInformation", "Qupu", dlls=ETW)
+    def _evsetinfo(c, h, cls, info, n):
+        return 0
+
+    @R("EventActivityIdControl EtwEventActivityIdControl", "up", dlls=ETW)
+    def _evaic(c, code, guid):
+        return 0
+
+    @R("RegisterTraceGuidsA RegisterTraceGuidsW", "pppupppp", dlls=ETW)
+    def _rtg(c, *a):
+        return 0
+
+    @R("UnregisterTraceGuids", "Q", dlls=ETW)
+    def _urtg(c, h):
+        return 0
+
+    @R("TraceEvent", "Qp", dlls=ETW)
+    def _tev(c, h, ev):
+        return 0
+
+    @R("TraceMessage", "Qupu.", dlls=ETW)
+    def _tmsg(c, h, flags, guid, num, va):
+        return 0
+
+    @R("OpenSCManagerA OpenSCManagerW OpenServiceA OpenServiceW", "ppu", "p", dlls=_ADV)
+    def _oscm(c, a, b_, acc):
+        return k.err(ERROR_ACCESS_DENIED)
+
+    @R("CreateServiceA CreateServiceW", "pppuuuupppppp", "p", dlls=_ADV)
+    def _csvc(c, *a):
+        return k.err(ERROR_ACCESS_DENIED)
+
+    @R("CloseServiceHandle", "p", dlls=_ADV)
+    def _csh2(c, h):
+        return 1
+
+    @R("StartServiceCtrlDispatcherA StartServiceCtrlDispatcherW", "p", dlls=_ADV)
+    def _sscd(c, t):
+        return k.err(1063)                          # ERROR_FAILED_SERVICE_CONTROLLER_CONNECT
+
+    @R("IsTextUnicode", "pip", dlls=_ADV)
+    def _itu(c, buf, n, pres):
+        data = M_.read(buf, max(0, min(n, 1 << 16)))
+        uni = len(data) >= 2 and (data[:2] == b"\xff\xfe" or
+                                  (sum(1 for b_ in data[1::2] if b_ == 0) > len(data) // 4))
+        if pres:
+            M_.write32(pres, 1 if uni else 0)
+        return 1 if uni else 0
+
+
+# ==============================================================================
+# 10g. oleaut32: BSTR, VARIANT, SAFEARRAY (OLE Automation core)
+# ==============================================================================
+
+_OA = ("oleaut32.dll",)
+_OLE = ("ole32.dll", "combase.dll", "propsys.dll")
+VT_EMPTY, VT_NULL, VT_I2, VT_I4, VT_R4, VT_R8, VT_CY, VT_DATE, VT_BSTR, VT_DISPATCH, \
+    VT_ERROR, VT_BOOL, VT_VARIANT, VT_UNKNOWN, VT_DECIMAL = range(15)
+VT_I1, VT_UI1, VT_UI2, VT_UI4, VT_I8, VT_UI8, VT_INT, VT_UINT = range(16, 24)
+VT_LPSTR, VT_LPWSTR, VT_FILETIME, VT_CLSID = 30, 31, 64, 72
+VT_ARRAY, VT_BYREF, VT_VECTOR = 0x2000, 0x4000, 0x1000
+DISP_E_TYPEMISMATCH, DISP_E_OVERFLOW, DISP_E_BADVARTYPE = 0x80020005, 0x8002000A, 0x80020008
+E_INVALIDARG, E_OUTOFMEMORY = 0x80070057, 0x8007000E
+_VT_INT = {VT_I1: (8, True), VT_UI1: (8, False), VT_I2: (16, True), VT_UI2: (16, False),
+           VT_I4: (32, True), VT_UI4: (32, False), VT_INT: (32, True), VT_UINT: (32, False),
+           VT_I8: (64, True), VT_UI8: (64, False), VT_ERROR: (32, False)}
+_VT_SIZE = {VT_I1: 1, VT_UI1: 1, VT_I2: 2, VT_UI2: 2, VT_I4: 4, VT_UI4: 4, VT_INT: 4, VT_UINT: 4,
+            VT_I8: 8, VT_UI8: 8, VT_R4: 4, VT_R8: 8, VT_CY: 8, VT_DATE: 8, VT_BOOL: 2,
+            VT_ERROR: 4}
+
+
+def _oa_install(k):
+    R = k.reg
+    p = k.p
+    M_ = p.mem
+    ps = lambda: k.ptr_size()
+    vsize = lambda: 24 if ps() == 8 else 16
+
+    # -- BSTR ---------------------------------------------------------------------------
+    def bstr_alloc(data):
+        """data: UTF-16LE bytes (any length) -> BSTR pointer."""
+        base = p.heap_alloc(p.process_heap_handle, 4 + len(data) + 2)
+        if not base:
+            return 0
+        M_.write32(base, len(data))
+        M_.write(base + 4, data + b"\0\0")
+        return base + 4
+
+    def bstr_text(b):
+        if not b:
+            return ""
+        n = M_.read32(b - 4)
+        return M_.read(b, n).decode("utf-16-le", "replace")
+
+    def bstr_free(b):
+        if b:
+            p.heap_free(p.process_heap_handle, b - 4)
+
+    k.bstr_alloc = bstr_alloc
+    k.bstr_text = bstr_text
+
+    @R("SysAllocString", "p", "p", dlls=_OA)
+    def _sas(c, src):
+        if not src:
+            return 0
+        return bstr_alloc(M_.read_wstring(src, 1 << 29))
+
+    @R("SysAllocStringLen", "pu", "p", dlls=_OA)
+    def _sasl(c, src, n):
+        return bstr_alloc(M_.read(src, 2 * n) if src else bytes(2 * n))
+
+    @R("SysAllocStringByteLen", "pu", "p", dlls=_OA)
+    def _sasbl(c, src, n):
+        return bstr_alloc(M_.read(src, n) if src else bytes(n))
+
+    @R("SysReAllocString", "pp", dlls=_OA)
+    def _sras(c, pb, src):
+        new = bstr_alloc(M_.read_wstring(src, 1 << 29) if src else b"")
+        bstr_free(k.p.mem.read64(pb) if ps() == 8 else M_.read32(pb))
+        k.wptr(pb, new)
+        return 1 if new else 0
+
+    @R("SysReAllocStringLen", "ppu", dlls=_OA)
+    def _srasl(c, pb, src, n):
+        new = bstr_alloc(M_.read(src, 2 * n) if src else bytes(2 * n))
+        bstr_free(M_.read64(pb) if ps() == 8 else M_.read32(pb))
+        k.wptr(pb, new)
+        return 1 if new else 0
+
+    @R("SysFreeString", "p", "v", dlls=_OA)
+    def _sfs(c, b):
+        bstr_free(b)
+
+    @R("SysStringLen", "p", dlls=_OA)
+    def _ssl(c, b):
+        return M_.read32(b - 4) // 2 if b else 0
+
+    @R("SysStringByteLen", "p", dlls=_OA)
+    def _ssbl(c, b):
+        return M_.read32(b - 4) if b else 0
+
+    @R("SysAddRefString", "p", dlls=_OA)
+    def _sars(c, b):
+        return 0
+
+    @R("SysReleaseString", "p", "v", dlls=_OA)
+    def _srls(c, b):
+        return None
+
+    # -- VARIANT --------------------------------------------------------------------------
+    def vread(v):
+        """-> (vt, python value)."""
+        vt = M_.read16(v)
+        d = v + 8
+        base = vt & 0xFFF
+        if vt & (VT_BYREF | VT_ARRAY | VT_VECTOR):
+            return vt, M_.read64(d) if ps() == 8 else M_.read32(d)
+        if base in _VT_INT:
+            bits, signed = _VT_INT[base]
+            raw = int.from_bytes(M_.read(d, bits // 8), "little")
+            if signed and raw >> (bits - 1):
+                raw -= 1 << bits
+            return vt, raw
+        if base == VT_R4:
+            return vt, _f32(M_.read32(d))
+        if base in (VT_R8, VT_DATE):
+            return vt, _f64(M_.read64(d))
+        if base == VT_CY:
+            return vt, _s64(M_.read64(d)) / 10000.0
+        if base == VT_BOOL:
+            return vt, 1 if M_.read16(d) else 0
+        if base == VT_BSTR:
+            return vt, M_.read64(d) if ps() == 8 else M_.read32(d)
+        if base in (VT_DISPATCH, VT_UNKNOWN, VT_LPSTR, VT_LPWSTR):
+            return vt, M_.read64(d) if ps() == 8 else M_.read32(d)
+        if base == VT_FILETIME:
+            return vt, M_.read64(d)
+        return vt, None
+
+    def vwrite(v, vt, val):
+        M_.write(v, bytes(vsize()))
+        M_.write16(v, vt)
+        d = v + 8
+        base = vt & 0xFFF
+        if base in _VT_INT:
+            bits, _s = _VT_INT[base]
+            M_.write(d, (int(val) & ((1 << bits) - 1)).to_bytes(bits // 8, "little"))
+        elif base == VT_R4:
+            M_.write32(d, _b32(float(val)))
+        elif base in (VT_R8, VT_DATE):
+            M_.write64(d, _b64(float(val)))
+        elif base == VT_CY:
+            M_.write64(d, int(round(float(val) * 10000)) & M64)
+        elif base == VT_BOOL:
+            M_.write16(d, 0xFFFF if val else 0)
+        elif base in (VT_BSTR, VT_DISPATCH, VT_UNKNOWN, VT_LPSTR, VT_LPWSTR):
+            k.wptr(d, val or 0)
+        elif base == VT_FILETIME:
+            M_.write64(d, val or 0)
+
+    def com_call(obj, slot):
+        if not obj:
+            return 0
+        vtbl = M_.read64(obj) if ps() == 8 else M_.read32(obj)
+        fn = M_.read64(vtbl + 8 * slot) if ps() == 8 else M_.read32(vtbl + 4 * slot)
+        try:
+            return p.call_guest(fn, [obj])
+        except (NOOCPUFault, NOOInternalError):
+            return 0
+
+    def vclear(v):
+        vt = M_.read16(v)
+        d = v + 8
+        ptr = M_.read64(d) if ps() == 8 else M_.read32(d)
+        if not vt & VT_BYREF:
+            if vt & VT_ARRAY:
+                sa_destroy(ptr)
+            elif vt == VT_BSTR:
+                bstr_free(ptr)
+            elif vt in (VT_DISPATCH, VT_UNKNOWN):
+                com_call(ptr, 2)                        # Release
+            elif vt in (VT_LPSTR, VT_LPWSTR) and ptr:
+                p.heap_free(p.process_heap_handle, ptr)
+        M_.write(v, bytes(vsize()))
+
+    @R("VariantInit", "p", "v", dlls=_OA)
+    def _vi(c, v):
+        M_.write(v, bytes(vsize()))
+
+    @R("VariantClear", "p", dlls=_OA)
+    def _vc(c, v):
+        if v:
+            vclear(v)
+        return 0
+
+    def vcopy(dst, src):
+        if dst != src:
+            vclear(dst)
+        vt = M_.read16(src)
+        raw = M_.read(src, vsize())
+        M_.write(dst, raw)
+        d = dst + 8
+        if vt & VT_BYREF:
+            return 0
+        if vt & VT_ARRAY:
+            k.wptr(d, sa_copy(M_.read64(src + 8) if ps() == 8 else M_.read32(src + 8)))
+        elif vt == VT_BSTR:
+            b = M_.read64(src + 8) if ps() == 8 else M_.read32(src + 8)
+            if b:
+                k.wptr(d, bstr_alloc(M_.read(b, M_.read32(b - 4))))
+        elif vt in (VT_DISPATCH, VT_UNKNOWN):
+            com_call(M_.read64(src + 8) if ps() == 8 else M_.read32(src + 8), 1)   # AddRef
+        return 0
+
+    @R("VariantCopy", "pp", dlls=_OA)
+    def _vcopy(c, dst, src):
+        return vcopy(dst, src)
+
+    @R("VariantCopyInd", "pp", dlls=_OA)
+    def _vcopyind(c, dst, src):
+        vt = M_.read16(src)
+        if not vt & VT_BYREF:
+            return vcopy(dst, src)
+        ref = M_.read64(src + 8) if ps() == 8 else M_.read32(src + 8)
+        base = vt & ~VT_BYREF
+        if base == VT_VARIANT:
+            return vcopy(dst, ref)
+        tmp = bytearray(vsize())
+        struct.pack_into("<H", tmp, 0, base)
+        n = _VT_SIZE.get(base & 0xFFF, ps())
+        tmp[8:8 + n] = M_.read(ref, n)
+        scratch = p.heap_alloc(p.process_heap_handle, vsize())
+        M_.write(scratch, bytes(tmp))
+        r = vcopy(dst, scratch)
+        p.heap_free(p.process_heap_handle, scratch)
+        return r
+
+    def to_text(vt, val):
+        base = vt & 0xFFF
+        if base == VT_BSTR:
+            return bstr_text(val)
+        if base == VT_BOOL:
+            return "True" if val else "False"
+        if base in (VT_R4, VT_R8, VT_CY):
+            f = float(val)
+            return ("%d" % f) if f == int(f) and abs(f) < 1e15 else repr(f)
+        if base == VT_DATE:
+            return repr(float(val))
+        if base in (VT_EMPTY,):
+            return ""
+        return str(val)
+
+    def change_type(dst, src, target):
+        vt, val = vread(src)
+        base = vt & 0xFFF
+        if vt & (VT_BYREF | VT_ARRAY) or target & (VT_BYREF | VT_ARRAY):
+            if vt == target:
+                return vcopy(dst, src)
+            return DISP_E_TYPEMISMATCH
+        if base == target:
+            return vcopy(dst, src)
+        if base == VT_NULL and target != VT_BSTR:
+            return DISP_E_TYPEMISMATCH
+        if base == VT_EMPTY:
+            num = 0
+        elif base == VT_BSTR:
+            txt = bstr_text(val).strip()
+            if target == VT_BSTR:
+                num = None
+            else:
+                low = txt.lower()
+                if low in ("true", "#true#"):
+                    num = -1
+                elif low in ("false", "#false#"):
+                    num = 0
+                else:
+                    try:
+                        num = int(txt, 0) if re.fullmatch(r"[+-]?(0x)?[0-9a-fA-F]+", txt) and \
+                            not re.fullmatch(r"[+-]?\d*\.\d*", txt) else float(txt)
+                    except ValueError:
+                        return DISP_E_TYPEMISMATCH
+        elif base in (VT_DISPATCH, VT_UNKNOWN):
+            return DISP_E_TYPEMISMATCH
+        else:
+            num = val
+        if target == VT_BSTR:
+            b = bstr_alloc(to_text(vt, val).encode("utf-16-le"))
+            vclear(dst) if dst != src else None
+            vwrite(dst, VT_BSTR, b)
+            return 0
+        if target == VT_BOOL:
+            res = 1 if num else 0
+        elif target in _VT_INT:
+            bits, signed = _VT_INT[target]
+            iv = int(round(num)) if isinstance(num, float) else int(num)
+            if base == VT_BOOL:
+                iv = -1 if num else 0
+            lo, hi = (-(1 << (bits - 1)), (1 << (bits - 1)) - 1) if signed else (0, (1 << bits) - 1)
+            if not lo <= iv <= hi:
+                return DISP_E_OVERFLOW
+            res = iv
+        elif target in (VT_R4, VT_R8, VT_DATE, VT_CY):
+            res = float(-1 if base == VT_BOOL and num else num)
+        elif target == VT_EMPTY:
+            res = 0
+        else:
+            return DISP_E_TYPEMISMATCH
+        if dst != src:
+            vclear(dst)
+        vwrite(dst, target, res)
+        return 0
+
+    @R("VariantChangeType", "ppuu", dlls=_OA)
+    def _vct(c, dst, src, flags, vt):
+        return change_type(dst, src, vt & 0xFFFF)
+
+    @R("VariantChangeTypeEx", "ppuuu", dlls=_OA)
+    def _vctx(c, dst, src, lcid, flags, vt):
+        return change_type(dst, src, vt & 0xFFFF)
+
+    @R("VarBstrCat", "ppp", dlls=_OA)
+    def _vbc(c, a, b_, out):
+        k.wptr(out, bstr_alloc((M_.read(a, M_.read32(a - 4)) if a else b"") +
+                               (M_.read(b_, M_.read32(b_ - 4)) if b_ else b"")))
+        return 0
+
+    @R("VarBstrCmp", "ppuu", dlls=_OA)
+    def _vbcmp(c, a, b_, lcid, flags):
+        x, y = bstr_text(a), bstr_text(b_)
+        if flags & 1:                                   # NORM_IGNORECASE
+            x, y = x.lower(), y.lower()
+        return 1 if x == y else (0 if x < y else 2)     # VARCMP_LT/EQ/GT
+
+    def num_from_str(src, out, target):
+        tmp = p.heap_alloc(p.process_heap_handle, vsize())
+        vwrite(tmp, VT_BSTR, bstr_alloc(M_.read_wstring(src, 1 << 20)))
+        dst = p.heap_alloc(p.process_heap_handle, vsize())
+        M_.write(dst, bytes(vsize()))
+        r = change_type(dst, tmp, target)
+        if r == 0:
+            n = _VT_SIZE.get(target, 8)
+            M_.write(out, M_.read(dst + 8, n))
+        vclear(tmp)
+        p.heap_free(p.process_heap_handle, tmp)
+        p.heap_free(p.process_heap_handle, dst)
+        return r
+
+    for nm, vt in (("VarI4FromStr", VT_I4), ("VarI2FromStr", VT_I2), ("VarR8FromStr", VT_R8),
+                   ("VarR4FromStr", VT_R4), ("VarUI4FromStr", VT_UI4), ("VarI8FromStr", VT_I8),
+                   ("VarBoolFromStr", VT_BOOL), ("VarDateFromStr", VT_DATE)):
+        R(nm, "puup", dlls=_OA)(lambda c, s_, lcid, fl, out, _vt=vt: num_from_str(s_, out, _vt))
+
+    def bstr_from(val_txt, out):
+        k.wptr(out, bstr_alloc(val_txt.encode("utf-16-le")))
+        return 0
+
+    @R("VarBstrFromI4", "iuup", dlls=_OA)
+    def _vbfi4(c, v, lcid, fl, out):
+        return bstr_from(str(v), out)
+
+    @R("VarBstrFromUI4", "uuup", dlls=_OA)
+    def _vbfui4(c, v, lcid, fl, out):
+        return bstr_from(str(v), out)
+
+    @R("VarBstrFromR8", "duup", dlls=_OA)
+    def _vbfr8(c, v, lcid, fl, out):
+        return bstr_from(to_text(VT_R8, v), out)
+
+    @R("VarBstrFromBool", "iuup", dlls=_OA)
+    def _vbfb(c, v, lcid, fl, out):
+        return bstr_from("True" if v else "False", out)
+
+    # -- SAFEARRAY ------------------------------------------------------------------------
+    def sa_off():
+        return (16, 24) if ps() == 8 else (12, 16)      # pvData, rgsabound
+
+    def sa_info(sa):
+        dims, feat, esz, locks = struct.unpack("<HHII", M_.read(sa, 12))
+        pv_off, b_off = sa_off()
+        data = M_.read64(sa + pv_off) if ps() == 8 else M_.read32(sa + pv_off)
+        bounds = []
+        for i in range(dims):
+            n, lb = struct.unpack("<Ii", M_.read(sa + b_off + 8 * i, 8))
+            bounds.append((n, lb))
+        return dims, feat, esz, data, bounds
+
+    def sa_vt(sa):
+        feat = M_.read16(sa + 2)
+        if feat & 0x80:                                 # FADF_HAVEVARTYPE
+            return M_.read32(sa - 4)
+        if feat & 0x100:
+            return VT_BSTR
+        if feat & 0x800:
+            return VT_VARIANT
+        if feat & 0x200:
+            return VT_UNKNOWN
+        if feat & 0x400:
+            return VT_DISPATCH
+        return 0
+
+    def sa_create(vt, bounds):
+        esz = {VT_BSTR: ps(), VT_UNKNOWN: ps(), VT_DISPATCH: ps(), VT_VARIANT: vsize()}.get(
+            vt, _VT_SIZE.get(vt))
+        if esz is None:
+            return 0
+        pv_off, b_off = sa_off()
+        hdr = b_off + 8 * len(bounds)
+        raw = p.heap_alloc(p.process_heap_handle, 16 + hdr)
+        sa = raw + 16
+        M_.write(raw, bytes(16 + hdr))
+        M_.write32(sa - 4, vt)
+        feat = 0x80 | {VT_BSTR: 0x100, VT_VARIANT: 0x800, VT_UNKNOWN: 0x200,
+                       VT_DISPATCH: 0x400}.get(vt, 0)
+        M_.write(sa, struct.pack("<HHII", len(bounds), feat, esz, 0))
+        count = 1
+        # rgsabound is stored in reverse order of the creation bounds (rightmost first)
+        for i, (n, lb) in enumerate(reversed(bounds)):
+            M_.write(sa + b_off + 8 * i, struct.pack("<Ii", n, lb))
+            count *= n
+        data = p.heap_alloc(p.process_heap_handle, max(1, count * esz))
+        M_.write(data, bytes(max(1, count * esz)))
+        k.wptr(sa + pv_off, data)
+        p.__dict__.setdefault("_safearrays", {})[sa] = raw
+        return sa
+
+    def sa_count(bounds):
+        n = 1
+        for c_, _lb in bounds:
+            n *= c_
+        return n
+
+    def sa_destroy(sa):
+        if not sa:
+            return 0
+        dims, feat, esz, data, bounds = sa_info(sa)
+        vt = sa_vt(sa)
+        n = sa_count(bounds)
+        for i in range(n if data else 0):
+            e = data + i * esz
+            if vt == VT_BSTR:
+                bstr_free(M_.read64(e) if ps() == 8 else M_.read32(e))
+            elif vt == VT_VARIANT:
+                vclear(e)
+            elif vt in (VT_UNKNOWN, VT_DISPATCH):
+                com_call(M_.read64(e) if ps() == 8 else M_.read32(e), 2)
+        if data and not feat & 0x12:                    # not FADF_AUTO/STATIC
+            p.heap_free(p.process_heap_handle, data)
+        raw = p.__dict__.get("_safearrays", {}).pop(sa, None)
+        if raw:
+            p.heap_free(p.process_heap_handle, raw)
+        return 0
+
+    def sa_copy(sa):
+        if not sa:
+            return 0
+        dims, feat, esz, data, bounds = sa_info(sa)
+        vt = sa_vt(sa)
+        new = sa_create(vt, list(reversed(bounds)))
+        if not new:
+            return 0
+        _d, _f, _e, ndata, _b = sa_info(new)
+        n = sa_count(bounds)
+        for i in range(n):
+            s_, d_ = data + i * esz, ndata + i * esz
+            if vt == VT_BSTR:
+                b = M_.read64(s_) if ps() == 8 else M_.read32(s_)
+                k.wptr(d_, bstr_alloc(M_.read(b, M_.read32(b - 4))) if b else 0)
+            elif vt == VT_VARIANT:
+                vcopy(d_, s_)
+            else:
+                M_.write(d_, M_.read(s_, esz))
+        return new
+
+    @R("SafeArrayCreate", "uup", "p", dlls=_OA)
+    def _sac(c, vt, dims, pb):
+        bounds = [struct.unpack("<Ii", M_.read(pb + 8 * i, 8)) for i in range(dims)]
+        return sa_create(vt, bounds)
+
+    @R("SafeArrayCreateVector", "uiu", "p", dlls=_OA)
+    def _sacv(c, vt, lb, n):
+        return sa_create(vt, [(n, lb)])
+
+    @R("SafeArrayDestroy", "p", dlls=_OA)
+    def _sad(c, sa):
+        return sa_destroy(sa)
+
+    @R("SafeArrayCopy", "pp", dlls=_OA)
+    def _sacp(c, sa, out):
+        k.wptr(out, sa_copy(sa))
+        return 0
+
+    @R("SafeArrayGetDim", "p", dlls=_OA)
+    def _sagd(c, sa):
+        return M_.read16(sa) if sa else 0
+
+    @R("SafeArrayGetElemsize", "p", dlls=_OA)
+    def _sage(c, sa):
+        return M_.read32(sa + 4) if sa else 0
+
+    @R("SafeArrayGetVartype", "pp", dlls=_OA)
+    def _sagvt(c, sa, out):
+        M_.write16(out, sa_vt(sa))
+        return 0
+
+    def bound(sa, dim, upper):
+        dims, feat, esz, data, bounds = sa_info(sa)
+        if not 1 <= dim <= dims:
+            return None
+        n, lb = bounds[dims - dim]
+        return lb + n - 1 if upper else lb
+
+    @R("SafeArrayGetLBound", "pup", dlls=_OA)
+    def _saglb(c, sa, dim, out):
+        v = bound(sa, dim, False)
+        if v is None:
+            return 0x8002000B                          # DISP_E_BADINDEX
+        M_.write32(out, v & 0xFFFFFFFF)
+        return 0
+
+    @R("SafeArrayGetUBound", "pup", dlls=_OA)
+    def _sagub(c, sa, dim, out):
+        v = bound(sa, dim, True)
+        if v is None:
+            return 0x8002000B
+        M_.write32(out, v & 0xFFFFFFFF)
+        return 0
+
+    @R("SafeArrayAccessData", "pp", dlls=_OA)
+    def _saad(c, sa, out):
+        _d, _f, _e, data, _b = sa_info(sa)
+        M_.write32(sa + 8, M_.read32(sa + 8) + 1)
+        k.wptr(out, data)
+        return 0
+
+    @R("SafeArrayUnaccessData SafeArrayUnlock", "p", dlls=_OA)
+    def _saud(c, sa):
+        M_.write32(sa + 8, max(0, M_.read32(sa + 8) - 1))
+        return 0
+
+    @R("SafeArrayLock", "p", dlls=_OA)
+    def _sal(c, sa):
+        M_.write32(sa + 8, M_.read32(sa + 8) + 1)
+        return 0
+
+    def elem_addr(sa, pidx):
+        dims, feat, esz, data, bounds = sa_info(sa)
+        off = 0
+        mult = 1
+        # rgIndices[0] is the leftmost dimension = the LAST rgsabound entry
+        for d in range(dims):
+            idx = _s32(M_.read32(pidx + 4 * d))
+            n, lb = bounds[dims - 1 - d]
+            if not lb <= idx < lb + n:
+                return None, esz
+            off += (idx - lb) * mult
+            mult *= n
+        return data + off * esz, esz
+
+    @R("SafeArrayPtrOfIndex", "ppp", dlls=_OA)
+    def _sapoi(c, sa, pidx, out):
+        a, _esz = elem_addr(sa, pidx)
+        if a is None:
+            return 0x8002000B
+        k.wptr(out, a)
+        return 0
+
+    @R("SafeArrayGetElement", "ppp", dlls=_OA)
+    def _sage2(c, sa, pidx, out):
+        a, esz = elem_addr(sa, pidx)
+        if a is None:
+            return 0x8002000B
+        vt = sa_vt(sa)
+        if vt == VT_BSTR:
+            b = M_.read64(a) if ps() == 8 else M_.read32(a)
+            k.wptr(out, bstr_alloc(M_.read(b, M_.read32(b - 4))) if b else 0)
+        elif vt == VT_VARIANT:
+            M_.write(out, bytes(vsize()))
+            vcopy(out, a)
+        else:
+            M_.write(out, M_.read(a, esz))
+        return 0
+
+    @R("SafeArrayPutElement", "ppp", dlls=_OA)
+    def _sape(c, sa, pidx, src):
+        a, esz = elem_addr(sa, pidx)
+        if a is None:
+            return 0x8002000B
+        vt = sa_vt(sa)
+        if vt == VT_BSTR:
+            old = M_.read64(a) if ps() == 8 else M_.read32(a)
+            bstr_free(old)
+            k.wptr(a, bstr_alloc(M_.read(src, M_.read32(src - 4))) if src else 0)
+        elif vt == VT_VARIANT:
+            vcopy(a, src)
+        else:
+            M_.write(a, M_.read(src, esz))
+        return 0
+
+    # -- PROPVARIANT (ole32 / propsys) ------------------------------------------------------
+    @R("PropVariantClear", "p", dlls=_OLE)
+    def _pvc(c, v):
+        if v:
+            vt = M_.read16(v)
+            if vt in (VT_LPSTR, VT_LPWSTR):
+                ptr = M_.read64(v + 8) if ps() == 8 else M_.read32(v + 8)
+                if ptr:
+                    p.heap_free(p.process_heap_handle, ptr)
+                M_.write(v, bytes(vsize()))
+            else:
+                vclear(v)
+        return 0
+
+    @R("PropVariantCopy", "pp", dlls=_OLE)
+    def _pvcopy(c, dst, src):
+        vt = M_.read16(src)
+        if vt in (VT_LPSTR, VT_LPWSTR):
+            M_.write(dst, M_.read(src, vsize()))
+            ptr = M_.read64(src + 8) if ps() == 8 else M_.read32(src + 8)
+            if ptr:
+                raw = M_.read_wstring(ptr, 1 << 20) + b"\0\0" if vt == VT_LPWSTR else \
+                    M_.read_cstring(ptr, 1 << 20) + b"\0"
+                a = p.heap_alloc(p.process_heap_handle, len(raw))
+                M_.write(a, raw)
+                k.wptr(dst + 8, a)
+            return 0
+        M_.write(dst, bytes(vsize()))
+        return vcopy(dst, src)
+
+
+# ==============================================================================
 # 11. Module / DLL loader
 # ==============================================================================
 
@@ -20321,7 +23122,7 @@ class NOOProcess:
     def _heap_grow(self, heap, need):
         grow = max((need + 0xFFFF) & ~0xFFFF, 0x400000, heap["size"] // 2)
         end = heap["end"]
-        if all(((end + off) >> 12) not in self.mem.pages for off in range(0, grow, PAGE_SIZE)):
+        if self.mem.range_free(end, grow):
             self.mem.alloc(grow, MEM_READ | MEM_WRITE, addr=end, tag="heap_grow")
             heap["end"] = end + grow
         else:
@@ -20463,19 +23264,46 @@ class NOOProcess:
         self.last_error = 87
         return 0xFFFFFFFF
 
-    def tls_get(self, idx):
+    # TLS slots live in the TEB (TlsSlots: x64 teb+0x1480, x86 teb+0xE10), so
+    # code reading GS:/FS:-relative slots directly (Go, some compilers'
+    # inlined TlsGetValue) sees the same values as the API.
+    def _tls_slot(self, idx):
         t = self.current_thread
-        return self.tls.get(idx, {}).get(t.tid if t else 0, 0)
+        if t is None or not 0 <= idx < 64:
+            return None
+        return t.teb + (0x1480 + 8 * idx if self.cpu_mode == 64 else 0xE10 + 4 * idx)
+
+    def tls_get(self, idx):
+        a = self._tls_slot(idx)
+        if a is None:
+            return 0
+        return self.mem.read64(a) if self.cpu_mode == 64 else self.mem.read32(a)
 
     def tls_set(self, idx, val):
         if idx not in self.tls:
             return False
-        t = self.current_thread
-        self.tls[idx][t.tid if t else 0] = val
+        a = self._tls_slot(idx)
+        if a is None:
+            return False
+        if self.cpu_mode == 64:
+            self.mem.write64(a, val & M64)
+        else:
+            self.mem.write32(a, val & 0xFFFFFFFF)
         return True
 
     def tls_free(self, idx):
-        return self.tls.pop(idx, None) is not None
+        if self.tls.pop(idx, None) is None:
+            return False
+        for t in self.threads:                  # Windows clears the slot in every thread
+            try:
+                a = t.teb + (0x1480 + 8 * idx if self.cpu_mode == 64 else 0xE10 + 4 * idx)
+                if self.cpu_mode == 64:
+                    self.mem.write64(a, 0)
+                else:
+                    self.mem.write32(a, 0)
+            except NOOCPUFault:
+                pass
+        return True
 
     def rand(self):
         self._rand_state = (self._rand_state * 1103515245 + 12345) & 0x7FFFFFFF
@@ -20573,12 +23401,16 @@ class NOOProcess:
             slots = _LEGACY_ARGC.get(name.lower())
         return -1 if slots is None else 4 * slots
 
-    # per-thread GetLastError value
+    # per-thread GetLastError value: TEB.LastErrorValue (x64 +0x68, x86 +0x34),
+    # which compilers and runtimes (Go, inlined CRT code) also access directly
     @property
     def last_error(self):
         t = self.__dict__.get("current_thread")
         if t is not None:
-            return t.last_error
+            try:
+                return self.mem.read32(t.teb + (0x68 if self.cpu_mode == 64 else 0x34))
+            except NOOCPUFault:
+                return t.last_error
         return self.__dict__.get("_last_error", 0)
 
     @last_error.setter
@@ -20586,6 +23418,11 @@ class NOOProcess:
         t = self.__dict__.get("current_thread")
         if t is not None:
             t.last_error = v & 0xFFFFFFFF
+            try:
+                self.mem.write32(t.teb + (0x68 if self.cpu_mode == 64 else 0x34),
+                                 v & 0xFFFFFFFF)
+            except NOOCPUFault:
+                pass
         else:
             self.__dict__["_last_error"] = v & 0xFFFFFFFF
 
@@ -20606,6 +23443,10 @@ class NOOProcess:
             return 0
         try:
             ret = fn(cpu)
+            if _TRACE:
+                self.log.info("[trace] %s!%s -> %#x (err=%d, tid=%d)"
+                              % (dll, name, (ret or 0) & M64, self.last_error,
+                                 self.current_thread.tid if self.current_thread else 0))
         except (NOOExitProcess, NOOExitThread, NOOCallbackReturn, NOOYield, NOOContextSet):
             raise
         except NOOCPUFault:
@@ -20685,8 +23526,7 @@ class NOOProcess:
         # (otherwise the Windows loader would relocate — so do we)
         base = None
         pb = pe.image_base & PAGE_MASK
-        if all((pb + off) // PAGE_SIZE not in self.mem.pages
-               for off in range(0, size, PAGE_SIZE)):
+        if self.mem.range_free(pb, size):
             base = self.mem.alloc(size, MEM_READ | MEM_WRITE | MEM_EXEC,
                                   addr=pb, tag="image:" + pe.path)
         else:
@@ -20770,6 +23610,7 @@ class NOOProcess:
             raise NOOError("%s is a DLL — NOO runs executables (.exe); DLLs are loaded "
                            "on demand by the guest" % self.exe_host_path)
         self.cpu_mode = 64 if pe.is64 else 32
+        self.mem.high_ok = pe.is64
 
         base = self.map_pe_image(pe)
         # the C runtime's data exports must exist before imports are bound,
@@ -20782,6 +23623,8 @@ class NOOProcess:
         self.seh.install_thunks()
         self.cxx = _CxxEH(self)
         self.cxx.install(self.k32)
+        _adv_install(self.k32)
+        _oa_install(self.k32)
         main = NOOModule(os.path.basename(self.exe_host_path).lower(), base,
                          pe.size_of_image, "pe", pe)
         self.modules.main = main
@@ -20802,7 +23645,7 @@ class NOOProcess:
         stack_top = stack_base + stack_size
 
         # TEB / PEB
-        teb = self.mem.alloc(0x1000, MEM_READ | MEM_WRITE, tag="teb")
+        teb = self.mem.alloc(0x2000, MEM_READ | MEM_WRITE, tag="teb")
         peb = self.mem.alloc(0x1000, MEM_READ | MEM_WRITE, tag="peb")
         self.teb_addr, self.peb_addr = teb, peb
         tid = 1
@@ -21251,7 +24094,7 @@ class NOOProcess:
     def create_thread(self, start, param, stack_size):
         stack_size = max(stack_size, 0x10000)
         stack_base = self.mem.alloc(stack_size, MEM_READ | MEM_WRITE, tag="thread_stack")
-        teb = self.mem.alloc(0x1000, MEM_READ | MEM_WRITE, tag="thread_teb")
+        teb = self.mem.alloc(0x2000, MEM_READ | MEM_WRITE, tag="thread_teb")
         cpu = CPU(self.mem, self.cpu_mode, self.log)
         cpu.api_handler = self.dispatch_api
         cpu.api_convention = self._api_convention
@@ -21645,8 +24488,10 @@ class NOOProcess:
                     self.gui_queue.append({"hwnd": t["hwnd"], "message": WM_TIMER,
                                            "w": t["id"], "l": 0})
 
-    @staticmethod
-    def _wait_deadline(t):
+    def _wait_deadline(self, t):
+        k32 = getattr(self, "k32", None)
+        if k32 is not None:
+            return k32.next_deadline(t)
         w = t.waiting_on
         if not w:
             return None
@@ -21668,7 +24513,7 @@ class NOOProcess:
                 # wake any threads whose wait condition is now satisfied
                 for t in self.threads:
                     if t.state in ("blocked", "guiwait") and self._wake_check(t):
-                        t.state = "running"
+                        t.state = "suspended" if getattr(t, "suspend", 0) else "running"
                         t.waiting_on = None
                         t.cpu.finish_yield()   # thunk ret + stdcall cleanup
                 alive = [t for t in self.threads if t.state in ("running", "guiwait")]
@@ -21794,7 +24639,7 @@ class NOOProcess:
                 # wake threads whose wait condition is satisfied (posted msgs)
                 for t in self.threads:
                     if t.state in ("blocked", "guiwait") and self._wake_check(t):
-                        t.state = "running"
+                        t.state = "suspended" if getattr(t, "suspend", 0) else "running"
                         t.waiting_on = None
                         t.cpu.finish_yield()
                 alive = [t for t in self.threads if t.state in ("running", "guiwait")]
@@ -22308,6 +25153,8 @@ class _APIShim(WinAPI):
             k = _K32(self)
             _k32_install(k)
             _CxxEH(self.p).install(k)
+            _adv_install(k)
+            _oa_install(k)
         except Exception:
             pass
 
