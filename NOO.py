@@ -1075,6 +1075,13 @@ def _sx(v, from_size):
     return v - (1 << from_size) if v >> (from_size - 1) else v
 
 
+def _sxe(expr, size):
+    """Generated-code form of _sx(expr, size): an inline expression, no call."""
+    size = int(size)
+    return "((((%s) & %s) ^ %s) - %s)" % (expr, hex((1 << size) - 1), hex(1 << (size - 1)),
+                                         hex(1 << (size - 1)))
+
+
 class _Mem:
     """Decoded memory operand."""
     __slots__ = ("base", "index", "scale", "disp", "seg", "rip", "asz")
@@ -1574,7 +1581,7 @@ class _DecoderMixin:
                 o = g.opaddr(o, ins.next)
                 v = g.rd(o, 32)
                 if sz == 64:
-                    g.wreg((reg, False), 64, "_sx(%s, 32) & 0xFFFFFFFFFFFFFFFF" % v, masked=True)
+                    g.wreg((reg, False), 64, "%s & 0xFFFFFFFFFFFFFFFF" % _sxe(v, 32), masked=True)
                 else:
                     g.wreg((reg, False), sz, v)
             return done(e, "movsxd")
@@ -1705,7 +1712,7 @@ class _DecoderMixin:
         if op == 0x98:                                 # cbw/cwde/cdqe
             def e(g, ins, sz=osz):
                 h = sz // 2
-                g.wreg((0, False), sz, "_sx(R[0], %d) & %s" % (h, hex(W[sz])), masked=True)
+                g.wreg((0, False), sz, "%s & %s" % (_sxe("R[0]", h), hex(W[sz])), masked=True)
             return done(e, "cbw")
         if op == 0x99:                                 # cwd/cdq/cqo
             def e(g, ins, sz=osz):
@@ -2228,7 +2235,7 @@ class _DecoderMixin:
                 o = g.opaddr(o, ins.next)
                 v = g.rd(o, ss)
                 if sx:
-                    g.wreg((reg, False), sz, "_sx(%s, %d)" % (v, ss))
+                    g.wreg((reg, False), sz, _sxe(v, ss))
                 else:
                     g.wreg((reg, False), sz, v, masked=(sz >= ss))
             return done(e, "movx")
@@ -2421,9 +2428,9 @@ class _DecoderMixin:
     def _e_imul3(self, g, ins, reg, o, immv, size):
         o = g.opaddr(o, ins.next)
         a = g.tmp()
-        g.L("%s = _sx(%s, %d)" % (a, g.rd(o, size), size))
+        g.L("%s = %s" % (a, _sxe(g.rd(o, size), size)))
         if immv is None:
-            bexpr = "_sx(%s, %d)" % (g.rreg((reg, False), size), size)
+            bexpr = _sxe(g.rreg((reg, False), size), size)
         else:
             bexpr = immv
         t = g.tmp()
@@ -2432,7 +2439,7 @@ class _DecoderMixin:
         g.L("%s = %s & %s" % (r, t, hex(W_MASK[size])))
         g.wreg((reg, False), size, r, masked=True)
         if ins.live_out & _FALL:
-            g.set_mat("_szp(%s, %d) | (2049 if _sx(%s, %d) != %s else 0)" % (r, size, r, size, t))
+            g.set_mat("_szp(%s, %d) | (2049 if %s != %s else 0)" % (r, size, _sxe(r, size), t))
 
     def _e_muldiv(self, g, ins, o, sub, size):
         o = g.opaddr(o, ins.next)
@@ -2447,7 +2454,7 @@ class _DecoderMixin:
             g.L("%s = %s * %s" % (t, g.rreg((0, False), size), v))
             hi = "(%s >> %d)" % (t, size)
         else:
-            g.L("%s = _sx(%s, %d) * _sx(%s, %d)" % (t, g.rreg((0, False), size), size, v, size))
+            g.L("%s = %s * %s" % (t, _sxe(g.rreg((0, False), size), size), _sxe(v, size)))
             hi = None
         if size == 8:
             g.wreg((0, False), 16, "%s & 0xFFFF" % t, masked=True)
@@ -2459,7 +2466,7 @@ class _DecoderMixin:
             if sub == 4:
                 ovf = "%s != 0" % hi
             else:
-                ovf = "_sx(%s, %d) != %s" % (lo, size, t)
+                ovf = "%s != %s" % (_sxe(lo, size), t)
             g.set_mat("_szp(%s, %d) | (2049 if %s else 0)" % (lo, size, ovf))
 
     def _e_shift(self, g, ins, o, kind, cnt, size, cmask):
@@ -2482,10 +2489,10 @@ class _DecoderMixin:
                     g.set_mat("_szp(%s, %d) | ((%s >> %d) & 1) | (((%s >> %d) & 1) << 11)"
                               % (r, size, v, cnt - 1, v, size - 1))
             else:
-                g.L("%s = (_sx(%s, %d) >> %d) & %s" % (r, v, size, cnt, hex(m)))
+                g.L("%s = (%s >> %d) & %s" % (r, _sxe(v, size), cnt, hex(m)))
                 if live:
-                    g.set_mat("_szp(%s, %d) | ((_sx(%s, %d) >> %d) & 1)"
-                              % (r, size, v, size, cnt - 1))
+                    g.set_mat("_szp(%s, %d) | ((%s >> %d) & 1)"
+                              % (r, size, _sxe(v, size), cnt - 1))
             g.wr(o, size, r, masked=True)
             return
         ce = str(cnt) if cnt is not None else "(R[1] & %d)" % cmask
@@ -2511,7 +2518,7 @@ class _DecoderMixin:
             if bitsrc[0] == "reg":
                 # register bit offsets address memory beyond the operand
                 sb = g.tmp()
-                g.L("%s = _sx(%s, %d)" % (sb, bexpr, size))
+                g.L("%s = %s" % (sb, _sxe(bexpr, size)))
                 aa = g.tmp()
                 g.L("%s = (%s + ((%s >> %d) * %d)) & %s" % (
                     aa, base, sb, {16: 4, 32: 5, 64: 6}[size], size // 8,
