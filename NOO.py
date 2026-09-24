@@ -4105,9 +4105,24 @@ class WinAPI:
             dist, hi_ptr, method = cpu.get_arg(1), cpu.get_arg(2), cpu.get_arg(3)
             if f is None:
                 return 0xFFFFFFFF
-            dist = dist - (1 << 32) if dist & 0x80000000 else dist
-            f.seek(dist, {0: 0, 1: 1, 2: 2}.get(method, 0))
-            return f.tell() & 0xFFFFFFFF
+            dist &= 0xFFFFFFFF       # LONG: x64 registers may carry junk bits
+            if hi_ptr:
+                # lpDistanceToMoveHigh supplies the upper 32 bits of a
+                # signed 64-bit distance and receives the new high dword.
+                dist |= cpu.mem.read32(hi_ptr) << 32
+                if dist & (1 << 63):
+                    dist -= 1 << 64
+            elif dist & 0x80000000:
+                dist -= 1 << 32
+            try:
+                f.seek(dist, {0: 0, 1: 1, 2: 2}.get(method & 0xFFFFFFFF, 0))
+            except (OSError, ValueError):
+                p.last_error = 131   # ERROR_NEGATIVE_SEEK
+                return 0xFFFFFFFF
+            pos = f.tell()
+            if hi_ptr:
+                cpu.mem.write32(hi_ptr, (pos >> 32) & 0xFFFFFFFF)
+            return pos & 0xFFFFFFFF
 
         @R("kernel32.dll", "DeleteFileA", "DeleteFileW")
         def _delete_file(cpu):
@@ -5941,17 +5956,30 @@ class WinAPI:
                 if title_arg else ""
             ckey = cls.upper() if isinstance(cls, str) else cls
             rec = p.window_classes.get(ckey)
-            hwnd = 0x10000 + (len(p.windows) + 1) * 4
+            # Monotonic handle counter: deriving the handle from len(p.windows)
+            # re-issued a live window's handle after any DestroyWindow.
+            p._next_hwnd = getattr(p, "_next_hwnd", 0) + 1
+            hwnd = 0x10000 + p._next_hwnd * 4
             # For WS_CHILD windows hMenu carries the control id (GetDlgItem key)
+            style &= 0xFFFFFFFF
             ctrl_id = hmenu if (style & 0x40000000) else 0
+
+            def _geom(v, default):
+                # int args arrive in 64-bit registers on x64: keep the low
+                # 32 bits, honor CW_USEDEFAULT, and sign-extend negatives.
+                v &= 0xFFFFFFFF
+                if v == 0x80000000:
+                    return default
+                return v - (1 << 32) if v & 0x80000000 else v
+
             win = {"hwnd": hwnd, "class": ckey,
                    "wndproc": rec["wndproc"] if rec else 0,
                    "title": title, "style": style, "parent": hparent,
                    "ctrl_id": ctrl_id,
-                   "x": 100 if x == 0x80000000 else x,
-                   "y": 100 if y == 0x80000000 else y,
-                   "w": 320 if w == 0x80000000 else w,
-                   "h": 240 if h == 0x80000000 else h,
+                   "x": _geom(x, 100),
+                   "y": _geom(y, 100),
+                   "w": _geom(w, 320),
+                   "h": _geom(h, 240),
                    "visible": False}
             p.windows[hwnd] = win
             gui = p.gui_backend()
@@ -7978,6 +8006,10 @@ class NOOProcess:
         and reported as 'exited' so the shell can close the window cleanly."""
         slice_n = 20000
         rounds = 0
+        # The instruction budget is a runaway guard for ONE pump (start-up or
+        # one injected event), not a lifetime cap: an interactive GUI program
+        # legitimately runs far more instructions over its lifetime.
+        start_count = self.instruction_count
         try:
             while True:
                 rounds += 1
@@ -8013,7 +8045,8 @@ class NOOProcess:
                             for _ in range(slice_n):
                                 t.cpu.step()
                                 self.instruction_count += 1
-                        if self.instruction_count > self.sandbox.max_instructions:
+                        if (self.instruction_count - start_count
+                                > self.sandbox.max_instructions):
                             self.log.error("instruction budget exhausted — stopping")
                             return "exited"
                     except NOOYield:
@@ -8584,10 +8617,11 @@ def _walk_installed_exes(fs_root):
                 rel = os.path.relpath(host, croot).replace(os.sep, "\\")
                 try:
                     size = os.path.getsize(host)
+                    mtime = os.path.getmtime(host)
                 except OSError:
-                    size = 0
+                    continue         # vanished mid-walk
                 out.append({"path": "C:\\" + rel, "host": host, "size": size,
-                            "name": fn, "mtime": os.path.getmtime(host)})
+                            "name": fn, "mtime": mtime})
     out.sort(key=lambda e: -e["mtime"])
     return out
 
@@ -8819,6 +8853,9 @@ class _GuiSession:
         self.tmp_path = tmp_path
         self.exited = False
         self.exit_code = None
+        # The bridge serves every call on its own thread; a poll and an input
+        # event must never drive the same emulated CPU at the same time.
+        self.lock = _py_threading.RLock()
 
     @property
     def proc(self):
@@ -8836,6 +8873,10 @@ class _GuiSession:
         p = self.proc
         if p is None:
             self.exited = True
+            return "exited"
+        if self.exited:
+            # A finished program must never be resumed: after ExitProcess, a
+            # crash or an exhausted budget its threads may still look runnable.
             return "exited"
         status = p.run_until_idle()
         if status == "exited":
@@ -8866,13 +8907,15 @@ class _GuiSession:
         return base
 
     def post(self, hwnd, message, wparam, lparam):
-        """Enqueue a Win32 message for the guest, then run until idle/exit."""
+        """Enqueue a Win32 message for the guest (the caller then pumps)."""
         p = self.proc
         if p is None:
             self.exited = True
             return
-        p.gui_queue.append({"hwnd": hwnd & SIZE_MASK[64], "message": message,
-                            "w": wparam & SIZE_MASK[64], "l": lparam & SIZE_MASK[64]})
+        with self.lock:
+            p.gui_queue.append({"hwnd": hwnd & SIZE_MASK[64], "message": message,
+                                "w": wparam & SIZE_MASK[64],
+                                "l": lparam & SIZE_MASK[64]})
 
     def dispose(self):
         try:
@@ -8912,8 +8955,9 @@ def gui_start(data, args=None, verbose=False, instruction_cap=None, fs_root=None
         _GUI_SESSION_SEQ[0] += 1
         sess = _GuiSession(sid, rt, tmp)
         _GUI_SESSIONS[sid] = sess
-        sess.pump_idle()                    # run to first idle (window shown)
-        snap = sess.snapshot()
+        with sess.lock:
+            sess.pump_idle()                # run to first idle (window shown)
+            snap = sess.snapshot()
         snap["ok"] = True
         return snap
     except Exception as e:
@@ -8929,9 +8973,10 @@ def gui_poll(sid):
     if sess is None:
         return {"ok": False, "error": "no such GUI session"}
     try:
-        # advance any timers / pending work, then snapshot
-        sess.pump_idle()
-        return sess.snapshot()
+        with sess.lock:
+            # advance any timers / pending work, then snapshot
+            sess.pump_idle()
+            return sess.snapshot()
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -8945,37 +8990,42 @@ def gui_event(sid, ev):
     if sess is None:
         return {"ok": False, "error": "no such GUI session"}
     try:
-        t = (ev or {}).get("type")
+        ev = ev or {}
+        t = ev.get("type")
         hwnd = int(ev.get("hwnd", 0) or 0)
         x = int(ev.get("x", 0) or 0)
         y = int(ev.get("y", 0) or 0)
-        lparam = (y << 16) | (x & 0xFFFF)
+        # MAKELPARAM: both coordinates are 16-bit (negative when the pointer
+        # is left of / above the client area) — mask y too.
+        lparam = ((y & 0xFFFF) << 16) | (x & 0xFFFF)
+        post = sess.post
         if t == "mousemove":
-            sess.post(hwnd, _WM_MOUSEMOVE, 0, lparam)
+            post(hwnd, _WM_MOUSEMOVE, 0, lparam)
         elif t == "mousedown":
-            sess.post(hwnd, _WM_LBUTTONDOWN, 1, lparam)
+            post(hwnd, _WM_LBUTTONDOWN, 1, lparam)
         elif t == "mouseup":
-            sess.post(hwnd, _WM_LBUTTONUP, 0, lparam)
+            post(hwnd, _WM_LBUTTONUP, 0, lparam)
         elif t == "rmousedown":
-            sess.post(hwnd, _WM_RBUTTONDOWN, 2, lparam)
+            post(hwnd, _WM_RBUTTONDOWN, 2, lparam)
         elif t == "keydown":
-            sess.post(hwnd, _WM_KEYDOWN, int(ev.get("key", 0) or 0), 1)
+            post(hwnd, _WM_KEYDOWN, int(ev.get("key", 0) or 0), 1)
         elif t == "keyup":
-            sess.post(hwnd, _WM_KEYUP, int(ev.get("key", 0) or 0), 1)
+            post(hwnd, _WM_KEYUP, int(ev.get("key", 0) or 0), 1)
         elif t == "char":
-            sess.post(hwnd, _WM_CHAR, int(ev.get("char", 0) or 0), 1)
+            post(hwnd, _WM_CHAR, int(ev.get("char", 0) or 0), 1)
         elif t == "command":
             # Button/menu click: WM_COMMAND with control id in the low word of
             # wParam (0 = from menu), lParam = control hwnd. Sent to the parent.
             ctrl_id = int(ev.get("ctrl_id", 0) or 0)
             parent = int(ev.get("parent", hwnd) or hwnd)
-            sess.post(parent, _WM_COMMAND, (0 << 16) | (ctrl_id & 0xFFFF), hwnd)
+            post(parent, _WM_COMMAND, (0 << 16) | (ctrl_id & 0xFFFF), hwnd)
         elif t == "close":
-            sess.post(hwnd, _WM_CLOSE, 0, 0)
+            post(hwnd, _WM_CLOSE, 0, 0)
         else:
             return {"ok": False, "error": "unknown event type: %r" % t}
-        sess.pump_idle()
-        return sess.snapshot()
+        with sess.lock:
+            sess.pump_idle()
+            return sess.snapshot()
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -8986,7 +9036,9 @@ def gui_stop(sid):
     if sess is None:
         return {"ok": True}
     try:
-        sess.dispose()
+        with sess.lock:             # wait for an in-flight pump to finish
+            sess.exited = True
+            sess.dispose()
     except Exception:
         pass
     return {"ok": True}
@@ -9005,6 +9057,7 @@ def run_bytes(data, args=None, verbose=False, instruction_cap=None, fs_root=None
               "instructions": 0, "missing_imports": [], "error": None,
               "log": ""}
     tmp = None
+    rt = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as fh:
             fh.write(data)
@@ -9013,8 +9066,11 @@ def run_bytes(data, args=None, verbose=False, instruction_cap=None, fs_root=None
         sandbox = NOOSandbox(fs_root=fs_root) if fs_root else None
         rt = Runtime(sandbox=sandbox, verbose=verbose, capture=True)
         if instruction_cap is not None:
+            # The scheduler enforces sandbox.max_instructions (a plain
+            # rt.instruction_cap attribute was never read, so the caller's
+            # runaway guard silently fell back to the 50M default).
             try:
-                rt.instruction_cap = instruction_cap
+                rt.sandbox.max_instructions = int(instruction_cap)
             except Exception:
                 pass
         code = rt.run(tmp, args=args or [])
@@ -9032,6 +9088,19 @@ def run_bytes(data, args=None, verbose=False, instruction_cap=None, fs_root=None
     except Exception as e:
         result["ok"] = False
         result["error"] = str(e)
+        # Keep whatever the program printed before it failed (e.g. a runaway
+        # loop hitting the instruction budget) — it is what the user needs.
+        if rt is not None:
+            try:
+                result["output"] = rt.log.captured_output().decode("utf-8", "replace")
+                result["log"] = "\n".join(rt.log.lines[-200:])
+                proc = getattr(rt, "process", None)
+                if proc is not None:
+                    result["instructions"] = getattr(proc, "instruction_count", 0)
+                    result["missing_imports"] = sorted(
+                        getattr(proc, "missing_imports", []) or [])
+            except Exception:
+                pass
     finally:
         if tmp:
             try:
