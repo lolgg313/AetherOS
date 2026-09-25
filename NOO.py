@@ -15296,6 +15296,23 @@ def _k32_install(k):
     def _rtlalloc(c, h, flags, n):
         return _halloc(c, h, flags, n)
 
+    @R("RtlCreateHeap", "ppzzpp", "p", NT)
+    def _rtlcreateheap(c, flags, base, reserve, commit, lock, params):
+        return p.heap_create()
+
+    @R("RtlDestroyHeap", "p", "p", NT)
+    def _rtldestroyheap(c, h):
+        return 0                                   # NULL = success
+
+    R("RtlLockHeap RtlUnlockHeap RtlValidateHeap", "p", "i", NT)(lambda c, h: 1)
+    R("RtlCompactHeap", "pu", "z", NT)(lambda c, h, f: 0x100000)
+    R("RtlGetProcessHeaps", "up", "u", NT)(
+        lambda c, n, arr: (k.wptr(arr, p.process_heap_handle) if arr and n else None, 1)[1])
+
+    @R("RtlSetHeapInformation RtlQueryHeapInformation", "pupz", "u", NT)
+    def _rtlheapinfo(c, h, cls, info, n):
+        return 0
+
     @R("HeapReAlloc", "pupz", "p")
     def _hrealloc(c, h, flags, a, n):
         if not a:
@@ -16508,7 +16525,7 @@ def _k32_install(k):
             c.mem.write64(a, new)
         return old
 
-    @R("InterlockedPushEntrySList", "pp", "p")
+    @R("InterlockedPushEntrySList RtlInterlockedPushEntrySList", "pp", "p", _K32_DLLS + NT)
     def _ipesl(c, head, entry):
         ps = k.ptr_size()
         first = c.mem.read64(head) if ps == 8 else c.mem.read32(head)
@@ -16516,7 +16533,7 @@ def _k32_install(k):
         k.wptr(head, entry)
         return first
 
-    @R("InterlockedPopEntrySList", "p", "p")
+    @R("InterlockedPopEntrySList RtlInterlockedPopEntrySList", "p", "p", _K32_DLLS + NT)
     def _ipopsl(c, head):
         ps = k.ptr_size()
         first = c.mem.read64(head) if ps == 8 else c.mem.read32(head)
@@ -16525,11 +16542,11 @@ def _k32_install(k):
             k.wptr(head, nxt)
         return first
 
-    @R("InitializeSListHead", "p", "v")
+    @R("InitializeSListHead RtlInitializeSListHead", "p", "v", _K32_DLLS + NT)
     def _islh(c, head):
         c.mem.write(head, bytes(16))
 
-    @R("InterlockedFlushSList", "p", "p")
+    @R("InterlockedFlushSList RtlInterlockedFlushSList", "p", "p", _K32_DLLS + NT)
     def _ifsl(c, head):
         ps = k.ptr_size()
         first = c.mem.read64(head) if ps == 8 else c.mem.read32(head)
@@ -18683,6 +18700,8 @@ def _k32_install(k):
         k.views[addr] = (m_, off, n or (m_.size - off))
         return addr
 
+    k.create_mapping, k.map_view = _cfm, _map_view
+
     @R("MapViewOfFile", "puuuz", "p")
     def _mvof(c, hm, acc, hi, lo, n):
         return _map_view(hm, acc, (hi << 32) | lo, n)
@@ -18708,6 +18727,8 @@ def _k32_install(k):
     @R("UnmapViewOfFileEx", "pu")
     def _uvofx(c, addr, fl):
         return _uvof(c, addr)
+
+    k.unmap_view = lambda addr: _uvof(None, addr)
 
     @R("FlushViewOfFile", "pz")
     def _fvof(c, addr, n):
@@ -19624,6 +19645,8 @@ def _k32_install(k):
                         return raw.decode("latin-1").rstrip("\0")
         return None
 
+    k.msg_table = _msg_table
+
     def _fmt_one(spec, val, wide_default, get_s):
         m_ = _FMT_RE.fullmatch("%" + spec)
         if not m_:
@@ -20150,6 +20173,8 @@ def _k32_install(k):
         p.mem.write(buf, (name + "\0").encode("utf-16-le") if wide else (name + "\0").encode())
         return len(name)
 
+    k.add_atom, k.find_atom = add_atom, find_atom
+
     @R("AddAtomA GlobalAddAtomA", "p")
     def _aaa(c, a):
         return add_atom(a, False)
@@ -20553,6 +20578,8 @@ def _k32_install(k):
         p.last_error = 0
         return 1
 
+    k.KTimer, k.set_timer = _KTimer, _set_timer
+
     @R("SetWaitableTimer", "ppippi")
     def _swt(c, h, pdue, period, cb, arg, resume):
         return _set_timer(h, pdue, period)
@@ -20569,13 +20596,105 @@ def _k32_install(k):
         tm.due = None
         return 1
 
-    # timer queues (callbacks on pool threads) ------------------------------------------
+    # pool timers and waits: timer queues, RegisterWaitForSingleObject, TP timers / waits ---
+    # Each armed item runs on its own worker thread, which alternates a real Sleep /
+    # WaitForSingleObject with calls to the callback on a fixed stack frame.
+    k.pool_items = {}
+    k.pool_next = [1]
+    k.pool_by_ptr = {}                      # TP_TIMER / TP_WAIT pointer -> item id
+    k.tq_members = {}                       # timer queue handle -> [item ids]
+
+    def _pool_entry(c):
+        t = p.current_thread
+        iid = t.__dict__.get("pool_item")
+        if iid is None:
+            iid = _CallArgs(c).int()
+            t.pool_item = iid
+            t.pool_sp = (c.regs[RSP] - 0x200) & ~0xF
+            t.pool_phase = None
+        it = k.pool_items.get(iid)
+        if it is None or it["dead"]:
+            k.pool_items.pop(iid, None)
+            raise NOOExitThread(0)
+        entry = k.pool_entry_thunk
+        now = time.monotonic()
+        if it["kind"] == "wait":
+            if t.pool_phase == "waited":
+                t.pool_phase = None
+                r = c.regs[RAX] & 0xFFFFFFFF
+                expired = it["deadline"] is not None and now >= it["deadline"]
+                if it["handle"] is not None and (r == 0 or expired):
+                    args = it["args"](r != 0)
+                    if it["once"]:
+                        it["handle"] = None if it.get("tp") else it["handle"]
+                        if not it.get("tp"):
+                            it["dead"] = True
+                    elif it["timeout"] is not None:
+                        it["deadline"] = now + it["timeout"]
+                    p.seh._call(c, it["cb"], args, entry, t.pool_sp)
+                    raise NOOContextSet()
+            if it["handle"] is None:
+                p.seh._call(c, k.pool_sleep, [100], entry, t.pool_sp)
+                raise NOOContextSet()
+            dl = it["deadline"]
+            ms = 100 if dl is None else max(0, min(100, int((dl - now) * 1000) + 1))
+            t.pool_phase = "waited"
+            p.seh._call(c, k.pool_wait, [it["handle"], ms], entry, t.pool_sp)
+            raise NOOContextSet()
+        nxt = it["next"]
+        if nxt is None or now < nxt:
+            ms = 100 if nxt is None else max(1, min(100, int((nxt - now) * 1000) + 1))
+            p.seh._call(c, k.pool_sleep, [ms], entry, t.pool_sp)
+            raise NOOContextSet()
+        if it["period"]:
+            it["next"] = max(nxt + it["period"], now)
+        else:
+            it["next"] = None
+            if it.get("once_dead"):
+                it["dead"] = True
+        p.seh._call(c, it["cb"], it["args"](True), entry, t.pool_sp)
+        raise NOOContextSet()
+
+    _pool_entry._noo_cc = "cdecl"
+    api.table[("!noo!", "pool_entry")] = _pool_entry
+    k.pool_entry_thunk = 0
+
+    def pool_start(item):
+        if not k.pool_entry_thunk:
+            k.pool_entry_thunk = p.api_thunk("!noo!", "pool_entry")
+            k.pool_sleep = p.api_thunk("kernel32.dll", "Sleep")
+            k.pool_wait = p.api_thunk("kernel32.dll", "WaitForSingleObject")
+        iid = k.pool_next[0]
+        k.pool_next[0] += 1
+        item.setdefault("dead", False)
+        k.pool_items[iid] = item
+        p.create_thread(k.pool_entry_thunk, iid, 0x40000)
+        return iid
+
+    def ms_or_none(ms):
+        return None if ms in (INFINITE, 0xFFFFFFFF) else ms / 1000.0
+
+    # timer queues
     @R("CreateTimerQueue", "", "p")
     def _ctq(c):
-        return p.handles.add({"timers": []}, "timerq")
+        h = p.handles.add({"timers": []}, "timerq")
+        k.tq_members[h] = []
+        return h
 
-    @R("DeleteTimerQueue DeleteTimerQueueEx", "pp")
-    def _dtq(c, h, ev):
+    def tq_timer(queue, cb, param, due, period, once):
+        item = {"kind": "timer", "cb": cb, "args": lambda to, _p=param: [_p, 1],
+                "next": time.monotonic() + due / 1000.0, "period": period / 1000.0,
+                "once_dead": not period}
+        iid = pool_start(item)
+        h = p.handles.add(item, "tqtimer")
+        k.tq_members.setdefault(queue, []).append(iid)
+        return h
+
+    @R("CreateTimerQueueTimer", "ppppuuu")
+    def _ctqt(c, ph, queue, cb, param, due, period, flags):
+        if not ph or not cb:
+            return k.err(ERROR_INVALID_PARAMETER)
+        k.wptr(ph, tq_timer(queue, cb, param, due, period, flags & 8))
         return 1
 
     @R("DeleteTimerQueueTimer", "ppp")
@@ -20583,14 +20702,168 @@ def _k32_install(k):
         ent = p.handles.get(t_, "tqtimer")
         if ent is not None:
             ent["dead"] = True
+        if ev and ev not in (0xFFFFFFFF, M64):
+            e = p.handles.get(ev, "kevent")
+            if e is not None:
+                e.signaled = True
         return 1
 
     @R("ChangeTimerQueueTimer", "ppuu")
     def _chtqt(c, q, t_, due, period):
         ent = p.handles.get(t_, "tqtimer")
         if ent is not None:
-            ent["due"], ent["period"] = due, period
+            ent["next"] = time.monotonic() + due / 1000.0
+            ent["period"] = period / 1000.0
+            ent["once_dead"] = False
         return 1
+
+    def tq_delete(q):
+        for iid in k.tq_members.pop(q, []):
+            it = k.pool_items.get(iid)
+            if it is not None:
+                it["dead"] = True
+        return 1
+
+    @R("DeleteTimerQueue", "p")
+    def _dtq1(c, h):
+        return tq_delete(h)
+
+    @R("DeleteTimerQueueEx", "pp")
+    def _dtq(c, h, ev):
+        tq_delete(h)
+        if ev and ev not in (0xFFFFFFFF, M64):
+            e = p.handles.get(ev, "kevent")
+            if e is not None:
+                e.signaled = True
+        return 1
+
+    NT_ = ("ntdll.dll",)
+
+    @R("RtlCreateTimerQueue", "p", "u", NT_)
+    def _rctq(c, ph):
+        k.wptr(ph, _ctq(c))
+        return 0
+
+    @R("RtlCreateTimer", "pppppuuu", "u", NT_)
+    def _rct(c, queue, ph, cb, ctx, due, period, flags):
+        k.wptr(ph, tq_timer(queue, cb, ctx, due, period, flags & 8))
+        return 0
+
+    R("RtlUpdateTimer", "ppuu", "u", NT_)(lambda c, q, t_, due, per: (_chtqt(c, q, t_, due, per),
+                                                                     0)[1])
+    R("RtlDeleteTimer", "ppp", "u", NT_)(lambda c, q, t_, ev: (_dtqt(c, q, t_, ev), 0)[1])
+    R("RtlDeleteTimerQueueEx", "pp", "u", NT_)(lambda c, q, ev: (_dtq(c, q, ev), 0)[1])
+    R("RtlDeleteTimerQueue", "p", "u", NT_)(lambda c, q: (tq_delete(q), 0)[1])
+
+    # registered waits
+    def reg_wait(hobj, cb, ctx, ms, flags):
+        to = ms_or_none(ms)
+        item = {"kind": "wait", "cb": cb, "handle": hobj,
+                "args": lambda timed_out, _c=ctx: [_c, 1 if timed_out else 0],
+                "timeout": to, "deadline": (time.monotonic() + to) if to is not None else None,
+                "once": bool(flags & 8)}
+        pool_start(item)
+        return p.handles.add(item, "regwait")
+
+    @R("RegisterWaitForSingleObject", "pppppu")
+    def _rwfso(c, ph, hobj, cb, ctx, ms, flags):
+        if not ph or not cb:
+            return k.err(ERROR_INVALID_PARAMETER)
+        k.wptr(ph, reg_wait(hobj, cb, ctx, ms, flags))
+        return 1
+
+    R("RegisterWaitForSingleObjectEx", "pppuu", "p")(
+        lambda c, hobj, cb, ctx, ms, flags: reg_wait(hobj, cb, ctx, ms, flags))
+
+    def unreg(h):
+        it = p.handles.get(h, "regwait")
+        if it is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        it["dead"] = True
+        return 1
+
+    R("UnregisterWait", "p")(lambda c, h: unreg(h))
+    R("UnregisterWaitEx", "pp")(lambda c, h, ev: unreg(h))
+    R("RtlRegisterWait", "pppppu", "u", NT_)(
+        lambda c, ph, hobj, cb, ctx, ms, flags: (k.wptr(ph, reg_wait(hobj, cb, ctx, ms, flags)),
+                                                 0)[1])
+    R("RtlDeregisterWait RtlDeregisterWaitEx", "pp", "u", NT_)(
+        lambda c, h, ev=0: (unreg(h), 0)[1])
+
+    # threadpool timers and waits (Vista API)
+    def tp_new(kind, cb, pv):
+        ptr = p.heap_alloc(p.process_heap_handle, 32)
+        if kind == "timer":
+            item = {"kind": "timer", "cb": cb, "next": None, "period": 0.0, "tp": True,
+                    "args": lambda to, _p=pv, _t=ptr: [0, _p, _t]}
+        else:
+            item = {"kind": "wait", "cb": cb, "handle": None, "timeout": None,
+                    "deadline": None, "once": True, "tp": True, "result": 0}
+            item["args"] = lambda to, _p=pv, _t=ptr: [0, _p, _t, 0x102 if to else 0]
+        k.pool_by_ptr[ptr] = pool_start(item)
+        return ptr
+
+    def tp_item(ptr):
+        iid = k.pool_by_ptr.get(ptr)
+        return k.pool_items.get(iid) if iid is not None else None
+
+    def ft_due(pft):
+        """PFILETIME due time -> monotonic deadline."""
+        v = _s64(p.mem.read64(pft))
+        if v < 0:
+            return time.monotonic() + (-v) / 10_000_000.0
+        if v == 0:
+            return time.monotonic()
+        return time.monotonic() + max(0.0, _unix_from_ft(v) - time.time())
+
+    R("CreateThreadpoolTimer", "ppp", "p")(lambda c, cb, pv, env: tp_new("timer", cb, pv))
+    R("CreateThreadpoolWait", "ppp", "p")(lambda c, cb, pv, env: tp_new("wait", cb, pv))
+
+    def set_tp_timer(timer, pft, period):
+        it = tp_item(timer)
+        if it is None:
+            return 0
+        was = it["next"] is not None
+        if not pft:
+            it["next"] = None
+        else:
+            it["next"] = ft_due(pft)
+            it["period"] = period / 1000.0
+        return 1 if was else 0
+
+    R("SetThreadpoolTimer", "ppuu", "v")(lambda c, t_, pft, per, win: set_tp_timer(t_, pft, per))
+    R("SetThreadpoolTimerEx", "ppuu")(lambda c, t_, pft, per, win: set_tp_timer(t_, pft, per))
+    R("IsThreadpoolTimerSet", "p")(
+        lambda c, t_: 1 if (tp_item(t_) or {}).get("next") is not None else 0)
+
+    @R("WaitForThreadpoolTimerCallbacks WaitForThreadpoolWaitCallbacks", "pi", "v")
+    def _wftptc(c, obj, cancel):
+        it = tp_item(obj)
+        if it is not None and cancel:
+            if it["kind"] == "timer":
+                it["next"] = None
+            else:
+                it["handle"] = None
+
+    def tp_close(obj):
+        iid = k.pool_by_ptr.pop(obj, None)
+        it = k.pool_items.get(iid) if iid is not None else None
+        if it is not None:
+            it["dead"] = True
+
+    R("CloseThreadpoolTimer CloseThreadpoolWait", "p", "v")(lambda c, obj: tp_close(obj))
+
+    def set_tp_wait(w, h, pft):
+        it = tp_item(w)
+        if it is None:
+            return 0
+        was = it["handle"] is not None
+        it["handle"] = h or None
+        it["deadline"] = ft_due(pft) if pft else None
+        return 1 if was else 0
+
+    R("SetThreadpoolWait", "ppp", "v")(lambda c, w, h, pft: set_tp_wait(w, h, pft))
+    R("SetThreadpoolWaitEx", "pppp")(lambda c, w, h, pft, res: set_tp_wait(w, h, pft))
 
     # =====================================================================
     # I/O completion ports
@@ -22254,6 +22527,9 @@ def _adv_install(k):
     def _rdtw(c, h, sub):
         return delete_key(h, s(sub, True), tree=True)
 
+    k.regh = {"hkey": hkey, "entry": entry, "find_value": find_value, "to_raw": to_raw,
+              "from_raw": from_raw, "join": join, "exists": exists}
+
     def enum_key(h, i, name, pcch, pcls, pccls, pft, wide, cch=None):
         base = hkey(h)
         if base is None:
@@ -22550,6 +22826,8 @@ def _adv_install(k):
             return lambda base: struct.pack("<I", 0)
         return None
 
+    k.token_info = lambda cls: token_info(cls)
+
     @R("GetTokenInformation", "puppp", dlls=_ADV)
     def _gti(c, h, cls, buf, n, pret):
         b = token_info(cls)
@@ -22784,6 +23062,181 @@ def _adv_install(k):
         if puse:
             M_.write32(puse, u_)
         return 1
+
+    # ---- LSA policy (local machine only) --------------------------------------------------
+    def lsa_blob(parts):
+        """Allocate one heap block: parts = list of bytes; returns (addr, [offsets])."""
+        total = sum(len(x) for x in parts)
+        a = p.heap_alloc(p.process_heap_handle, max(total, 4))
+        offs = []
+        pos = 0
+        for x in parts:
+            offs.append(a + pos)
+            pos += len(x)
+        M_.write(a, b"".join(parts))
+        return a, offs
+
+    def ustr_bytes(addr, text):
+        """LSA_UNICODE_STRING pointing at addr."""
+        n = len(text.encode("utf-16-le"))
+        ps = k.ptr_size()
+        return struct.pack("<HH4xQ" if ps == 8 else "<HHI", n, n + 2, addr)
+
+    @R("LsaOpenPolicy", "pppp", dlls=_ADV)
+    def _lsaop(c, sysname, oa, acc, ph):
+        k.wptr(ph, p.handles.add({"lsa": 1}, "lsapolicy"))
+        return 0
+
+    R("LsaClose", "p", dlls=_ADV)(lambda c, h: (p.handles.close(h), 0)[1] if h else 0)
+    R("LsaFreeMemory", "p", dlls=_ADV)(
+        lambda c, a: (p.heap_free(p.process_heap_handle, a) if a else None, 0)[1])
+
+    @R("LsaNtStatusToWinError", "u", dlls=_ADV)
+    def _lsantse(c, st):
+        if st == 0:
+            return 0
+        return _NT_TO_W32.get(st, {0xC0000073: 1332, 0x107: 0}.get(st, 317))
+
+    def domains_blob(dom_names, dom_sids):
+        ps = k.ptr_size()
+        ent = 24 if ps == 8 else 12
+        head = 16 if ps == 8 else 8
+        n = len(dom_names)
+        strs = [(d.encode("utf-16-le") + b"\0\0") for d in dom_names]
+        sids = [dom_sids.get(d, b"") for d in dom_names]
+        size = head + ent * n + sum(len(x) for x in strs) + sum(len(x) for x in sids)
+        a = p.heap_alloc(p.process_heap_handle, max(size, 8))
+        arr = a + head
+        pos = arr + ent * n
+        out = bytearray(size)
+        struct.pack_into("<I4xQ" if ps == 8 else "<II", out, 0, n, arr if n else 0)
+        for i, d in enumerate(dom_names):
+            sp = pos
+            out[sp - a:sp - a + len(strs[i])] = strs[i]
+            pos += len(strs[i])
+            sidp = pos if sids[i] else 0
+            if sids[i]:
+                out[pos - a:pos - a + len(sids[i])] = sids[i]
+                pos += len(sids[i])
+            e = ustr_bytes(sp, d) + struct.pack("<Q" if ps == 8 else "<I", sidp)
+            out[arr - a + i * ent:arr - a + (i + 1) * ent] = e
+        M_.write(a, bytes(out))
+        return a
+
+    def lookup_sids(count, sids, pdoms, pnames):
+        ps = k.ptr_size()
+        ent = 32 if ps == 8 else 16
+        doms, dom_sids, rows = [], {}, []
+        mapped = 0
+        for i in range(count):
+            sp = M_.read64(sids + 8 * i) if ps == 8 else M_.read32(sids + 4 * i)
+            txt = sid_text(sp) if sp else ""
+            nm, dn, use = _SID_NAMES.get(txt, (None, None, None))
+            if nm is None:
+                rows.append((8, txt, -1))                        # SidTypeUnknown
+                continue
+            mapped += 1
+            if dn not in doms:
+                doms.append(dn)
+                if txt.startswith("S-1-5-21-"):
+                    dom_sids[dn] = _sid_bytes(txt.rsplit("-", 1)[0])
+            rows.append((use, nm, doms.index(dn)))
+        strs = [r[1].encode("utf-16-le") + b"\0\0" for r in rows]
+        size = ent * count + sum(len(x) for x in strs)
+        a = p.heap_alloc(p.process_heap_handle, max(size, 8))
+        out = bytearray(size)
+        pos = a + ent * count
+        for i, (use, nm, di) in enumerate(rows):
+            out[pos - a:pos - a + len(strs[i])] = strs[i]
+            rec = struct.pack("<I4x", use) + ustr_bytes(pos, nm) + struct.pack("<i4x", di) \
+                if ps == 8 else struct.pack("<I", use) + ustr_bytes(pos, nm) + \
+                struct.pack("<i", di)
+            out[i * ent:(i + 1) * ent] = rec
+            pos += len(strs[i])
+        M_.write(a, bytes(out))
+        k.wptr(pnames, a)
+        k.wptr(pdoms, domains_blob(doms, dom_sids))
+        if mapped == 0:
+            return 0xC0000073                                   # STATUS_NONE_MAPPED
+        return 0x107 if mapped < count else 0                   # STATUS_SOME_NOT_MAPPED
+
+    R("LsaLookupSids", "pupPp".replace("P", "p"), dlls=_ADV)(
+        lambda c, h, n, sids, pd, pn: lookup_sids(n, sids, pd, pn))
+    R("LsaLookupSids2", "puuppp", dlls=_ADV)(
+        lambda c, h, fl, n, sids, pd, pn: lookup_sids(n, sids, pd, pn))
+
+    def lookup_names(count, names, pdoms, psids, v2):
+        ps = k.ptr_size()
+        us = 16 if ps == 8 else 8
+        ent = (24 if ps == 8 else 16) if v2 else 12
+        doms, dom_sids, rows = [], {}, []
+        mapped = 0
+        for i in range(count):
+            u = names + us * i
+            n = M_.read16(u)
+            buf = M_.read64(u + 8) if ps == 8 else M_.read32(u + 4)
+            nm = M_.read(buf, n).decode("utf-16-le", "replace") if n else ""
+            want = nm.split("\\")[-1].lower()
+            hit = None
+            for t, (n_, d_, u_) in _SID_NAMES.items():
+                if n_.lower() == want:
+                    hit = (t, n_, d_, u_)
+            if hit is None:
+                rows.append((8, b"", -1))
+                continue
+            mapped += 1
+            t, n_, d_, u_ = hit
+            if d_ not in doms:
+                doms.append(d_)
+            rows.append((u_, _sid_bytes(t), doms.index(d_)))
+        size = ent * count + sum(len(r[1]) for r in rows)
+        a = p.heap_alloc(p.process_heap_handle, max(size, 8))
+        out = bytearray(size)
+        pos = a + ent * count
+        for i, (use, sb, di) in enumerate(rows):
+            sidp = pos if sb else 0
+            out[pos - a:pos - a + len(sb)] = sb
+            pos += len(sb)
+            if v2:
+                rec = struct.pack("<I4xQiI", use, sidp, di, 0) if ps == 8 else \
+                    struct.pack("<IIiI", use, sidp, di, 0)
+            else:
+                rid = struct.unpack_from("<I", sb, len(sb) - 4)[0] if sb else 0
+                rec = struct.pack("<IIi", use, rid, di)
+            out[i * ent:(i + 1) * ent] = rec
+        M_.write(a, bytes(out))
+        k.wptr(psids, a)
+        k.wptr(pdoms, domains_blob(doms, dom_sids))
+        if mapped == 0:
+            return 0xC0000073
+        return 0x107 if mapped < count else 0
+
+    R("LsaLookupNames", "pupPp".replace("P", "p"), dlls=_ADV)(
+        lambda c, h, n, names, pd, ps_: lookup_names(n, names, pd, ps_, False))
+    R("LsaLookupNames2", "puuppp", dlls=_ADV)(
+        lambda c, h, fl, n, names, pd, ps_: lookup_names(n, names, pd, ps_, True))
+
+    @R("LsaQueryInformationPolicy", "pup", dlls=_ADV)
+    def _lsaqip(c, h, cls, pbuf):
+        ps = k.ptr_size()
+        if cls in (3, 5):               # Primary / AccountDomain information
+            name = "WORKGROUP" if cls == 3 else "NOO-PC"
+            sid = b"" if cls == 3 else _sid_bytes(_SID_USER.rsplit("-", 1)[0])
+            nb = name.encode("utf-16-le") + b"\0\0"
+            head = 24 if ps == 8 else 12
+            a = p.heap_alloc(p.process_heap_handle, head + len(nb) + len(sid))
+            sidp = (a + head + len(nb)) if sid else 0
+            M_.write(a, ustr_bytes(a + head, name) + struct.pack("<Q" if ps == 8 else "<I",
+                                                                 sidp) + nb + sid)
+            k.wptr(pbuf, a)
+            return 0
+        return 0xC000000D                                       # STATUS_INVALID_PARAMETER
+
+    R("LsaEnumerateAccountRights", "pppp", dlls=_ADV)(lambda c, *a: 0xC0000034)
+    R("LsaAddAccountRights LsaRemoveAccountRights", "pppu", dlls=_ADV)(lambda c, *a: 0)
+    R("LsaEnumerateAccountsWithUserRight", "pppp", dlls=_ADV)(lambda c, *a: 0x8000001A)
+    R("LsaRetrievePrivateData LsaStorePrivateData", "ppp", dlls=_ADV)(lambda c, *a: 0xC0000034)
+    R("LsaSetInformationPolicy", "pup", dlls=_ADV)(lambda c, *a: 0)
 
     @R("LookupAccountNameA", "ppppppp", dlls=_ADV)
     def _lana(c, sysn, acct, sid, pcb, dom, pcchd, puse):
@@ -25044,6 +25497,974 @@ def _nt_install(k):
     @R("NetUserGetInfo NetUserGetLocalGroups NetLocalGroupGetMembers", "ppup", dlls=NA)
     def _nugi(c, server, user, level, out):
         return 2221                                     # NERR_UserNotFound
+    _nt_install2(k, {"ustr": ustr, "alloc_str": alloc_str, "objattr_path": objattr_path,
+                     "rptr": rptr, "st_from_err": st_from_err})
+
+
+STATUS_NO_MORE_ENTRIES, STATUS_INVALID_CID = 0x8000001A, 0xC000000B
+STATUS_MESSAGE_NOT_FOUND, STATUS_SECTION_NOT_IMAGE = 0xC0000109, 0xC0000049
+
+
+def _nt_install2(k, H):
+    """More of the native API: sections, Unicode strings and code pages, time fields,
+    the Nt registry calls, tokens, NtOpenProcess, message tables."""
+    R = k.reg
+    p = k.p
+    M_ = p.mem
+    NT = ("ntdll.dll",)
+    ps = k.ptr_size
+    ustr, alloc_str, objattr_path, rptr = H["ustr"], H["alloc_str"], H["objattr_path"], H["rptr"]
+    st_from_err = H["st_from_err"]
+
+    def buf_of(u):
+        return rptr(u + (8 if ps() == 8 else 4))
+
+    def put_ustr(u, text):
+        """Write text into an existing UNICODE_STRING buffer; STATUS_BUFFER_TOO_SMALL if needed."""
+        data = text.encode("utf-16-le")
+        cap = M_.read16(u + 2)
+        if len(data) > cap:
+            return STATUS_BUFFER_TOO_SMALL
+        M_.write(buf_of(u), data + (b"\0\0" if len(data) + 2 <= cap else b""))
+        M_.write16(u, len(data))
+        return 0
+
+    # ---- sections -------------------------------------------------------------------------
+    @R("NtCreateSection ZwCreateSection", "pupppup", dlls=NT)
+    def _ntcs(c, ph, access, oa, psize, prot, attrs, hfile):
+        size = M_.read64(psize) if psize else 0
+        name = objattr_path(oa) if oa and rptr(oa + (16 if ps() == 8 else 8)) else None
+        h = k.create_mapping(hfile if hfile else 0xFFFFFFFF, prot, size, name)
+        if not h:
+            return st_from_err() if p.last_error != 1006 else 0xC0000011
+        k.wptr(ph, h)
+        return 0
+
+    @R("NtOpenSection ZwOpenSection", "pup", dlls=NT)
+    def _ntos(c, ph, access, oa):
+        name = objattr_path(oa)
+        ent = k.named.get(name)
+        if ent is None:
+            return STATUS_OBJECT_NAME_NOT_FOUND
+        k.wptr(ph, p.handles.add(ent[1], "kmapping"))
+        return 0
+
+    @R("NtMapViewOfSection ZwMapViewOfSection", "pppzzppuuu", dlls=NT)
+    def _ntmvs(c, hs, proc, pbase, zbits, commit, poff, psize, inherit, typ, prot):
+        off = M_.read64(poff) if poff else 0
+        n = rptr(psize) if psize else 0
+        want = rptr(pbase) if pbase else 0
+        addr = k.map_view(hs, prot, off, n, want)
+        if not addr:
+            return STATUS_INVALID_HANDLE if p.last_error == 6 else 0xC0000018
+        ent = k.views.get(addr)
+        k.wptr(pbase, addr)
+        if psize and ent is not None:
+            k.wptr(psize, (ent[2] + 0xFFF) & ~0xFFF)
+        return 0
+
+    @R("NtUnmapViewOfSection ZwUnmapViewOfSection", "pp", dlls=NT)
+    def _ntuvs(c, proc, base):
+        return 0 if k.unmap_view(base) else 0xC0000019     # STATUS_NOT_MAPPED_VIEW
+
+    R("NtUnmapViewOfSectionEx ZwUnmapViewOfSectionEx", "ppu", dlls=NT)(
+        lambda c, proc, base, fl: _ntuvs(c, proc, base))
+
+    @R("NtQuerySection ZwQuerySection", "pupzp", dlls=NT)
+    def _ntqs(c, hs, cls, buf, n, pret):
+        m_ = p.handles.get(hs, "kmapping")
+        if m_ is None:
+            return STATUS_INVALID_HANDLE
+        if cls != 0:                                # SectionBasicInformation only
+            return STATUS_INVALID_INFO_CLASS
+        size = 24 if ps() == 8 else 16
+        if n < size:
+            return STATUS_INFO_LENGTH_MISMATCH
+        if ps() == 8:
+            M_.write(buf, struct.pack("<QIIq", m_.base or 0, 0x8000000, 0, m_.size)[:24])
+        else:
+            M_.write(buf, struct.pack("<IIq", m_.base or 0, 0x8000000, m_.size))
+        if pret:
+            M_.write32(pret, size)
+        return 0
+
+    R("NtExtendSection ZwExtendSection", "pp", dlls=NT)(lambda c, h, pn: 0)
+
+    # ---- characters, strings, code pages ---------------------------------------------------
+    R("RtlUpcaseUnicodeChar", "u", dlls=NT)(lambda c, ch: ord(chr(ch & 0xFFFF).upper()[0])
+                                            if len(chr(ch & 0xFFFF).upper()) == 1 else ch & 0xFFFF)
+    R("RtlDowncaseUnicodeChar", "u", dlls=NT)(lambda c, ch: ord(chr(ch & 0xFFFF).lower()[0])
+                                              if len(chr(ch & 0xFFFF).lower()) == 1
+                                              else ch & 0xFFFF)
+
+    def up1(s_):
+        return "".join(ch.upper() if len(ch.upper()) == 1 else ch for ch in s_)
+
+    def lo1(s_):
+        return "".join(ch.lower() if len(ch.lower()) == 1 else ch for ch in s_)
+
+    def case_op(dst, src, alloc, fn):
+        text = fn(ustr(src))
+        if alloc:
+            alloc_str(text, True, dst)
+            return 0
+        return put_ustr(dst, text)
+
+    R("RtlUpcaseUnicodeString", "ppi", dlls=NT)(lambda c, d, s_, a: case_op(d, s_, a, up1))
+    R("RtlDowncaseUnicodeString", "ppi", dlls=NT)(lambda c, d, s_, a: case_op(d, s_, a, lo1))
+
+    @R("RtlCompareUnicodeString", "ppi", dlls=NT)
+    def _rcus(c, a, b, ci):
+        x, y = ustr(a), ustr(b)
+        if ci:
+            x, y = up1(x), up1(y)
+        for ca, cb in zip(x, y):
+            if ca != cb:
+                return (ord(ca) - ord(cb)) & 0xFFFFFFFF
+        return (len(x) - len(y)) & 0xFFFFFFFF
+
+    @R("RtlCompareUnicodeStrings", "pzpzi", dlls=NT)
+    def _rcuss(c, a, na, b, nb, ci):
+        x = M_.read(a, 2 * na).decode("utf-16-le", "replace") if na else ""
+        y = M_.read(b, 2 * nb).decode("utf-16-le", "replace") if nb else ""
+        if ci:
+            x, y = up1(x), up1(y)
+        for ca, cb in zip(x, y):
+            if ca != cb:
+                return (ord(ca) - ord(cb)) & 0xFFFFFFFF
+        return (len(x) - len(y)) & 0xFFFFFFFF
+
+    @R("RtlEqualUnicodeString", "ppi", dlls=NT)
+    def _reus(c, a, b, ci):
+        x, y = ustr(a), ustr(b)
+        return 1 if (up1(x) == up1(y) if ci else x == y) else 0
+
+    @R("RtlPrefixUnicodeString", "ppi", dlls=NT)
+    def _rpus(c, pre, s_, ci):
+        x, y = ustr(pre), ustr(s_)
+        return 1 if (up1(y).startswith(up1(x)) if ci else y.startswith(x)) else 0
+
+    @R("RtlCopyUnicodeString", "pp", "v", dlls=NT)
+    def _rcpus(c, dst, src):
+        text = ustr(src) if src else ""
+        cap = M_.read16(dst + 2) // 2
+        put_ustr(dst, text[:cap])
+
+    @R("RtlAppendUnicodeToString", "pp", dlls=NT)
+    def _raus(c, dst, src):
+        return put_ustr(dst, ustr(dst) + (k.ws_(src) if src else ""))
+
+    @R("RtlAppendUnicodeStringToString", "pp", dlls=NT)
+    def _rauss(c, dst, src):
+        return put_ustr(dst, ustr(dst) + ustr(src))
+
+    @R("RtlCreateUnicodeString", "pp", dlls=NT)
+    def _rcus2(c, dst, src):
+        alloc_str(k.ws_(src), True, dst)
+        return 1
+
+    @R("RtlCreateUnicodeStringFromAsciiz", "pp", dlls=NT)
+    def _rcusa(c, dst, src):
+        alloc_str(k.cs_(src), True, dst)
+        return 1
+
+    @R("RtlDuplicateUnicodeString", "upp", dlls=NT)
+    def _rdus(c, flags, src, dst):
+        alloc_str(ustr(src), True, dst)
+        return 0
+
+    @R("RtlHashUnicodeString", "piup", dlls=NT)
+    def _rhus(c, s_, ci, alg, phash):
+        h = 0
+        for ch in (up1(ustr(s_)) if ci else ustr(s_)):
+            h = (h * 65599 + ord(ch)) & 0xFFFFFFFF
+        if phash:
+            M_.write32(phash, h)
+        return 0
+
+    @R("RtlIntegerToUnicodeString", "uup", dlls=NT)
+    def _rius2(c, v, base, dst):
+        base = base or 10
+        if base not in (2, 8, 10, 16):
+            return STATUS_INVALID_PARAMETER
+        text = {2: bin(v)[2:], 8: oct(v)[2:], 10: str(v), 16: "%X" % v}[base]
+        return put_ustr(dst, text)
+
+    @R("RtlInt64ToUnicodeString", "Qup", dlls=NT)
+    def _ri64us(c, v, base, dst):
+        return _rius2(c, v, base, dst)
+
+    @R("RtlUnicodeStringToInteger", "pup", dlls=NT)
+    def _rusti(c, s_, base, pv):
+        t = ustr(s_).strip()
+        neg = t.startswith("-")
+        t = t.lstrip("+-")
+        if not base:
+            base = 10
+            for pre, b in (("0x", 16), ("0o", 8), ("0b", 2)):
+                if t.lower().startswith(pre):
+                    t, base = t[2:], b
+        digits = ""
+        for ch in t:
+            if ch.lower() in "0123456789abcdef"[:base]:
+                digits += ch
+            else:
+                break
+        v = int(digits, base) if digits else 0
+        M_.write32(pv, (-v if neg else v) & 0xFFFFFFFF)
+        return 0
+
+    def mb_decode(data):
+        return data.decode("utf-8", "replace")
+
+    @R("RtlMultiByteToUnicodeSize", "ppu", dlls=NT)
+    def _rmbtus(c, pn, src, n):
+        M_.write32(pn, len(mb_decode(M_.read(src, n)).encode("utf-16-le")) if n else 0)
+        return 0
+
+    def mb_to_uni(dst, cap, pres, src, n, oem=False):
+        text = M_.read(src, n).decode("cp437" if oem else "utf-8", "replace") if n else ""
+        data = text.encode("utf-16-le")[:cap & ~1]
+        if data:
+            M_.write(dst, data)
+        if pres:
+            M_.write32(pres, len(data))
+        return 0
+
+    R("RtlMultiByteToUnicodeN", "pupPu".replace("P", "p"), dlls=NT)(
+        lambda c, d, cap, pr, s_, n: mb_to_uni(d, cap, pr, s_, n))
+    R("RtlOemToUnicodeN", "puppu", dlls=NT)(
+        lambda c, d, cap, pr, s_, n: mb_to_uni(d, cap, pr, s_, n, True))
+
+    def uni_to_mb(dst, cap, pres, src, n, oem=False, upper=False):
+        text = M_.read(src, n & ~1).decode("utf-16-le", "replace") if n else ""
+        if upper:
+            text = up1(text)
+        data = text.encode("cp437" if oem else "utf-8", "replace")[:cap]
+        if data:
+            M_.write(dst, data)
+        if pres:
+            M_.write32(pres, len(data))
+        return 0
+
+    R("RtlUnicodeToMultiByteN", "puppu", dlls=NT)(
+        lambda c, d, cap, pr, s_, n: uni_to_mb(d, cap, pr, s_, n))
+    R("RtlUnicodeToOemN", "puppu", dlls=NT)(
+        lambda c, d, cap, pr, s_, n: uni_to_mb(d, cap, pr, s_, n, True))
+    R("RtlUpcaseUnicodeToMultiByteN", "puppu", dlls=NT)(
+        lambda c, d, cap, pr, s_, n: uni_to_mb(d, cap, pr, s_, n, False, True))
+    R("RtlUpcaseUnicodeToOemN", "puppu", dlls=NT)(
+        lambda c, d, cap, pr, s_, n: uni_to_mb(d, cap, pr, s_, n, True, True))
+
+    @R("RtlUnicodeToMultiByteSize", "ppu", dlls=NT)
+    def _rutmbs(c, pn, src, n):
+        text = M_.read(src, n & ~1).decode("utf-16-le", "replace") if n else ""
+        M_.write32(pn, len(text.encode("utf-8", "replace")))
+        return 0
+
+    @R("RtlUnicodeStringToOemString RtlUpcaseUnicodeStringToOemString", "ppi", dlls=NT)
+    def _rusos(c, dst, src, alloc):
+        text = ustr(src)
+        if alloc:
+            alloc_str(text, False, dst)
+            return 0
+        data = text.encode("cp437", "replace")
+        if len(data) + 1 > M_.read16(dst + 2):
+            return STATUS_BUFFER_OVERFLOW
+        M_.write(buf_of(dst), data + b"\0")
+        M_.write16(dst, len(data))
+        return 0
+
+    R("RtlxUnicodeStringToAnsiSize RtlxUnicodeStringToOemSize", "p", dlls=NT)(
+        lambda c, s_: len(ustr(s_).encode("utf-8", "replace")) + 1)
+    R("RtlxAnsiStringToUnicodeSize RtlxOemStringToUnicodeSize", "p", dlls=NT)(
+        lambda c, s_: 2 * (M_.read16(s_) + 1))
+
+    # ---- time -------------------------------------------------------------------------------
+    EPOCH_1601 = 116444736000000000
+
+    @R("RtlTimeToTimeFields", "pp", "v", dlls=NT)
+    def _rtttf(c, pt, pf):
+        v = M_.read64(pt)
+        secs, rem = divmod(v, 10000000)
+        days, sod = divmod(secs, 86400)
+        import datetime as _dt
+        d = _dt.date(1601, 1, 1) + _dt.timedelta(days=days)
+        M_.write(pf, struct.pack("<8H", d.year, d.month, d.day, sod // 3600, (sod // 60) % 60,
+                                 sod % 60, rem // 10000, (d.weekday() + 1) % 7))
+
+    @R("RtlTimeFieldsToTime", "pp", dlls=NT)
+    def _rtftt(c, pf, pt):
+        y, mo, d, hh, mi, ss, ms, _wd = struct.unpack("<8H", M_.read(pf, 16))
+        import datetime as _dt
+        try:
+            days = (_dt.date(y, mo, d) - _dt.date(1601, 1, 1)).days
+        except ValueError:
+            return 0
+        if hh > 23 or mi > 59 or ss > 59 or ms > 999:
+            return 0
+        M_.write64(pt, ((days * 86400 + hh * 3600 + mi * 60 + ss) * 1000 + ms) * 10000)
+        return 1
+
+    @R("RtlTimeToSecondsSince1970", "pp", dlls=NT)
+    def _rtts70(c, pt, ps_):
+        v = (M_.read64(pt) - EPOCH_1601) // 10000000
+        if not 0 <= v <= 0xFFFFFFFF:
+            return 0
+        M_.write32(ps_, v)
+        return 1
+
+    @R("RtlSecondsSince1970ToTime", "up", "v", dlls=NT)
+    def _rs70tt(c, s_, pt):
+        M_.write64(pt, s_ * 10000000 + EPOCH_1601)
+
+    @R("RtlTimeToSecondsSince1980", "pp", dlls=NT)
+    def _rtts80(c, pt, ps_):
+        v = (M_.read64(pt) - EPOCH_1601) // 10000000 - 315532800
+        if not 0 <= v <= 0xFFFFFFFF:
+            return 0
+        M_.write32(ps_, v)
+        return 1
+
+    @R("RtlSecondsSince1980ToTime", "up", "v", dlls=NT)
+    def _rs80tt(c, s_, pt):
+        M_.write64(pt, (s_ + 315532800) * 10000000 + EPOCH_1601)
+
+    def lcg(pseed):
+        seed = M_.read32(pseed)
+        seed = (seed * 0x7FFFFFED + 0x7FFFFFC3) % 0x7FFFFFFF
+        M_.write32(pseed, seed)
+        return seed
+
+    R("RtlRandom RtlRandomEx RtlUniform", "p", dlls=NT)(lambda c, pseed: lcg(pseed))
+
+    # ---- current directory ------------------------------------------------------------------
+    @R("RtlGetCurrentDirectory_U", "up", dlls=NT)
+    def _rgcd(c, n, buf):
+        cwd = p.vfs.getcwd()
+        data = cwd.encode("utf-16-le")
+        if n < len(data) + 2:
+            return len(data) + 2
+        M_.write(buf, data + b"\0\0")
+        return len(data)
+
+    @R("RtlSetCurrentDirectory_U", "p", dlls=NT)
+    def _rscd(c, u):
+        path = ustr(u)
+        try:
+            p.vfs.setcwd(path)
+        except Exception:
+            return STATUS_OBJECT_PATH_NOT_FOUND
+        return 0
+
+    # ---- message tables ----------------------------------------------------------------------
+    @R("RtlFindMessage", "puuup", dlls=NT)
+    def _rfm(c, hmod, table, lang, msgid, pent):
+        text = None
+        mod = getattr(p.modules, "by_handle", {}).get(hmod) if hmod else None
+        if mod is not None and getattr(mod, "pe", None) is not None:
+            text = k.msg_table(hmod, msgid)
+        if text is None:
+            name = (getattr(mod, "name", "") or "").lower() if mod is not None else ""
+            if "ntdll" in name:
+                code = _NT_TO_W32.get(msgid)
+                text = _SYS_ERRORS.get(code) if code else None
+                if text is None and msgid >> 30 == 3:
+                    text = "{Application Error}\nThe exception 0x%08X occurred." % msgid
+            elif "kernel32" in name or "kernelbase" in name or not name:
+                text = _SYS_ERRORS.get(msgid)
+        if text is None:
+            return STATUS_MESSAGE_NOT_FOUND
+        data = (text.rstrip("\r\n") + "\r\n").encode("utf-16-le") + b"\0\0"
+        ent = p.heap_alloc(p.process_heap_handle, len(data) + 4)
+        M_.write(ent, struct.pack("<HH", len(data) + 4, 1) + data)
+        k.wptr(pent, ent)
+        return 0
+
+    # ---- registry (native) ---------------------------------------------------------------
+    def nt_key_path(oa):
+        """OBJECT_ATTRIBUTES -> (hive, path) or None."""
+        root = rptr(oa + (8 if ps() == 8 else 4))
+        name = ustr(rptr(oa + (16 if ps() == 8 else 8))).strip("\\")
+        if root:
+            base = k.regh["hkey"](root)
+            if base is None:
+                return None
+            return base[0], k.regh["join"](base[1], name)
+        up = name.upper()
+        for pre, hive in (("REGISTRY\\MACHINE", "HKLM"), ("REGISTRY\\USER", "HKU")):
+            if up == pre or up.startswith(pre + "\\"):
+                rest = name[len(pre):].strip("\\")
+                if hive == "HKU":
+                    sid, _s, tail = rest.partition("\\")
+                    if sid.upper().startswith("S-1-5-21") or sid.upper() == ".DEFAULT":
+                        if sid.upper().endswith("_CLASSES"):
+                            return "HKCU", k.regh["join"]("Software\\Classes", tail)
+                        return "HKCU", tail
+                return hive, rest
+        return None
+
+    def open_nt_key(ph, oa, create=False, pdisp=None):
+        kp = nt_key_path(oa)
+        if kp is None:
+            return STATUS_OBJECT_NAME_NOT_FOUND
+        hive, path = kp
+        existed = k.regh["exists"](hive, path)
+        if not existed:
+            if not create:
+                return STATUS_OBJECT_NAME_NOT_FOUND
+            if not p.sandbox.allow_registry_write:
+                return STATUS_ACCESS_DENIED
+            k.regh["entry"](hive, path, True)
+        if pdisp:
+            M_.write32(pdisp, 2 if existed else 1)
+        k.wptr(ph, p.handles.add((hive, path), "regkey"))
+        return 0
+
+    R("NtOpenKey ZwOpenKey", "pup", dlls=NT)(lambda c, ph, acc, oa: open_nt_key(ph, oa))
+    R("NtOpenKeyEx ZwOpenKeyEx", "pupu", dlls=NT)(
+        lambda c, ph, acc, oa, opt: open_nt_key(ph, oa))
+    R("NtCreateKey ZwCreateKey", "pupupup", dlls=NT)(
+        lambda c, ph, acc, oa, ti, cls, opt, pdisp: open_nt_key(ph, oa, True, pdisp))
+
+    def key_ent(h):
+        base = k.regh["hkey"](h)
+        if base is None:
+            return None, None
+        return base, k.regh["entry"](*base)
+
+    def fill(buf, n, pret, data):
+        if pret:
+            M_.write32(pret, len(data))
+        if n < len(data):
+            if n >= 8 and buf:
+                M_.write(buf, data[:n])
+            return STATUS_BUFFER_OVERFLOW if n else STATUS_BUFFER_TOO_SMALL
+        M_.write(buf, data)
+        return 0
+
+    def value_info(nm, vtype, val, cls):
+        raw = k.regh["to_raw"](vtype, val, True)
+        t = _REG_N.get(vtype, 3)
+        nb = nm.encode("utf-16-le")
+        if cls == 0:                                # KeyValueBasicInformation
+            return struct.pack("<III", 0, t, len(nb)) + nb
+        if cls == 1:                                # KeyValueFullInformation
+            off = (20 + len(nb) + 7) & ~7
+            head = struct.pack("<IIIII", 0, t, off, len(raw), len(nb)) + nb
+            return head + bytes(off - len(head)) + raw
+        if cls in (2, 3):                           # KeyValuePartialInformation(Align64)
+            if cls == 3:
+                return struct.pack("<II", t, len(raw)) + raw
+            return struct.pack("<III", 0, t, len(raw)) + raw
+        return None
+
+    @R("NtQueryValueKey ZwQueryValueKey", "ppupup", dlls=NT)
+    def _ntqvk(c, h, pname, cls, buf, n, pret):
+        base, ent = key_ent(h)
+        if ent is None:
+            return STATUS_INVALID_HANDLE if base is None else STATUS_OBJECT_NAME_NOT_FOUND
+        kk, v = k.regh["find_value"](ent, ustr(pname) if pname else "")
+        if v is None:
+            return STATUS_OBJECT_NAME_NOT_FOUND
+        data = value_info(kk, v[0], v[1], cls)
+        if data is None:
+            return STATUS_INVALID_PARAMETER
+        return fill(buf, n, pret, data)
+
+    @R("NtEnumerateValueKey ZwEnumerateValueKey", "puupup", dlls=NT)
+    def _ntevk(c, h, i, cls, buf, n, pret):
+        base, ent = key_ent(h)
+        if ent is None:
+            return STATUS_INVALID_HANDLE
+        vals = list(ent["values"].items())
+        if i >= len(vals):
+            return STATUS_NO_MORE_ENTRIES
+        nm, (vtype, val) = vals[i]
+        data = value_info(nm, vtype, val, cls)
+        if data is None:
+            return STATUS_INVALID_PARAMETER
+        return fill(buf, n, pret, data)
+
+    def key_info(hive, path, ent, name, cls):
+        ft = (int(time.time()) * 10000000) + EPOCH_1601
+        nb = name.encode("utf-16-le")
+        if cls == 0:                                # KeyBasicInformation
+            return struct.pack("<qII", ft, 0, len(nb)) + nb
+        if cls == 1:                                # KeyNodeInformation
+            return struct.pack("<qIIII", ft, 0, 0xFFFFFFFF, 0, len(nb)) + nb
+        if cls == 2:                                # KeyFullInformation
+            subs = list(ent["sub"].keys()) if ent else []
+            vals = list(ent["values"].items()) if ent else []
+            maxd = max([len(k.regh["to_raw"](t, v, True)) for _n, (t, v) in vals] or [0])
+            return struct.pack("<qIIIIIIIIII", ft, 0, 44, 0, len(subs),
+                               max([len(x) * 2 for x in subs] or [0]), 0, len(vals),
+                               max([len(x) * 2 for x, _v in vals] or [0]), maxd, 0)[:44]
+        if cls == 3:                                # KeyNameInformation
+            root = {"HKLM": "\\REGISTRY\\MACHINE", "HKU": "\\REGISTRY\\USER",
+                    "HKCU": "\\REGISTRY\\USER\\S-1-5-21-0-0-0-1000",
+                    "HKCR": "\\REGISTRY\\MACHINE\\SOFTWARE\\Classes"}.get(hive, "\\REGISTRY")
+            full = (root + ("\\" + path if path else "")).encode("utf-16-le")
+            return struct.pack("<I", len(full)) + full
+        if cls == 4:                                # KeyCachedInformation
+            subs = list(ent["sub"].keys()) if ent else []
+            vals = list(ent["values"].items()) if ent else []
+            return struct.pack("<qIIIIII", ft, 0, len(subs), 0, len(vals), 0, 0, len(nb))
+        return None
+
+    @R("NtEnumerateKey ZwEnumerateKey", "puupup", dlls=NT)
+    def _ntek(c, h, i, cls, buf, n, pret):
+        base, ent = key_ent(h)
+        if ent is None:
+            return STATUS_INVALID_HANDLE
+        keys = sorted(ent["sub"].keys(), key=str.upper)
+        if i >= len(keys):
+            return STATUS_NO_MORE_ENTRIES
+        nm = keys[i]
+        sub_path = k.regh["join"](base[1], nm)
+        data = key_info(base[0], sub_path, k.regh["entry"](base[0], sub_path), nm, cls)
+        if data is None:
+            return STATUS_INVALID_PARAMETER
+        return fill(buf, n, pret, data)
+
+    @R("NtQueryKey ZwQueryKey", "pupup", dlls=NT)
+    def _ntqk(c, h, cls, buf, n, pret):
+        base, ent = key_ent(h)
+        if base is None:
+            return STATUS_INVALID_HANDLE
+        name = base[1].rsplit("\\", 1)[-1]
+        data = key_info(base[0], base[1], ent, name, cls)
+        if data is None:
+            return STATUS_INVALID_PARAMETER
+        return fill(buf, n, pret, data)
+
+    @R("NtSetValueKey ZwSetValueKey", "ppuupu", dlls=NT)
+    def _ntsvk(c, h, pname, ti, t, data, n):
+        base, ent = key_ent(h)
+        if ent is None:
+            return STATUS_INVALID_HANDLE
+        if not p.sandbox.allow_registry_write:
+            return STATUS_ACCESS_DENIED
+        raw = M_.read(data, n) if n else b""
+        vtype, val = k.regh["from_raw"](t, bytes(raw), True)
+        nm = ustr(pname) if pname else ""
+        kk, _v = k.regh["find_value"](ent, nm)
+        ent["values"][kk or nm] = (vtype, val)
+        return 0
+
+    @R("NtDeleteValueKey ZwDeleteValueKey", "pp", dlls=NT)
+    def _ntdvk(c, h, pname):
+        base, ent = key_ent(h)
+        if ent is None:
+            return STATUS_INVALID_HANDLE
+        kk, v = k.regh["find_value"](ent, ustr(pname) if pname else "")
+        if v is None:
+            return STATUS_OBJECT_NAME_NOT_FOUND
+        del ent["values"][kk]
+        return 0
+
+    @R("NtDeleteKey ZwDeleteKey", "p", dlls=NT)
+    def _ntdk(c, h):
+        base = k.regh["hkey"](h)
+        if base is None:
+            return STATUS_INVALID_HANDLE
+        parent, _s, leaf = base[1].rpartition("\\")
+        pent = k.regh["entry"](base[0], parent)
+        if pent is None:
+            return STATUS_OBJECT_NAME_NOT_FOUND
+        for kk in list(pent["sub"].keys()):
+            if kk.upper() == leaf.upper():
+                if pent["sub"][kk].get("sub"):
+                    return 0xC0000121                   # STATUS_CANNOT_DELETE
+                del pent["sub"][kk]
+                return 0
+        return STATUS_OBJECT_NAME_NOT_FOUND
+
+    R("NtFlushKey ZwFlushKey", "p", dlls=NT)(lambda c, h: 0)
+    R("NtNotifyChangeKey ZwNotifyChangeKey", "ppppppuipu", dlls=NT)(
+        lambda c, *a: 0x103)                             # STATUS_PENDING: nothing changes
+
+    # ---- processes and tokens ----------------------------------------------------------------
+    @R("NtOpenProcess ZwOpenProcess", "pupp", dlls=NT)
+    def _ntop(c, ph, acc, oa, cid):
+        pid = rptr(cid) if cid else 0
+        if pid == p.pid:
+            k.wptr(ph, p.handles.add({"exited": False, "pid": pid}, "process"))
+            return 0
+        child = getattr(k, "children", {}).get(pid)
+        if child is not None:
+            k.wptr(ph, p.handles.add(child, "process"))
+            return 0
+        return STATUS_INVALID_CID
+
+    @R("NtOpenProcessToken ZwOpenProcessToken", "pup", dlls=NT)
+    def _ntopt(c, proc, acc, ph):
+        k.wptr(ph, p.handles.add({"kind": "primary"}, "token"))
+        return 0
+
+    R("NtOpenProcessTokenEx ZwOpenProcessTokenEx", "puup", dlls=NT)(
+        lambda c, proc, acc, attrs, ph: _ntopt(c, proc, acc, ph))
+    R("NtOpenThreadToken ZwOpenThreadToken", "puip", dlls=NT)(
+        lambda c, th, acc, self_, ph: 0xC000007C)        # STATUS_NO_TOKEN
+    R("NtOpenThreadTokenEx ZwOpenThreadTokenEx", "puiup", dlls=NT)(
+        lambda c, th, acc, self_, attrs, ph: 0xC000007C)
+
+    @R("NtQueryInformationToken ZwQueryInformationToken", "puppp", dlls=NT)
+    def _ntqit(c, h, cls, buf, n, pret):
+        b = k.token_info(cls)
+        if b is None:
+            return STATUS_INVALID_INFO_CLASS
+        data = b(buf or 0)                      # builders lay out pointers relative to buf
+        if pret:
+            M_.write32(pret, len(data))
+        if not buf or n < len(data):
+            return STATUS_BUFFER_TOO_SMALL
+        M_.write(buf, data)
+        return 0
+
+    R("NtAdjustPrivilegesToken ZwAdjustPrivilegesToken", "piuppp", dlls=NT)(
+        lambda c, h, dis, new, n, prev, pret: (M_.write32(pret, 0) if pret else None, 0)[1])
+
+    @R("RtlAdjustPrivilege", "uiip", dlls=NT)
+    def _rap(c, priv, enable, client, pwas):
+        if pwas:
+            M_.write8(pwas, 0)
+        return 0
+
+
+    # ---- synchronization objects --------------------------------------------------------------
+    STATUS_OBJECT_NAME_EXISTS = 0x40000000
+
+    def obj_name(oa):
+        if not oa or not rptr(oa + (16 if ps() == 8 else 8)):
+            return None
+        n = ustr(rptr(oa + (16 if ps() == 8 else 8)))
+        for pre in ("\\BaseNamedObjects\\", "\\Sessions\\1\\BaseNamedObjects\\"):
+            if n.startswith(pre):
+                n = n[len(pre):]
+        return n or None
+
+    def create_named(ph, kind, oa, make):
+        name = obj_name(oa)
+        if name and name in k.named:
+            k.wptr(ph, p.handles.add(k.named[name][1], kind))
+            return STATUS_OBJECT_NAME_EXISTS
+        obj = make()
+        h = p.handles.add(obj, kind)
+        if name:
+            k.named[name] = (h, obj)
+        k.wptr(ph, h)
+        return 0
+
+    def open_named(ph, kind, oa):
+        name = obj_name(oa)
+        ent = k.named.get(name) if name else None
+        if ent is None:
+            return STATUS_OBJECT_NAME_NOT_FOUND
+        k.wptr(ph, p.handles.add(ent[1], kind))
+        return 0
+
+    @R("NtCreateSemaphore ZwCreateSemaphore", "pupii", dlls=NT)
+    def _ntcsem(c, ph, acc, oa, init, mx):
+        if mx <= 0 or not 0 <= init <= mx:
+            return STATUS_INVALID_PARAMETER
+        return create_named(ph, "ksem", oa, lambda: _KSemaphore(init, mx))
+
+    R("NtOpenSemaphore ZwOpenSemaphore", "pup", dlls=NT)(
+        lambda c, ph, acc, oa: open_named(ph, "ksem", oa))
+
+    @R("NtReleaseSemaphore ZwReleaseSemaphore", "pip", dlls=NT)
+    def _ntrsem(c, h, n, prev):
+        s_ = p.handles.get(h, "ksem")
+        if s_ is None:
+            return STATUS_INVALID_HANDLE
+        if s_.count + n > s_.maximum:
+            return 0xC0000047                               # STATUS_SEMAPHORE_LIMIT_EXCEEDED
+        if prev:
+            M_.write32(prev, s_.count)
+        s_.count += n
+        return 0
+
+    @R("NtQuerySemaphore ZwQuerySemaphore", "pupup", dlls=NT)
+    def _ntqsem(c, h, cls, buf, n, pret):
+        s_ = p.handles.get(h, "ksem")
+        if s_ is None:
+            return STATUS_INVALID_HANDLE
+        if n < 8:
+            return STATUS_INFO_LENGTH_MISMATCH
+        M_.write(buf, struct.pack("<ii", s_.count, s_.maximum))
+        if pret:
+            M_.write32(pret, 8)
+        return 0
+
+    def make_mutant(owned):
+        m_ = _KMutex()
+        if owned:
+            m_.owner = p.current_thread.tid
+            m_.count = 1
+        return m_
+
+    R("NtCreateMutant ZwCreateMutant", "pupi", dlls=NT)(
+        lambda c, ph, acc, oa, owned: create_named(ph, "kmutex", oa, lambda: make_mutant(owned)))
+    R("NtOpenMutant ZwOpenMutant", "pup", dlls=NT)(
+        lambda c, ph, acc, oa: open_named(ph, "kmutex", oa))
+
+    @R("NtReleaseMutant ZwReleaseMutant", "pp", dlls=NT)
+    def _ntrmut(c, h, prev):
+        m_ = p.handles.get(h, "kmutex")
+        if m_ is None:
+            return STATUS_INVALID_HANDLE
+        if m_.owner != p.current_thread.tid:
+            return 0xC0000046                               # STATUS_MUTANT_NOT_OWNED
+        if prev:
+            M_.write32(prev, 1 - m_.count)
+        m_.count -= 1
+        if m_.count <= 0:
+            m_.count, m_.owner = 0, 0
+        return 0
+
+    R("NtOpenEvent ZwOpenEvent", "pup", dlls=NT)(
+        lambda c, ph, acc, oa: open_named(ph, "kevent", oa))
+
+    @R("NtQueryEvent ZwQueryEvent", "pupup", dlls=NT)
+    def _ntqev(c, h, cls, buf, n, pret):
+        ev = p.handles.get(h, "kevent")
+        if ev is None:
+            return STATUS_INVALID_HANDLE
+        if n < 8:
+            return STATUS_INFO_LENGTH_MISMATCH
+        M_.write(buf, struct.pack("<ii", 0 if ev.manual else 1, 1 if ev.signaled else 0))
+        if pret:
+            M_.write32(pret, 8)
+        return 0
+
+    # ---- threads ------------------------------------------------------------------------------
+    @R("NtCreateThreadEx ZwCreateThreadEx", "pupppuuzzzp", dlls=NT)
+    def _ntcte(c, ph, acc, oa, proc, start, arg, flags, zbits, stack, maxstack, attrs):
+        tid, h = p.create_thread(start, arg, stack or 0x100000)
+        t = p.handles.get(h, "thread")
+        if flags & 1 and t is not None:                     # THREAD_CREATE_FLAGS_CREATE_SUSPENDED
+            t.state = "suspended"
+            t.suspend = 1
+        k.wptr(ph, h)
+        return 0
+
+    def thr(h):
+        if h in (0xFFFFFFFE, 0xFFFFFFFFFFFFFFFE):
+            return p.current_thread
+        return p.handles.get(h, "thread")
+
+    @R("NtSuspendThread ZwSuspendThread", "pp", dlls=NT)
+    def _ntsusp(c, h, prev):
+        t = thr(h)
+        if t is None:
+            return STATUS_INVALID_HANDLE
+        pv = getattr(t, "suspend", 0)
+        t.suspend = pv + 1
+        if t.state == "running" and t is not p.current_thread:
+            t.state = "suspended"
+        if prev:
+            M_.write32(prev, pv)
+        return 0
+
+    @R("NtResumeThread ZwResumeThread NtAlertResumeThread", "pp", dlls=NT)
+    def _ntres(c, h, prev):
+        t = thr(h)
+        if t is None:
+            return STATUS_INVALID_HANDLE
+        pv = getattr(t, "suspend", 0)
+        if pv:
+            t.suspend = pv - 1
+            if t.suspend == 0 and t.state == "suspended":
+                t.state = "running"
+        if prev:
+            M_.write32(prev, pv)
+        return 0
+
+    @R("NtQueueApcThread ZwQueueApcThread", "ppppp", dlls=NT)
+    def _ntqapc(c, h, fn, a1, a2, a3):
+        t = thr(h)
+        if t is None:
+            return STATUS_INVALID_HANDLE
+        k.queue_apc(t, fn, [a1, a2, a3])
+        return 0
+
+    R("NtTestAlert ZwTestAlert", "", dlls=NT)(lambda c: 0x101 if k.run_apcs() else 0)
+    R("NtAlertThread ZwAlertThread", "p", dlls=NT)(lambda c, h: 0)
+
+    # ---- file attributes by name ------------------------------------------------------------
+    def stat_oa(oa):
+        path = objattr_path(oa)
+        try:
+            host = p.vfs.resolve(path)
+            return os.stat(host), host
+        except Exception:
+            return None, None
+
+    def ft(t):
+        return int(t * 10000000) + EPOCH_1601
+
+    def attrs(host, st):
+        a = 0x10 if os.path.isdir(host) else 0x20
+        base = os.path.basename(host)
+        if base.startswith(".") and base not in (".", ".."):
+            a |= 2
+        return a
+
+    @R("NtQueryAttributesFile ZwQueryAttributesFile", "pp", dlls=NT)
+    def _ntqaf(c, oa, buf):
+        st, host = stat_oa(oa)
+        if st is None:
+            return STATUS_OBJECT_NAME_NOT_FOUND
+        M_.write(buf, struct.pack("<qqqqI4x", ft(st.st_ctime), ft(st.st_atime),
+                                  ft(st.st_mtime), ft(st.st_mtime), attrs(host, st)))
+        return 0
+
+    @R("NtQueryFullAttributesFile ZwQueryFullAttributesFile", "pp", dlls=NT)
+    def _ntqfaf(c, oa, buf):
+        st, host = stat_oa(oa)
+        if st is None:
+            return STATUS_OBJECT_NAME_NOT_FOUND
+        size = 0 if os.path.isdir(host) else st.st_size
+        M_.write(buf, struct.pack("<qqqqqqI4x", ft(st.st_ctime), ft(st.st_atime),
+                                  ft(st.st_mtime), ft(st.st_mtime), (size + 4095) & ~4095,
+                                  size, attrs(host, st)))
+        return 0
+
+    @R("NtDeleteFile ZwDeleteFile", "p", dlls=NT)
+    def _ntdf(c, oa):
+        path = objattr_path(oa)
+        try:
+            host = p.vfs.resolve(path, for_write=True)
+            if os.path.isdir(host):
+                os.rmdir(host)
+            else:
+                os.remove(host)
+        except FileNotFoundError:
+            return STATUS_OBJECT_NAME_NOT_FOUND
+        except OSError:
+            return STATUS_ACCESS_DENIED
+        except Exception:
+            return STATUS_ACCESS_DENIED
+        return 0
+
+    # ---- object manager namespace, security, misc ------------------------------------------
+    R("NtOpenDirectoryObject ZwOpenDirectoryObject NtOpenSymbolicLinkObject "
+      "ZwOpenSymbolicLinkObject", "pup", dlls=NT)(
+        lambda c, ph, acc, oa: STATUS_OBJECT_NAME_NOT_FOUND)
+    R("NtQueryDirectoryObject ZwQueryDirectoryObject", "ppuiipp", dlls=NT)(
+        lambda c, *a: STATUS_NO_MORE_ENTRIES)
+    R("NtQuerySymbolicLinkObject ZwQuerySymbolicLinkObject", "ppp", dlls=NT)(
+        lambda c, h, u, pret: STATUS_INVALID_HANDLE)
+
+    @R("NtQuerySecurityObject ZwQuerySecurityObject", "pupup", dlls=NT)
+    def _ntqso(c, h, info, sd, n, pneeded):
+        data = struct.pack("<BBHIIII", 1, 0, 0x8000, 0, 0, 0, 0)   # empty self-relative SD
+        if pneeded:
+            M_.write32(pneeded, len(data))
+        if n < len(data):
+            return STATUS_BUFFER_TOO_SMALL
+        M_.write(sd, data)
+        return 0
+
+    R("NtSetSecurityObject ZwSetSecurityObject", "pup", dlls=NT)(lambda c, h, i, sd: 0)
+    R("NtPowerInformation ZwPowerInformation", "upupu", dlls=NT)(
+        lambda c, *a: STATUS_NOT_IMPLEMENTED)
+    R("NtQueryLicenseValue ZwQueryLicenseValue", "ppppp", dlls=NT)(
+        lambda c, *a: STATUS_OBJECT_NAME_NOT_FOUND)
+    R("NtQuerySystemInformationEx ZwQuerySystemInformationEx", "upupup", dlls=NT)(
+        lambda c, *a: STATUS_INVALID_INFO_CLASS)
+
+    @R("NtQueryInformationJobObject ZwQueryInformationJobObject", "pupup", dlls=NT)
+    def _ntqijo(c, h, cls, buf, n, pret):
+        o = p.handles.get(h) if h else None
+        if not isinstance(o, dict) or not o.get("job"):
+            return STATUS_ACCESS_DENIED if not h else STATUS_INVALID_HANDLE
+        M_.write(buf, bytes(n))
+        if pret:
+            M_.write32(pret, n)
+        return 0
+
+    # ---- DOS path helpers ---------------------------------------------------------------------
+    def dos_path_type(s_):
+        if s_.startswith(("\\\\", "//")):
+            if len(s_) >= 3 and s_[2] in ".?":
+                if len(s_) == 3:
+                    return 7                                  # RtlPathTypeRootLocalDevice
+                if s_[3] in "\\/":
+                    return 6                                  # RtlPathTypeLocalDevice
+            return 1                                          # RtlPathTypeUncAbsolute
+        if s_.startswith(("\\", "/")):
+            return 4                                          # RtlPathTypeRooted
+        if len(s_) >= 2 and s_[1] == ":":
+            return 2 if len(s_) >= 3 and s_[2] in "\\/" else 3
+        return 5                                              # RtlPathTypeRelative
+
+    R("RtlDetermineDosPathNameType_U", "p", dlls=NT)(lambda c, a: dos_path_type(k.ws_(a))
+                                                      if a else 0)
+
+    @R("RtlDoesFileExists_U RtlDoesFileExists_UEx", "p", dlls=NT)
+    def _rdfe(c, a):
+        try:
+            return 1 if os.path.exists(p.vfs.resolve(k.ws_(a))) else 0
+        except Exception:
+            return 0
+
+    R("RtlIsDosDeviceName_U", "p", dlls=NT)(
+        lambda c, a: (lambda n: ((len(n.rsplit("\\", 1)[-1].split(".")[0]) * 2) & 0xFFFF)
+                      if n.rsplit("\\", 1)[-1].split(".")[0].upper() in
+                      ("CON", "NUL", "AUX", "PRN", "COM1", "COM2", "LPT1") else 0)(k.ws_(a)))
+
+    # ---- atoms and timers -------------------------------------------------------------------------
+    def atom_via(fn, name_ptr, nbytes, patom):
+        mark = p.wm.scratch_mark() if getattr(p, "wm", None) else None
+        tmp = p.heap_alloc(p.process_heap_handle, nbytes + 2)
+        try:
+            M_.write(tmp, bytes(M_.read(name_ptr, nbytes)) + b"\0\0")
+            a = fn(tmp, True)
+        finally:
+            p.heap_free(p.process_heap_handle, tmp)
+        if not a:
+            return STATUS_OBJECT_NAME_NOT_FOUND
+        if patom:
+            M_.write16(patom, a)
+        return 0
+
+    R("NtAddAtom ZwAddAtom", "pup", dlls=NT)(
+        lambda c, nm, n, pa: atom_via(k.add_atom, nm, n, pa))
+    R("NtAddAtomEx ZwAddAtomEx", "pupu", dlls=NT)(
+        lambda c, nm, n, pa, fl: atom_via(k.add_atom, nm, n, pa))
+    R("NtFindAtom ZwFindAtom", "pup", dlls=NT)(
+        lambda c, nm, n, pa: atom_via(k.find_atom, nm, n, pa))
+
+    @R("NtCreateTimer ZwCreateTimer", "pupu", dlls=NT)
+    def _ntctm(c, ph, acc, oa, typ):
+        return create_named(ph, "ktimer", oa, lambda: k.KTimer(typ == 0))
+
+    R("NtOpenTimer ZwOpenTimer", "pup", dlls=NT)(
+        lambda c, ph, acc, oa: open_named(ph, "ktimer", oa))
+
+    @R("NtSetTimer ZwSetTimer", "ppppiip", dlls=NT)
+    def _ntstm(c, h, pdue, apc, ctx, resume, period, prev):
+        tm = p.handles.get(h, "ktimer")
+        if tm is None:
+            return STATUS_INVALID_HANDLE
+        if prev:
+            M_.write8(prev, 1 if tm.signaled else 0)
+        k.set_timer(h, pdue, period)
+        return 0
+
+    R("NtSetTimerEx ZwSetTimerEx", "pupu", dlls=NT)(lambda c, h, cls, buf, n: 0)
+
+    @R("NtCancelTimer ZwCancelTimer", "pp", dlls=NT)
+    def _ntcntm(c, h, prev):
+        tm = p.handles.get(h, "ktimer")
+        if tm is None:
+            return STATUS_INVALID_HANDLE
+        if prev:
+            M_.write8(prev, 1 if tm.signaled else 0)
+        tm.due = None
+        return 0
 
 
 # ==============================================================================
@@ -43175,6 +44596,7 @@ def _gui_install(k):
     _mdi_install(k)
     _stream_install(k)
     _gdiplus_install(k)
+    _propsheet_install(k)
 
 
 # -- displays: headless (PNG dump / scripted input), Tk, AetherOS web sessions ----------------------
@@ -48558,16 +49980,6 @@ def _cc_install_bars(k, notify, NMHDR_SZ, hfont, gfont, paint, IL, py_class):
         if pverify:
             M_.write32(pverify, 0)
         return _task_dialog(c, owner, inst, title, main, content, common or 1, icon, pbutton)
-
-    # ---- property sheets: pages shown one at a time in a tab dialog ---------------------------
-    reg("CreatePropertySheetPageA CreatePropertySheetPageW", "p", "p")(
-        lambda c, a: gdi.add(_GMisc("psp", addr=a, copy=bytes(M_.read(a, 0x60)))))
-    reg("DestroyPropertySheetPage", "p")(lambda c, h: 1)
-
-    @reg("PropertySheetA PropertySheetW", "p", "p")
-    def _psheet(c, hdr):
-        p.log.warn("PropertySheet: property sheets are not implemented yet — returning cancel")
-        return 0
 
 
 # ==========================================================================================
@@ -58632,6 +60044,713 @@ def _gdiplus_text_install(k, env):
                                                                prect, hsf, True))
 
 
+# ==========================================================================================
+# 10w. Property sheets and wizards (comctl32 PropertySheet / CreatePropertySheetPage):
+#      a #32770 frame with a tab control (or wizard buttons) hosting child page dialogs,
+#      PSN_* notifications and the PSM_* message set
+# ==========================================================================================
+PSH_PROPTITLE, PSH_USEHICON, PSH_PROPSHEETPAGE, PSH_WIZARD = 0x1, 0x2, 0x8, 0x20
+PSH_USEPSTARTPAGE, PSH_NOAPPLYNOW, PSH_USECALLBACK, PSH_HASHELP, PSH_MODELESS = \
+    0x40, 0x80, 0x100, 0x200, 0x400
+PSH_WIZARD97, PSH_AEROWIZARD, PSH_WIZARD_LITE = 0x1000000, 0x4000, 0x400000
+PSP_DLGINDIRECT, PSP_USETITLE, PSP_USECALLBACK = 0x1, 0x8, 0x80
+PSN_SETACTIVE, PSN_KILLACTIVE, PSN_APPLY, PSN_RESET, PSN_HELP = -200, -201, -202, -203, -205
+PSN_WIZBACK, PSN_WIZNEXT, PSN_WIZFINISH, PSN_QUERYCANCEL = -206, -207, -208, -209
+PSBTN_IDS = {"back": 0x3023, "next": 0x3024, "finish": 0x3025, "ok": 1, "cancel": 2,
+             "apply": 0x3021, "help": 0x0009}
+
+
+def _load_string(p, inst, sid):
+    """String resource sid of module inst (or the main module) -> str or None."""
+    sid &= 0xFFFF
+    data = _res_bytes(p, inst, 6, (sid >> 4) + 1)
+    if data is None and inst:
+        data = _res_bytes(p, 0, 6, (sid >> 4) + 1)
+    if data is None:
+        return None
+    pos = 0
+    for i in range(16):
+        if pos + 2 > len(data):
+            return None
+        ln = struct.unpack_from("<H", data, pos)[0]
+        pos += 2
+        if i == (sid & 15):
+            return data[pos:pos + 2 * ln].decode("utf-16-le", "replace")
+        pos += 2 * ln
+    return None
+
+
+def _propsheet_install(k):
+    p = k.p
+    wm = p.wm
+    gdi = p.gdi
+    M_ = p.mem
+
+    def reg(names, sig, ret="i"):
+        return k.reg(names, sig, ret, dlls=("comctl32.dll",))
+
+    def P():
+        return 8 if p.cpu_mode == 64 else 4
+
+    def rp(a):
+        return M_.read64(a) if P() == 8 else M_.read32(a)
+
+    def W(h):
+        return wm.wnd(h & 0xFFFFFFFF) if h else None
+
+    pages = {}                                     # HPROPSHEETPAGE (guest copy) -> info
+
+    def psp_offsets():
+        if P() == 8:
+            return {"inst": 8, "tpl": 16, "icon": 24, "title": 32, "proc": 40, "lparam": 48,
+                    "cb": 56, "ref": 64}
+        return {"inst": 8, "tpl": 12, "icon": 16, "title": 20, "proc": 24, "lparam": 28,
+                "cb": 32, "ref": 36}
+
+    def call_page_cb(info, msg):
+        if info["flags"] & PSP_USECALLBACK and info["cb"]:
+            return p.call_guest(info["cb"], [0, msg, info["addr"]]) & 0xFFFFFFFF
+        return 1
+
+    def make_page(src, wide):
+        """Copy a PROPSHEETPAGE; returns the HPROPSHEETPAGE (address of the copy)."""
+        size = M_.read32(src)
+        size = max(size, 40 if P() == 4 else 72)
+        copy = p.heap_alloc(p.process_heap_handle, size)
+        M_.write(copy, bytes(M_.read(src, size)))
+        o = psp_offsets()
+        info = {"addr": copy, "wide": wide, "flags": M_.read32(copy + 4),
+                "inst": rp(copy + o["inst"]), "tpl": rp(copy + o["tpl"]),
+                "title": rp(copy + o["title"]), "proc": rp(copy + o["proc"]),
+                "cb": rp(copy + o["cb"]), "ref": rp(copy + o["ref"])}
+        pages[copy] = info
+        if info["ref"]:
+            M_.write32(info["ref"], M_.read32(info["ref"]) + 1)
+        call_page_cb(info, 0)                                        # PSPCB_ADDREF
+        return copy
+
+    def release_page(h):
+        info = pages.pop(h, None)
+        if info is None:
+            return 0
+        call_page_cb(info, 1)                                        # PSPCB_RELEASE
+        if info["ref"]:
+            M_.write32(info["ref"], max(0, M_.read32(info["ref"]) - 1))
+        return 1
+
+    reg("CreatePropertySheetPageA", "p", "p")(lambda c, a: make_page(a, False) if a else 0)
+    reg("CreatePropertySheetPageW", "p", "p")(lambda c, a: make_page(a, True) if a else 0)
+    reg("DestroyPropertySheetPage", "p")(lambda c, h: release_page(h))
+
+    def page_template(info):
+        if info["flags"] & PSP_DLGINDIRECT:
+            return info["tpl"]
+        name = info["tpl"]
+        key = name if name < 0x10000 else _res_key(p, name, info["wide"])
+        r = _res_find(p, info["inst"], 5, key)
+        if r is None and info["inst"]:
+            r = _res_find(p, 0, 5, key)
+        return r[0] if r else 0
+
+    def page_title(info):
+        if info["flags"] & PSP_USETITLE and info["title"]:
+            t = info["title"]
+            if t < 0x10000:
+                return _load_string(p, info["inst"], t) or ""
+            return k.s(t, info["wide"])
+        tpl = page_template(info)
+        if tpl:
+            try:
+                d = _parse_dlg_template(M_, tpl)
+                return d["title"] if isinstance(d["title"], str) else ""
+            except Exception:
+                return ""
+        return ""
+
+    def tpl_size_px(tpl):
+        d = _parse_dlg_template(M_, tpl)
+        if d["font"] is not None:
+            pt_, weight, italic, charset, face = d["font"]
+            fo = _GFontObj(-((pt_ * 96 + 36) // 72), 0, 0, 0, weight or 400, italic, 0, 0,
+                           charset, 0, 0, 0, 0, face)
+            bx, by = _dlg_base_units(fo.realize())
+        else:
+            bx, by = _dlg_base_units(gdi.stock[13].realize())
+        return d["cx"] * bx // 4, d["cy"] * by // 8
+
+    def patch_child_style(tpl):
+        """Pages are children: clear popup/caption bits in the template while creating."""
+        sig = M_.read32(tpl)
+        off = 12 if (sig >> 16) == 0xFFFF and (sig & 0xFFFF) == 1 else 0
+        old = M_.read32(tpl + off)
+        new = (old & ~(0x80000000 | 0x00C00000 | 0x00080000 | 0x00040000 | 0x10000000 |
+                       0x80)) | 0x40000000 | 0x400                 # WS_CHILD | DS_CONTROL
+        M_.write32(tpl + off, new)
+        return off, old
+
+    def nm_notify(sheet, page_hwnd, code, lparam=0):
+        mark = wm.scratch_mark()
+        try:
+            if P() == 8:
+                a = wm.scratch(struct.pack("<QQi4xQ", sheet, 0, code, lparam & M64))
+            else:
+                a = wm.scratch(struct.pack("<IIiI", sheet, 0, code, lparam & 0xFFFFFFFF))
+            return _s32(wm.send(page_hwnd, 0x004E, 0, a) & 0xFFFFFFFF)
+        finally:
+            wm.scratch_release(mark)
+
+    # ---- the sheet -------------------------------------------------------------------------
+    def build_sheet(hdr, wide):
+        ps_ = P()
+        size, flags = M_.read32(hdr), M_.read32(hdr + 4)
+        if ps_ == 8:
+            owner, inst, icon, cap = rp(hdr + 8), rp(hdr + 16), rp(hdr + 24), rp(hdr + 32)
+            npages, start, ppsp, cb = M_.read32(hdr + 40), rp(hdr + 48), rp(hdr + 56), \
+                rp(hdr + 64)
+        else:
+            owner, inst, icon, cap = struct.unpack("<IIII", M_.read(hdr + 8, 16))
+            npages, start, ppsp, cb = struct.unpack("<IIII", M_.read(hdr + 24, 16))
+        wizard = bool(flags & (PSH_WIZARD | PSH_WIZARD97 | PSH_AEROWIZARD | PSH_WIZARD_LITE))
+        hpages = []
+        if flags & PSH_PROPSHEETPAGE:
+            a = ppsp
+            for _i in range(npages):
+                hpages.append(make_page(a, wide))
+                a += max(M_.read32(a), 40 if ps_ == 4 else 72)
+        else:
+            for i in range(npages):
+                hpages.append(rp(ppsp + i * ps_))
+        caption = ""
+        if cap:
+            caption = (_load_string(p, inst, cap) or "") if cap < 0x10000 else k.s(cap, wide)
+        if flags & PSH_PROPTITLE and caption:
+            caption = "Properties for " + caption
+        if flags & PSH_USEPSTARTPAGE:
+            want = k.s(start, wide) if start >= 0x10000 else ""
+            start_idx = 0
+            for i, hp in enumerate(hpages):
+                if hp in pages and page_title(pages[hp]) == want:
+                    start_idx = i
+        else:
+            start_idx = start if start < max(1, len(hpages)) else 0
+        # geometry
+        fo = _GFontObj(-11, face="MS Shell Dlg")
+        hfont = gdi.add(fo)
+        bx, by = _dlg_base_units(fo.realize())
+        pw, ph = 212 * bx // 4, 188 * by // 8
+        for hp in hpages:
+            info = pages.get(hp)
+            if info is None:
+                continue
+            tpl = page_template(info)
+            if tpl:
+                try:
+                    w_, h_ = tpl_size_px(tpl)
+                    pw, ph = max(pw, w_), max(ph, h_)
+                except Exception:
+                    pass
+        m = 7 * bx // 4
+        btn_w, btn_h, gap = 50 * bx // 4, 14 * by // 8, 4 * bx // 4
+        cls = wm.find_class("#32770")
+        style = 0x80000000 | 0x00C00000 | 0x00080000 | 0x80 | 0x4    # POPUP CAPTION SYSMENU
+        tmp = _Wnd(0)
+        tmp.style, tmp.exstyle = style, WS_EX_DLGMODALFRAME
+        L = _nc_layout(wm, tmp)
+        wm.dlg_pending = {"proc": 0, "font": hfont, "base": (bx, by), "wide": wide}
+        hwnd = wm.create(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, cls, caption, style,
+                         0, 0, 100, 100, owner, 0, inst, 0, True)
+        wm.dlg_pending = None
+        sheet = W(hwnd)
+        if sheet is None:
+            return None
+        sheet.py["dlg"] = True
+        sheet.py["base"] = (bx, by)
+        wm.send(hwnd, WM_SETFONT, hfont, 0)
+        st = {"hwnd": hwnd, "pages": hpages, "hwnds": {}, "cur": -1, "wizard": wizard,
+              "flags": flags, "tab": 0, "result": 0, "changed": set(), "restart": 0,
+              "done": False, "modeless": bool(flags & PSH_MODELESS), "cb": cb,
+              "wide": wide, "font": hfont, "inst": inst, "pw": pw, "ph": ph}
+        sheet.py["psheet"] = st
+        if flags & PSH_USECALLBACK and cb:
+            mark = wm.scratch_mark()
+            try:
+                dummy = wm.scratch(bytes(64))
+                p.call_guest(cb, [0, 1, dummy])                      # PSCB_PRECREATE
+            finally:
+                wm.scratch_release(mark)
+        # page area
+        if wizard:
+            area = (m, m, m + pw, m + ph)
+        else:
+            th = wm.create(0, wm.find_class("SysTabControl32"), "",
+                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS, m, m, pw + 8,
+                           ph + 30, hwnd, 0x3020, inst, 0, True)
+            st["tab"] = th
+            wm.send(th, WM_SETFONT, hfont, 0)
+            mark = wm.scratch_mark()
+            try:
+                for i, hp in enumerate(hpages):
+                    title = page_title(pages[hp]) if hp in pages else ""
+                    txt = wm.scratch(title.encode("utf-16-le") + b"\0\0")
+                    it = wm.scratch(struct.pack("<IIIQiiQ" if P() == 8 else "<IIIIiiI",
+                                                1, 0, 0, txt, 0, -1, 0))
+                    wm.send(th, 0x133E, i, it)                        # TCM_INSERTITEMW
+                # tab window rect around the page display rect
+                rc = wm.scratch(struct.pack("<iiii", m, m, m + pw, m + ph))
+                wm.send(th, 0x1328, 1, rc)                            # TCM_ADJUSTRECT(TRUE)
+                l_, t_, r_, b_ = struct.unpack("<iiii", M_.read(rc, 16))
+                dx, dy = m - l_, m - t_
+                wm.set_pos(W(th), 0, m, m, r_ - l_, b_ - t_, 0x14)
+                area = (m + dx, m + dy, m + dx + pw, m + dy + ph)
+                tab_b = m + (b_ - t_)
+            finally:
+                wm.scratch_release(mark)
+        st["area"] = area
+        bottom = (tab_b if not wizard else area[3]) + m
+        # buttons
+        labels = []
+        if wizard:
+            labels = [("< &Back", PSBTN_IDS["back"]), ("&Next >", PSBTN_IDS["next"]),
+                      ("Finish", PSBTN_IDS["finish"]), ("Cancel", 2)]
+        else:
+            labels = [("OK", 1), ("Cancel", 2)]
+            if not flags & PSH_NOAPPLYNOW:
+                labels.append(("&Apply", PSBTN_IDS["apply"]))
+        if flags & PSH_HASHELP:
+            labels.append(("&Help", PSBTN_IDS["help"]))
+        cw = max(area[2] + m, (btn_w + gap) * len(labels) + m)
+        if wizard:
+            line = wm.create(0, wm.find_class("Static"), "", WS_CHILD | WS_VISIBLE | 0x10,
+                             0, bottom - 4, cw, 2, hwnd, 0x3026, inst, 0, True)
+        x = cw - m - (btn_w + gap) * len(labels) + gap
+        st["buttons"] = {}
+        for label, bid in labels:
+            if wizard and bid == PSBTN_IDS["finish"]:
+                bh_ = wm.create(0, wm.find_class("Button"), label, WS_CHILD | WS_TABSTOP,
+                                x - btn_w - gap, bottom, btn_w, btn_h, hwnd, bid, inst, 0, True)
+            else:
+                bh_ = wm.create(0, wm.find_class("Button"), label,
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | (1 if bid in (1, 0x3024)
+                                                                       else 0),
+                                x, bottom, btn_w, btn_h, hwnd, bid, inst, 0, True)
+                x += btn_w + gap
+            wm.send(bh_, WM_SETFONT, hfont, 0)
+            st["buttons"][bid] = bh_
+        apply_h = st["buttons"].get(PSBTN_IDS["apply"])
+        if apply_h:
+            W(apply_h).style |= WS_DISABLED
+        ch = bottom + btn_h + m
+        Wd = cw + 2 * L["b"]
+        Hd = ch + 2 * L["b"] + L["cap"]
+        ow = W(owner)
+        if ow is not None and ow.style & WS_VISIBLE:
+            t = wm.top(ow)
+            sx, sy = t.x + (t.w - Wd) // 2, t.y + (t.h - Hd) // 2
+        else:
+            sx, sy = (gdi.screen.w - Wd) // 2, (gdi.screen.h - Hd) // 2
+        wm.set_pos(sheet, 0, max(0, sx), max(0, sy), Wd, Hd, 0x14)
+        addr = wm.register_pyproc(lambda h, msg, wp, lp, wd: sheet_proc(st, h, msg, wp, lp, wd))
+        st["proc"] = addr
+        _dlg_set_proc(wm, sheet, addr)
+        if flags & PSH_USECALLBACK and cb:
+            p.call_guest(cb, [hwnd, 2, 0])                           # PSCB_INITIALIZED
+        if hpages:
+            set_page(st, start_idx)
+        wizbuttons(st, 2 if len(hpages) > 1 else 4)
+        return st
+
+    def page_hwnd(st, i, create=True):
+        h = st["hwnds"].get(i)
+        if h and W(h) is not None:
+            return h
+        if not create or not 0 <= i < len(st["pages"]):
+            return 0
+        info = pages.get(st["pages"][i])
+        if info is None:
+            return 0
+        if info["flags"] & PSP_USECALLBACK and info["cb"] and not call_page_cb(info, 2):
+            return 0                                                  # PSPCB_CREATE refused
+        tpl = page_template(info)
+        if not tpl:
+            p.log.warn("property page template %r not found" % (info["tpl"],))
+            return 0
+        copy = 0
+        if not info["flags"] & PSP_DLGINDIRECT:
+            # resource memory is read-only: work on a private copy of the template
+            key = info["tpl"] if info["tpl"] < 0x10000 else _res_key(p, info["tpl"],
+                                                                      info["wide"])
+            r = _res_find(p, info["inst"], 5, key) or _res_find(p, 0, 5, key)
+            if r is not None:
+                copy = p.heap_alloc(p.process_heap_handle, r[1] + 16)
+                M_.write(copy, bytes(M_.read(r[0], r[1])))
+                tpl = copy
+        off, old = patch_child_style(tpl)
+        try:
+            h = _dlg_create(wm, info["inst"], tpl, st["hwnd"], info["proc"], info["addr"],
+                            info["wide"])
+        finally:
+            if copy:
+                p.heap_free(p.process_heap_handle, copy)
+            else:
+                M_.write32(tpl + off, old)
+        pw_ = W(h)
+        if pw_ is None:
+            return 0
+        pw_.py["dlgwide"] = info["wide"]
+        a = st["area"]
+        wm.set_pos(pw_, 0, a[0], a[1], a[2] - a[0], a[3] - a[1], 0x10)   # HWND_TOP
+        st["hwnds"][i] = h
+        return h
+
+    def set_page(st, i, notify_old=True):
+        if not 0 <= i < len(st["pages"]):
+            return False
+        cur = st["cur"]
+        if cur == i:
+            return True
+        if cur >= 0 and notify_old:
+            oh = page_hwnd(st, cur, False)
+            if oh and nm_notify(st["hwnd"], oh, PSN_KILLACTIVE):
+                return False
+        nh = page_hwnd(st, i)
+        if not nh:
+            return False
+        r = nm_notify(st["hwnd"], nh, PSN_SETACTIVE)
+        if r == -1 and st["wizard"]:
+            return False
+        if cur >= 0:
+            oh = page_hwnd(st, cur, False)
+            if oh:
+                wm.show(W(oh), 0)
+        st["cur"] = i
+        wm.show(W(nh), 5)
+        if st["tab"]:
+            wm.send(st["tab"], 0x130C, i, 0)                          # TCM_SETCURSEL
+        if st["wizard"]:
+            _dlg_set_focus(wm, W(st["hwnd"]), W(nh))
+        return True
+
+    def wizbuttons(st, fl):
+        if not st["wizard"]:
+            return
+        b = st["buttons"]
+
+        def en(bid, on):
+            w_ = W(b.get(bid, 0))
+            if w_ is not None:
+                if on:
+                    w_.style &= ~WS_DISABLED
+                else:
+                    w_.style |= WS_DISABLED
+                w_.ncdirty = True
+                wm.invalidate(w_, None, True)
+        en(PSBTN_IDS["back"], fl & 1)
+        fin = fl & (4 | 8)
+        nxt, fb = W(b.get(PSBTN_IDS["next"], 0)), W(b.get(PSBTN_IDS["finish"], 0))
+        if nxt is not None and fb is not None:
+            if fin:
+                wm.show(nxt, 0)
+                wm.show(fb, 5)
+                en(PSBTN_IDS["finish"], fl & 4)
+            else:
+                wm.show(fb, 0)
+                wm.show(nxt, 5)
+                en(PSBTN_IDS["next"], fl & 2)
+
+    def finish(st, result):
+        st["result"] = result
+        st["done"] = True
+        if st["modeless"]:
+            for i in list(st["hwnds"]):
+                h = st["hwnds"].pop(i)
+                if W(h) is not None:
+                    wm.destroy(W(h))
+            st["cur"] = -1
+            return
+        _end_dialog(wm, st["hwnd"], result)
+
+    def do_apply(st, ok):
+        cur = st["cur"]
+        ch = page_hwnd(st, cur, False)
+        if ch and nm_notify(st["hwnd"], ch, PSN_KILLACTIVE):
+            return False
+        for i in sorted(st["hwnds"]):
+            h = st["hwnds"][i]
+            r = nm_notify(st["hwnd"], h, PSN_APPLY, 1 if ok else 0)
+            if r in (1, 2):                                        # PSNRET_INVALID(_NOCHANGEPAGE)
+                if r == 1:
+                    set_page(st, i, False)
+                return False
+        st["changed"].clear()
+        ah = W(st["buttons"].get(PSBTN_IDS["apply"], 0))
+        if ah is not None:
+            ah.style |= WS_DISABLED
+            wm.invalidate(ah, None, True)
+        return True
+
+    def press(st, bid):
+        hwnd = st["hwnd"]
+        if st["flags"] & PSH_USECALLBACK and st["cb"]:
+            code = {1: 1, 2: 2, PSBTN_IDS["apply"]: 3}.get(bid)
+            if code:
+                p.call_guest(st["cb"], [hwnd, 3, code])            # PSCB_BUTTONPRESSED
+        cur = st["cur"]
+        ch = page_hwnd(st, cur, False)
+        if bid == 1:
+            if do_apply(st, True):
+                finish(st, st["restart"] or 1)
+        elif bid == 2:
+            if ch and nm_notify(hwnd, ch, PSN_QUERYCANCEL):
+                return
+            for h in list(st["hwnds"].values()):
+                nm_notify(hwnd, h, PSN_RESET)
+            finish(st, 0)
+        elif bid == PSBTN_IDS["apply"]:
+            do_apply(st, False)
+        elif bid in (PSBTN_IDS["back"], PSBTN_IDS["next"]):
+            r = nm_notify(hwnd, ch, PSN_WIZBACK if bid == PSBTN_IDS["back"] else PSN_WIZNEXT) \
+                if ch else 0
+            if r == -1:
+                return
+            if r:
+                target = id_to_index(st, r)
+            else:
+                target = cur + (-1 if bid == PSBTN_IDS["back"] else 1)
+            if 0 <= target < len(st["pages"]):
+                set_page(st, target, False)
+        elif bid == PSBTN_IDS["finish"]:
+            if ch and nm_notify(hwnd, ch, PSN_WIZFINISH):
+                return
+            finish(st, 1)
+        elif bid == PSBTN_IDS["help"]:
+            if ch:
+                nm_notify(hwnd, ch, PSN_HELP)
+
+    def id_to_index(st, rid):
+        for i, hp in enumerate(st["pages"]):
+            info = pages.get(hp)
+            if info is not None and not info["flags"] & PSP_DLGINDIRECT and info["tpl"] == rid:
+                return i
+        return -1
+
+    def result(sheet_w, v):
+        _dlg_set(wm, sheet_w, 0, v)
+        return 1
+
+    def sheet_proc(st, h, msg, wp, lp, wide):
+        w = W(h)
+        if w is None:
+            return 0
+        if msg == 0x0111:                                          # WM_COMMAND
+            bid = wp & 0xFFFF
+            if bid in (1, 2) or bid in PSBTN_IDS.values():
+                press(st, bid)
+                return 1
+            return 0
+        if msg == 0x0010:                                          # WM_CLOSE
+            press(st, 2)
+            return 1
+        if msg == 0x004E and lp:                                   # WM_NOTIFY from the tab
+            code = _s32(M_.read32(lp + 2 * P()))
+            src = rp(lp)
+            if src == st["tab"]:
+                if code == -552:                                   # TCN_SELCHANGING
+                    ch = page_hwnd(st, st["cur"], False)
+                    blocked = bool(ch and nm_notify(h, ch, PSN_KILLACTIVE))
+                    return result(w, 1 if blocked else 0)
+                if code == -551:                                   # TCN_SELCHANGE
+                    sel = _s32(wm.send(st["tab"], 0x130B, 0, 0) & 0xFFFFFFFF)
+                    set_page(st, sel, False)
+                    return 1
+            return 0
+        if not 0x465 <= msg <= 0x48F:
+            return 0
+        if msg == 0x465:                                           # PSM_SETCURSEL
+            idx = wp if not lp else (st["pages"].index(lp) if lp in st["pages"] else -1)
+            return result(w, 1 if set_page(st, idx) else 0)
+        if msg == 0x472:                                           # PSM_SETCURSELID
+            return result(w, 1 if set_page(st, id_to_index(st, lp)) else 0)
+        if msg in (0x467, 0x477):                                  # PSM_ADDPAGE / INSERTPAGE
+            hp = lp
+            if hp not in pages:
+                return result(w, 0)
+            idx = len(st["pages"]) if msg == 0x467 else min(wp, len(st["pages"]))
+            st["pages"].insert(idx, hp)
+            st["hwnds"] = {(i + 1 if i >= idx else i): hh for i, hh in st["hwnds"].items()}
+            if st["cur"] >= idx:
+                st["cur"] += 1
+            if st["tab"]:
+                mark = wm.scratch_mark()
+                try:
+                    txt = wm.scratch(page_title(pages[hp]).encode("utf-16-le") + b"\0\0")
+                    it = wm.scratch(struct.pack("<IIIQiiQ" if P() == 8 else "<IIIIiiI",
+                                                1, 0, 0, txt, 0, -1, 0))
+                    wm.send(st["tab"], 0x133E, idx, it)
+                finally:
+                    wm.scratch_release(mark)
+            return result(w, 1)
+        if msg == 0x466:                                           # PSM_REMOVEPAGE
+            idx = wp if not lp else (st["pages"].index(lp) if lp in st["pages"] else -1)
+            if not 0 <= idx < len(st["pages"]):
+                return result(w, 0)
+            ph_ = st["hwnds"].pop(idx, 0)
+            if ph_ and W(ph_) is not None:
+                wm.destroy(W(ph_))
+            release_page(st["pages"].pop(idx))
+            st["hwnds"] = {(i - 1 if i > idx else i): hh for i, hh in st["hwnds"].items()}
+            if st["tab"]:
+                wm.send(st["tab"], 0x1308, idx, 0)                 # TCM_DELETEITEM
+            if st["cur"] == idx:
+                st["cur"] = -1
+                if st["pages"]:
+                    set_page(st, min(idx, len(st["pages"]) - 1), False)
+            elif st["cur"] > idx:
+                st["cur"] -= 1
+            return result(w, 1)
+        if msg == 0x468:                                           # PSM_CHANGED
+            st["changed"].add(wp)
+            ah = W(st["buttons"].get(PSBTN_IDS["apply"], 0))
+            if ah is not None:
+                ah.style &= ~WS_DISABLED
+                wm.invalidate(ah, None, True)
+            return result(w, 0)
+        if msg == 0x46D:                                           # PSM_UNCHANGED
+            st["changed"].discard(wp)
+            if not st["changed"]:
+                ah = W(st["buttons"].get(PSBTN_IDS["apply"], 0))
+                if ah is not None:
+                    ah.style |= WS_DISABLED
+                    wm.invalidate(ah, None, True)
+            return result(w, 0)
+        if msg in (0x469, 0x46A):                                  # PSM_RESTARTWINDOWS / REBOOT
+            st["restart"] = 2 if msg == 0x469 else 3
+            return result(w, 0)
+        if msg == 0x46B:                                           # PSM_CANCELTOCLOSE
+            ok = W(st["buttons"].get(1, 0))
+            cn = W(st["buttons"].get(2, 0))
+            if ok is not None:
+                wm.send(ok.hwnd, 0x000C, 0, 0)
+                ok.text = "Close"
+                wm.invalidate(ok, None, True)
+            if cn is not None:
+                cn.style |= WS_DISABLED
+                wm.invalidate(cn, None, True)
+            return result(w, 0)
+        if msg == 0x46C:                                           # PSM_QUERYSIBLINGS
+            for i in sorted(st["hwnds"]):
+                r = wm.send(st["hwnds"][i], 0x46C, wp, lp) & 0xFFFFFFFF
+                if r:
+                    return result(w, r)
+            return result(w, 0)
+        if msg == 0x46E:                                           # PSM_APPLY
+            return result(w, 1 if do_apply(st, False) else 0)
+        if msg in (0x46F, 0x478):                                  # PSM_SETTITLE A/W
+            t = (lp if lp < 0x10000 else None)
+            text = (_load_string(p, st["inst"], t) or "") if t is not None else \
+                k.s(lp, msg == 0x478)
+            if wp & 1:                                             # PSH_PROPTITLE
+                text = "Properties for " + text
+            w.text = text
+            w.ncdirty = True
+            wm.invalidate(w, None, True)
+            return result(w, 0)
+        if msg in (0x470, 0x48B):                                  # PSM_SETWIZBUTTONS / ENABLE
+            wizbuttons(st, lp if msg == 0x470 else wp)
+            return result(w, 0)
+        if msg == 0x471:                                           # PSM_PRESSBUTTON
+            bid = {0: PSBTN_IDS["back"], 1: PSBTN_IDS["next"], 2: PSBTN_IDS["finish"], 3: 1,
+                   4: PSBTN_IDS["apply"], 5: 2, 6: PSBTN_IDS["help"]}.get(wp)
+            if bid:
+                wm.post(h, 0x0111, bid, 0)
+            return result(w, 1)
+        if msg in (0x473, 0x479):                                  # PSM_SETFINISHTEXT A/W
+            fb = W(st["buttons"].get(PSBTN_IDS["finish"], 0))
+            nb = W(st["buttons"].get(PSBTN_IDS["next"], 0))
+            if fb is not None:
+                fb.text = k.s(lp, msg == 0x479)
+                if nb is not None:
+                    wm.show(nb, 0)
+                wm.show(fb, 5)
+                fb.style &= ~WS_DISABLED
+                wm.invalidate(fb, None, True)
+            return result(w, 0)
+        if msg in (0x489, 0x48C):                                  # PSM_SETNEXTTEXT / BUTTONTEXT
+            bid = PSBTN_IDS["next"] if msg == 0x489 else {0: PSBTN_IDS["back"],
+                                                         1: PSBTN_IDS["next"], 3: 1,
+                                                         5: 2}.get(wp, 0)
+            bw_ = W(st["buttons"].get(bid, 0))
+            if bw_ is not None:
+                bw_.text = k.s(lp, True)
+                wm.invalidate(bw_, None, True)
+            return result(w, 0)
+        if msg == 0x48A:                                           # PSM_SHOWWIZBUTTONS
+            return result(w, 0)
+        if msg == 0x474:                                           # PSM_GETTABCONTROL
+            return result(w, st["tab"])
+        if msg == 0x476:                                           # PSM_GETCURRENTPAGEHWND
+            return result(w, 0 if st["done"] else page_hwnd(st, st["cur"], False))
+        if msg == 0x475:                                           # PSM_ISDIALOGMESSAGE
+            if not lp:
+                return result(w, 0)
+            if P() == 8:
+                mh, mm, mw, ml = struct.unpack("<QI4xQQ", M_.read(lp, 32))
+            else:
+                mh, mm, mw, ml = struct.unpack("<IIII", M_.read(lp, 16))
+            m = {"hwnd": mh, "msg": mm, "w": mw, "l": ml, "time": 0, "pt": (0, 0)}
+            return result(w, 1 if _is_dialog_message(wm, w, m) else 0)
+        if msg == 0x481:                                           # PSM_HWNDTOINDEX
+            for i, hh in st["hwnds"].items():
+                if hh == wp:
+                    return result(w, i)
+            return result(w, 0xFFFFFFFF)
+        if msg == 0x482:                                           # PSM_INDEXTOHWND
+            return result(w, page_hwnd(st, wp, False))
+        if msg == 0x483:                                           # PSM_PAGETOINDEX
+            return result(w, st["pages"].index(lp) if lp in st["pages"] else 0xFFFFFFFF)
+        if msg == 0x484:                                           # PSM_INDEXTOPAGE
+            return result(w, st["pages"][wp] if 0 <= wp < len(st["pages"]) else 0)
+        if msg == 0x485:                                           # PSM_IDTOINDEX
+            return result(w, id_to_index(st, lp) & 0xFFFFFFFF)
+        if msg == 0x486:                                           # PSM_INDEXTOID
+            if 0 <= wp < len(st["pages"]):
+                info = pages.get(st["pages"][wp])
+                return result(w, info["tpl"] if info is not None else 0)
+            return result(w, 0)
+        if msg == 0x487:                                           # PSM_GETRESULT
+            return result(w, st["result"])
+        if msg == 0x488:                                           # PSM_RECALCPAGESIZES
+            return result(w, 1)
+        if msg in (0x47D, 0x47E, 0x47F, 0x480):                    # header (sub)titles
+            return result(w, 0)
+        return 0
+
+    def _psheet(c, hdr, wide):
+        if not hdr:
+            return 0xFFFFFFFF
+        st = build_sheet(hdr, wide)
+        if st is None:
+            return 0xFFFFFFFF
+        hwnd = st["hwnd"]
+        if st["modeless"]:
+            wm.show(W(hwnd), 5)
+            return hwnd
+        r = _dialog_modal(wm, hwnd, W(hwnd).owner if W(hwnd) is not None else 0)
+        for hp in list(st["pages"]):
+            release_page(hp)
+        wm.pyprocs.pop(st["proc"], None)
+        return r if r != 0xFFFFFFFF else st["result"]
+
+    reg("PropertySheetA", "p", "p")(lambda c, hdr: _psheet(c, hdr, False))
+    reg("PropertySheetW", "p", "p")(lambda c, hdr: _psheet(c, hdr, True))
+
+    # shell32 ordinal-only dialogs that tools call by number
+    SH = ("shell32.dll",)
+    k.reg("RunFileDlg", "pppppu", "v", dlls=SH)(lambda c, *a: None)
+    k.reg("PickIconDlg", "ppup", dlls=SH)(lambda c, *a: 0)
+    k.reg("RestartDialog RestartDialogEx", "ppuu", dlls=SH)(lambda c, *a: 2)   # IDCANCEL
+    k.reg("SHFindFiles", "pp", dlls=SH)(lambda c, *a: 0)
+
+
 # Bitmap glyphs rasterized from the DejaVu fonts (c) Bitstream / DejaVu
 # authors (Bitstream Vera / DejaVu license); regenerate with tools/mkfonts.py
 _NOO_FONT_B64 = (
@@ -61013,6 +63132,8 @@ _ORDINAL_EXPORTS["comctl32.dll"] = {
     386: "DPA_DestroyCallback", 387: "DSA_EnumCallback", 388: "DSA_DestroyCallback",
     410: "SetWindowSubclass", 411: "GetWindowSubclass", 412: "RemoveWindowSubclass",
     413: "DefSubclassProc"}
+_ORDINAL_EXPORTS["shell32.dll"].update({61: "RunFileDlg", 62: "PickIconDlg", 59: "RestartDialog",
+                                       730: "RestartDialogEx", 90: "SHFindFiles"})
 _ORDINAL_EXPORTS["shell32.dll"].update({
     16: "ILFindLastID", 18: "ILClone", 21: "ILIsEqual", 152: "ILGetSize", 153: "ILGetNext",
     155: "ILFree", 157: "ILCreateFromPathW", 165: "SHCreateDirectory",
@@ -61184,6 +63305,11 @@ class ModuleManager:
         except NOOCPUFault as e:
             self.p.log.warn("TLS directory of %s could not be set up: %s" % (name, e))
         self.p.log.ok("loaded PE DLL %s at %#x (%d exports)" % (name, base, len(m.exports)))
+        try:
+            self.p.ldr_add(base, base + pe.entry_rva if pe.entry_rva else 0,
+                           pe.size_of_image, self.p.module_win_path(m))
+        except Exception as e:
+            self.p.log.warn("loader list update for %s failed: %s" % (name, e))
         self.p.__dict__.setdefault("pending_dll_inits", []).append(base)
         return m
 
@@ -62227,6 +64353,10 @@ class NOOProcess:
             h = self.modules.handle_for(dll)
             if h:
                 mods.append((h, 0, 0x1000, "C:\\Windows\\System32\\" + dll))
+        for hm, mod in list(self.modules.by_handle.items()):
+            if getattr(mod, "kind", "") == "pe" and hm != base and mod.pe is not None:
+                mods.append((hm, hm + mod.pe.entry_rva if mod.pe.entry_rva else 0,
+                             mod.pe.size_of_image, self.module_win_path(mod)))
         esz = 0x120 if x64 else 0xA8
         entries = []
         for dbase, entry, size, path in mods:
@@ -62248,6 +64378,60 @@ class NOOProcess:
             wp(head, chain[1])
             wp(head + P, chain[-2])
         wp(peb + (0x18 if x64 else 0x0C), ldr)
+        self._ldr_state = {"ldr": ldr, "heads": heads, "esz": esz, "pool": 0, "left": 0,
+                           "bases": {d[0] for d in mods}}
+
+    def module_win_path(self, mod):
+        host = getattr(mod.pe, "path", None) if mod.pe is not None else None
+        if host:
+            try:
+                return self.vfs.to_guest_path(host)
+            except Exception:
+                pass
+        return "C:\\Windows\\System32\\" + mod.name
+
+    def ldr_add(self, dbase, entry, size, path):
+        """Append a module to the PEB loader lists (for DLLs loaded after start-up)."""
+        st = self.__dict__.get("_ldr_state")
+        if st is None or dbase in st["bases"]:
+            return
+        st["bases"].add(dbase)
+        m = self.mem
+        x64 = self.cpu_mode == 64
+        P = 8 if x64 else 4
+        need = st["esz"] + 2 * (len(path) * 2 + 2) + 32
+        if st["left"] < need:
+            st["pool"] = m.alloc(0x10000, MEM_READ | MEM_WRITE, tag="ldr_entries")
+            st["left"] = 0x10000
+        e = st["pool"]
+        st["pool"] += (need + 15) & ~15
+        st["left"] -= (need + 15) & ~15
+        wp = m.write64 if x64 else m.write32
+        rp = m.read64 if x64 else m.read32
+        sp = e + st["esz"]
+
+        def put(at, text):
+            nonlocal sp
+            data = text.encode("utf-16-le")
+            m.write(sp, data + b"\0\0")
+            m.write16(at, len(data))
+            m.write16(at + 2, len(data) + 2)
+            wp(at + (8 if x64 else 4), sp)
+            sp += len(data) + 2
+        wp(e + (0x30 if x64 else 0x18), dbase)
+        wp(e + (0x38 if x64 else 0x1C), entry)
+        m.write32(e + (0x40 if x64 else 0x20), size)
+        put(e + (0x48 if x64 else 0x24), path)
+        put(e + (0x58 if x64 else 0x2C), path.rsplit("\\", 1)[-1])
+        m.write32(e + (0x68 if x64 else 0x34), 0x4)
+        for li, off in enumerate((0, 0x10, 0x20) if x64 else (0, 8, 0x10)):
+            head = st["ldr"] + st["heads"][li]
+            node = e + off
+            last = rp(head + P)
+            wp(node, head)
+            wp(node + P, last)
+            wp(last, node)
+            wp(head + P, node)
 
     def _write_ptr_array(self, ptrs, ptr_size):
         addr = self.mem.alloc((len(ptrs) + 1) * ptr_size, MEM_READ | MEM_WRITE)
