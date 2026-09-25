@@ -4954,6 +4954,19 @@ class VirtualFileSystem:
         # We avoid symlinks: instead we keep an explicit overlay table.
         self.overlay = getattr(self, "overlay", {})
         self.overlay[win_dir.upper()] = os.path.abspath(host_dir)
+        self.overlay_names = getattr(self, "overlay_names", {})
+        self.overlay_names[win_dir.upper()] = win_dir
+
+    def overlay_children(self, win_dir):
+        """{name: host path} of overlay mount points directly inside a guest directory."""
+        out = {}
+        parent = win_dir.rstrip("\\").upper()
+        for key, host in getattr(self, "overlay", {}).items():
+            par, _sep, name = key.rpartition("\\")
+            if par == parent and name:
+                real = getattr(self, "overlay_names", {}).get(key, key).rpartition("\\")[2]
+                out[real] = host
+        return out
 
     def resolve(self, win_path, for_write=False):
         """Translate a guest path to a host path, honoring overlays."""
@@ -12539,8 +12552,8 @@ def _crt_install(crt):
             m.write(buf, base + struct.pack("<iiii", size & 0x7FFFFFFF, at, mt, ct))
         elif kind == "32i64":       # _stat32i64: size 8 (aligned), times 4
             m.write(buf, base + struct.pack("<4xqiii4x", size, at, mt, ct))
-        elif kind == "64i32":       # _stat64i32: size 4, times 8
-            m.write(buf, base + struct.pack("<i4xqqq", size & 0x7FFFFFFF, at, mt, ct))
+        elif kind == "64i32":       # _stat64i32 (48 bytes): size 4 at 20, times 8 at 24
+            m.write(buf, base + struct.pack("<iqqq", size & 0x7FFFFFFF, at, mt, ct))
         else:                       # _stat64: size 8, times 8
             m.write(buf, base + struct.pack("<4xqqqq", size, at, mt, ct))
 
@@ -12568,7 +12581,7 @@ def _crt_install(crt):
             crt.set_errno(_EBADF)
             return -1
         if fdo.kind != "file":
-            crt.mem.write(buf, bytes(56))
+            crt.mem.write(buf, bytes({"32": 36, "32i64": 48, "64i32": 48}.get(kind, 56)))
             crt.mem.write16(buf + 6, 0x2000 | 0x1B6)     # _S_IFCHR
             return 0
         st = os.fstat(fdo.f.fileno())
@@ -17408,6 +17421,8 @@ def _k32_install(k):
             return None
         if sep and not d:
             d = "\\"
+        elif sep and len(d) == 2 and d[1] == ":":
+            d += "\\"                                 # "C:\\name" lives in the root, not in C:'s cwd
         guest_dir = full_path(d if d else ".")
         host = resolve(guest_dir)
         if host is None:
@@ -17420,6 +17435,9 @@ def _k32_install(k):
         except OSError as e:
             oserr(e)
             return None
+        mounts = p.vfs.overlay_children(guest_dir) if hasattr(p.vfs, "overlay_children") else {}
+        upper = {n.upper() for n in names}
+        names += [n for n in mounts if n.upper() not in upper]   # mounted folders show up too
         names.sort(key=lambda s: s.upper())
         if len(guest_dir.rstrip("\\")) > 2:         # not a drive root
             names = [".", ".."] + names
@@ -17436,6 +17454,12 @@ def _k32_install(k):
     def _fill_find(buf, host_dir, name, wide, basic=False):
         host = os.path.join(host_dir, name) if name not in (".", "..") else \
             (host_dir if name == "." else os.path.dirname(host_dir))
+        if not os.path.exists(host) and name not in (".", ".."):
+            try:                                    # an overlay mount point in this folder
+                gd = p.vfs.to_guest_path(host_dir)
+                host = p.vfs.overlay_children(gd).get(name, host)
+            except Exception:
+                pass
         try:
             st = os.stat(host)
         except OSError:
