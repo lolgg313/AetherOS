@@ -20744,7 +20744,7 @@ def _k32_install(k):
         k.wptr(ph, _ctq(c))
         return 0
 
-    @R("RtlCreateTimer", "pppppuuu", "u", NT_)
+    @R("RtlCreateTimer", "ppppuuu", "u", NT_)
     def _rct(c, queue, ph, cb, ctx, due, period, flags):
         k.wptr(ph, tq_timer(queue, cb, ctx, due, period, flags & 8))
         return 0
@@ -25218,36 +25218,113 @@ def _nt_install(k):
     def _ntsit(c, h, cls, buf, n):
         return 0
 
+    def process_list(buf):
+        """SYSTEM_PROCESS_INFORMATION records: idle, System, this process, emulated children."""
+        P = ps()
+        hdr = 0x100 if P == 8 else 0xB8
+        tsz = 0x50 if P == 8 else 0x40
+        if not k.__dict__.get("boot_ft"):
+            k.boot_ft = _ft_from_unix(time.time()) - int((time.monotonic() - k.boot) * 1e7)
+            k.boot_ft -= k.boot_ft % 10000000                  # whole seconds: stable keys
+        boot = k.boot_ft
+        start = k.__dict__.setdefault("start_ft", boot + 10000000 * 30)
+        ncpu_ = os.cpu_count() or 1
+        elapsed = int((time.monotonic() - k.boot) * 1e7)
+        cpu_used = int(time.process_time() * 1e7)
+        procs = [(0, 0, "", 1, 0), (4, 0, "System", 1, 0)]
+        procs.append((p.pid, 0, p.exe_win_path.rsplit("\\", 1)[-1], len(p.threads) or 1,
+                      p.mem.committed))
+        for cpid, child in sorted(getattr(k, "children", {}).items()):
+            if getattr(child, "__dict__", {}).get("terminate_code") is not None:
+                continue
+            path = getattr(child, "exe_win_path", "") or ""
+            procs.append((cpid, p.pid, path.rsplit("\\", 1)[-1] or "child.exe",
+                          len(getattr(child, "threads", [])) or 1,
+                          getattr(getattr(child, "mem", None), "committed", 0)))
+        out = bytearray()
+        for i, (pid, ppid, name, nthreads, mem) in enumerate(procs):
+            rec = bytearray(hdr + tsz * nthreads)
+            nb = name.encode("utf-16-le")
+            base = len(out)
+            name_off = base + len(rec)
+            struct.pack_into("<I", rec, 4, nthreads)
+            if pid == 0:
+                times = (0, 0, max(0, elapsed * ncpu_ - cpu_used))
+            elif pid == p.pid:
+                times = (start, cpu_used, 0)
+            else:
+                times = (boot, 0, 0)
+            struct.pack_into("<qqq", rec, 0x20, *times)
+            struct.pack_into("<HH", rec, 0x38, len(nb), len(nb) + 2 if nb else 0)
+            if P == 8:
+                struct.pack_into("<Q", rec, 0x40, (buf + name_off) if nb else 0)
+                struct.pack_into("<iQQII", rec, 0x48, 8, pid, ppid, 16 * nthreads,
+                                 0 if pid in (0, 4) else 1)
+                struct.pack_into("<QQ", rec, 0x70, mem + 0x1000000, mem + 0x1000000)
+                struct.pack_into("<QQ", rec, 0x88, mem, mem)
+                struct.pack_into("<QQQ", rec, 0xB8, mem, mem, mem)
+            else:
+                struct.pack_into("<I", rec, 0x3C, (buf + name_off) if nb else 0)
+                struct.pack_into("<iIIII", rec, 0x40, 8, pid, ppid, 16 * nthreads,
+                                 0 if pid in (0, 4) else 1)
+                struct.pack_into("<II", rec, 0x58, mem + 0x1000000, mem + 0x1000000)
+                struct.pack_into("<II", rec, 0x64, mem, mem)
+                struct.pack_into("<III", rec, 0x7C, mem, mem, mem)
+            ths = p.threads if pid == p.pid else [None] * nthreads
+            for j in range(nthreads):
+                t = ths[j] if j < len(ths) else None
+                tid = t.tid if t is not None else (pid + 4 * (j + 1))
+                o = hdr + j * tsz
+                struct.pack_into("<qqq", rec, o, 0, 0, boot)
+                state = 5 if t is not None and t.state in ("blocked", "guiwait") else 2
+                if P == 8:
+                    struct.pack_into("<QQiiIII", rec, o + 0x28, pid, tid, 8, 8, 0, state, 0)
+                else:
+                    struct.pack_into("<IIiiIII", rec, o + 0x20, pid, tid, 8, 8, 0, state, 0)
+            rec += nb + (b"\0\0" if nb else b"")
+            while len(rec) % 8:
+                rec += b"\0"
+            if i < len(procs) - 1:
+                struct.pack_into("<I", rec, 0, len(rec))
+            out += rec
+        return bytes(out)
+
     @R("NtQuerySystemInformation ZwQuerySystemInformation", "pupp", dlls=NT)
     def _ntqsi(c, cls, buf, n, pret):
         P = ps()
         ncpu = os.cpu_count() or 1
+        total_pages = (p.sandbox.max_memory_mb * 1024 * 1024) // 4096
+        used_pages = min(total_pages, p.mem.committed // 4096)
         if cls == 0:                                    # SystemBasicInformation
-            data = struct.pack("<IIIIII", 0, 156250, 0x1000, 0x80000, 1, 0x7FFFF) + \
-                struct.pack("<I", 0x10000) + \
-                (struct.pack("<QQQ", 0x10000, 0x7FFFFFFEFFFF, (1 << ncpu) - 1) if P == 8 else
-                 struct.pack("<III", 0x10000, 0x7FFEFFFF, (1 << ncpu) - 1)) + struct.pack("<b", ncpu)
+            data = struct.pack("<IIIIIII", 0, 156250, 0x1000, total_pages, 1, total_pages,
+                               0x10000)
+            if P == 8:
+                data += struct.pack("<4xQQQb", 0x10000, 0x7FFFFFFEFFFF, (1 << ncpu) - 1, ncpu)
+            else:
+                data += struct.pack("<IIIb", 0x10000, 0x7FFEFFFF, (1 << ncpu) - 1, ncpu)
             data = data.ljust(64 if P == 8 else 44, b"\0")
         elif cls == 1:                                  # SystemProcessorInformation
             data = struct.pack("<HHHHI", 9, 6, 0x3A09, 0, 0x2F)
+        elif cls == 2:                                  # SystemPerformanceInformation
+            idle = int((time.monotonic() - k.boot) * 1e7 * ncpu * 0.9)
+            data = bytearray(0x158)
+            struct.pack_into("<q", data, 0, idle)
+            struct.pack_into("<IIII", data, 0x2C, total_pages - used_pages, used_pages,
+                             total_pages * 2, used_pages)
+            data = bytes(data[:n]) if n in (0x138, 0x148) else bytes(data)
         elif cls == 3:                                  # SystemTimeOfDayInformation
             now = _ft_from_unix(time.time())
             data = struct.pack("<qqqII", now - int(3600 * 5e7), now, time.timezone * 10_000_000,
                                0, 0).ljust(48, b"\0")
         elif cls == 8:                                  # SystemProcessorPerformanceInformation
-            now = int((time.monotonic() - k.boot) * 1e7)
-            data = b"".join(struct.pack("<qqqqI4x", now // 2, now // 3, now // 10, 0, 0)
+            total = int((time.monotonic() - k.boot) * 1e7)
+            user = min(total, int(time.process_time() * 1e7 / ncpu))
+            kern = total - user                         # kernel time includes idle time
+            idle = max(0, kern - total // 100)
+            data = b"".join(struct.pack("<qqqqqI4x", idle, kern, user, 0, 0, 0)
                             for _ in range(ncpu))
-        elif cls == 5:                                  # SystemProcessInformation (just us)
-            name = os.path.basename(p.exe_win_path).encode("utf-16-le")
-            hdr = 0x100 if P == 8 else 0xB8
-            data = bytearray(hdr) + name + b"\0\0"
-            struct.pack_into("<I", data, 0, 0)          # NextEntryOffset
-            struct.pack_into("<I", data, 4, len(p.threads))
-            struct.pack_into("<HH", data, 0x38, len(name), len(name) + 2)
-            struct.pack_into("<Q" if P == 8 else "<I", data, 0x40 if P == 8 else 0x3C, buf + hdr)
-            struct.pack_into("<Q" if P == 8 else "<I", data, 0x50 if P == 8 else 0x44, p.pid)
-            data = bytes(data)
+        elif cls == 5:                                  # SystemProcessInformation
+            data = process_list(buf)
         else:
             return STATUS_INVALID_INFO_CLASS
         if pret:
@@ -26465,6 +26542,207 @@ def _nt_install2(k, H):
             M_.write8(prev, 1 if tm.signaled else 0)
         tm.due = None
         return 0
+
+    # ---- bitmaps (RTL_BITMAP {ULONG SizeOfBitMap; PULONG Buffer}) --------------------------
+    def bm_hdr(h):
+        n = M_.read32(h)
+        buf = rptr(h + (8 if ps() == 8 else 4))
+        return n, buf
+
+    def bm_get(buf, i):
+        return (M_.read8(buf + (i >> 3)) >> (i & 7)) & 1
+
+    def bm_set(buf, i, v):
+        a = buf + (i >> 3)
+        b = M_.read8(a)
+        M_.write8(a, (b | (1 << (i & 7))) if v else (b & ~(1 << (i & 7))))
+
+    @R("RtlInitializeBitMap", "ppu", "v", dlls=NT)
+    def _ribm(c, h, buf, n):
+        M_.write32(h, n)
+        k.wptr(h + (8 if ps() == 8 else 4), buf)
+
+    def set_range(h, start, n, v):
+        size, buf = bm_hdr(h)
+        for i in range(start, min(size, start + n)):
+            bm_set(buf, i, v)
+
+    R("RtlSetBits", "puu", "v", dlls=NT)(lambda c, h, s_, n: set_range(h, s_, n, 1))
+    R("RtlClearBits", "puu", "v", dlls=NT)(lambda c, h, s_, n: set_range(h, s_, n, 0))
+    R("RtlSetAllBits", "p", "v", dlls=NT)(lambda c, h: set_range(h, 0, bm_hdr(h)[0], 1))
+    R("RtlClearAllBits", "p", "v", dlls=NT)(lambda c, h: set_range(h, 0, bm_hdr(h)[0], 0))
+    R("RtlSetBit", "pu", "v", dlls=NT)(lambda c, h, i: set_range(h, i, 1, 1))
+    R("RtlClearBit", "pu", "v", dlls=NT)(lambda c, h, i: set_range(h, i, 1, 0))
+    R("RtlTestBit", "pu", dlls=NT)(lambda c, h, i: bm_get(bm_hdr(h)[1], i)
+                                   if i < bm_hdr(h)[0] else 0)
+
+    def all_are(h, start, n, v):
+        size, buf = bm_hdr(h)
+        if start + n > size:
+            return 0
+        return 1 if all(bm_get(buf, i) == v for i in range(start, start + n)) else 0
+
+    R("RtlAreBitsSet", "puu", dlls=NT)(lambda c, h, s_, n: all_are(h, s_, n, 1))
+    R("RtlAreBitsClear", "puu", dlls=NT)(lambda c, h, s_, n: all_are(h, s_, n, 0))
+
+    def count(h, v):
+        size, buf = bm_hdr(h)
+        data = M_.read(buf, (size + 7) // 8) if size else b""
+        ones = sum(bin(b).count("1") for b in data[:size // 8])
+        for i in range(size // 8 * 8, size):
+            ones += bm_get(buf, i)
+        return ones if v else size - ones
+
+    R("RtlNumberOfSetBits", "p", dlls=NT)(lambda c, h: count(h, 1))
+    R("RtlNumberOfClearBits", "p", dlls=NT)(lambda c, h: count(h, 0))
+
+    def find_run(h, n, hint, v):
+        size, buf = bm_hdr(h)
+        if n == 0:
+            return hint if hint < size else 0
+        order = list(range(hint if hint < size else 0, size)) + list(range(0, min(hint, size)))
+        for s_ in order:
+            if s_ + n <= size and all(bm_get(buf, i) == v for i in range(s_, s_ + n)):
+                return s_
+        return 0xFFFFFFFF
+
+    R("RtlFindClearBits", "puu", dlls=NT)(lambda c, h, n, hint: find_run(h, n, hint, 0))
+    R("RtlFindSetBits", "puu", dlls=NT)(lambda c, h, n, hint: find_run(h, n, hint, 1))
+
+    @R("RtlFindClearBitsAndSet", "puu", dlls=NT)
+    def _rfcbas(c, h, n, hint):
+        i = find_run(h, n, hint, 0)
+        if i != 0xFFFFFFFF:
+            set_range(h, i, n, 1)
+        return i
+
+    @R("RtlFindSetBitsAndClear", "puu", dlls=NT)
+    def _rfsbac(c, h, n, hint):
+        i = find_run(h, n, hint, 1)
+        if i != 0xFFFFFFFF:
+            set_range(h, i, n, 0)
+        return i
+
+    # ---- environment / SIDs / SLists ------------------------------------------------------
+    @R("RtlExpandEnvironmentStrings_U", "pppp", dlls=NT)
+    def _rees(c, env, src, dst, pneed):
+        text = ustr(src)
+
+        def rep(m_):
+            v = p.env.get(m_.group(1).upper())
+            return v if v is not None else m_.group(0)
+        out = re.sub(r"%([^%]+)%", rep, text)
+        data = out.encode("utf-16-le")
+        if pneed:
+            M_.write32(pneed, len(data) + 2)
+        if len(data) + 2 > M_.read16(dst + 2):
+            return STATUS_BUFFER_TOO_SMALL
+        return put_ustr(dst, out)
+
+    @R("RtlExpandEnvironmentStrings", "ppzpzp", dlls=NT)
+    def _rees2(c, env, src, n, dst, cap, pneed):
+        text = M_.read(src, 2 * n).decode("utf-16-le", "replace") if n else ""
+        out = re.sub(r"%([^%]+)%", lambda m_: p.env.get(m_.group(1).upper(), m_.group(0)), text)
+        data = out.encode("utf-16-le") + b"\0\0"
+        if pneed:
+            k.wptr(pneed, len(data) // 2)
+        if cap * 2 < len(data):
+            return STATUS_BUFFER_TOO_SMALL
+        M_.write(dst, data)
+        return 0
+
+    @R("RtlConvertSidToUnicodeString", "ppi", dlls=NT)
+    def _rcstus(c, dst, sid, alloc):
+        n = M_.read8(sid + 1)
+        text = _sid_str(bytes(M_.read(sid, 8 + 4 * n)))
+        if alloc:
+            alloc_str(text, True, dst)
+            return 0
+        return put_ustr(dst, text)
+
+    @R("RtlFirstEntrySList", "p", "p", dlls=NT)
+    def _rfesl(c, head):
+        return rptr(head)
+
+    @R("RtlQueryDepthSList", "p", dlls=NT)
+    def _rqdsl(c, head):
+        n, e = 0, rptr(head)
+        while e and n < 1 << 16:
+            n += 1
+            e = rptr(e)
+        return n
+
+    # ---- other processes' memory (ours, or an emulated child's) -------------------------------
+    def proc_mem(h):
+        if h in (0xFFFFFFFF, M64, 0xFFFFFFFFFFFFFFFF):
+            return M_
+        o = p.handles.get(h)
+        if isinstance(o, dict) and o.get("pid") == p.pid:
+            return M_
+        mem = getattr(o, "mem", None)
+        if mem is None and isinstance(o, dict):
+            child = getattr(k, "children", {}).get(o.get("pid"))
+            mem = getattr(child, "mem", None)
+        return mem
+
+    @R("NtReadVirtualMemory ZwReadVirtualMemory", "pppzp", dlls=NT)
+    def _ntrvm(c, h, addr, buf, n, pread):
+        mem = proc_mem(h)
+        if mem is None:
+            return STATUS_ACCESS_DENIED
+        try:
+            data = bytes(mem.read(addr, n)) if n else b""
+        except Exception:
+            if pread:
+                k.wptr(pread, 0)
+            return 0x8000000D                                    # STATUS_PARTIAL_COPY
+        M_.write(buf, data)
+        if pread:
+            k.wptr(pread, n)
+        return 0
+
+    @R("NtWriteVirtualMemory ZwWriteVirtualMemory", "pppzp", dlls=NT)
+    def _ntwvm(c, h, addr, buf, n, pw):
+        mem = proc_mem(h)
+        if mem is None:
+            return STATUS_ACCESS_DENIED
+        try:
+            mem.write(addr, bytes(M_.read(buf, n)) if n else b"")
+        except Exception:
+            if pw:
+                k.wptr(pw, 0)
+            return 0x8000000D
+        if pw:
+            k.wptr(pw, n)
+        return 0
+
+    # ---- SIDs ----------------------------------------------------------------------------------
+    R("RtlSubAuthoritySid", "pu", "p", dlls=NT)(lambda c, sid, i: sid + 8 + 4 * i)
+    R("RtlSubAuthorityCountSid", "p", "p", dlls=NT)(lambda c, sid: sid + 1)
+    R("RtlIdentifierAuthoritySid", "p", "p", dlls=NT)(lambda c, sid: sid + 2)
+    R("RtlLengthRequiredSid", "u", dlls=NT)(lambda c, n: 8 + 4 * n)
+
+    @R("RtlInitializeSid", "ppu", dlls=NT)
+    def _rinsid(c, sid, auth, n):
+        M_.write(sid, bytes((1, n & 0xFF)) + bytes(M_.read(auth, 6)))
+        return 0
+
+    @R("RtlAllocateAndInitializeSid", "puuuuuuuuup", dlls=NT)
+    def _raais(c, auth, n, s0, s1, s2, s3, s4, s5, s6, s7, psid):
+        if n > 8:
+            return STATUS_INVALID_PARAMETER
+        subs = [s0, s1, s2, s3, s4, s5, s6, s7][:n]
+        a = p.heap_alloc(p.process_heap_handle, 8 + 4 * n)
+        M_.write(a, bytes((1, n)) + bytes(M_.read(auth, 6)) +
+                 b"".join(struct.pack("<I", v & 0xFFFFFFFF) for v in subs))
+        k.wptr(psid, a)
+        return 0
+
+    R("RtlFreeSid", "p", "p", dlls=NT)(lambda c, sid: (p.heap_free(p.process_heap_handle, sid)
+                                                       if sid else None, 0)[1])
+
+    R("NtIsProcessInJob ZwIsProcessInJob", "pp", dlls=NT)(
+        lambda c, proc, job: 0x123)                            # STATUS_PROCESS_NOT_IN_JOB
 
 
 # ==============================================================================
@@ -45878,6 +46156,178 @@ def _sysdlls_install(k):
     R("InternetCrackUrlA", "puup", dlls=INET)(lambda c, u, n, f, cp: _crack(c, u, n, f, cp, False))
     R("InternetCrackUrlW", "puup", dlls=INET)(lambda c, u, n, f, cp: _crack(c, u, n, f, cp, True))
 
+    # ---- winhttp (synchronous; real HTTP when the sandbox allows networking) ---------------
+    WH = ("winhttp.dll",)
+
+    def wh(h, kind=None):
+        o = p.handles.get(h, "inet")
+        if o is None or (kind and o.get("kind") != kind):
+            return None
+        return o
+
+    R("WinHttpOpen", "pupp" + "u", "p", dlls=WH)(
+        lambda c, agent, acc, proxy, bypass, flags: _inet_add(
+            "wh_session", agent=gstr(agent, True), flags=flags))
+
+    @R("WinHttpConnect", "ppuu", "p", dlls=WH)
+    def _whconnect(c, hs, server, port, res):
+        if wh(hs, "wh_session") is None:
+            return err(6)
+        return _inet_add("wh_connect", host=gstr(server, True), port=port & 0xFFFF)
+
+    @R("WinHttpOpenRequest", "ppppppu", "p", dlls=WH)
+    def _whopenreq(c, hc, verb, obj, ver, ref, accept, flags):
+        conn = wh(hc, "wh_connect")
+        if conn is None:
+            return err(6)
+        return _inet_add("wh_request", verb=gstr(verb, True) or "GET",
+                         path=gstr(obj, True) or "/", secure=bool(flags & 0x800000),
+                         conn=conn, headers={}, body=b"", resp=None, pos=0)
+
+    def parse_headers(text, into):
+        for line in text.replace("\r\n", "\n").split("\n"):
+            if ":" in line:
+                k_, v = line.split(":", 1)
+                into[k_.strip()] = v.strip()
+
+    @R("WinHttpAddRequestHeaders", "ppuu", dlls=WH)
+    def _whaddhdr(c, hr, hdrs, n, mods):
+        r = wh(hr, "wh_request")
+        if r is None:
+            return err(6)
+        text = gstr(hdrs, True) if n in (0xFFFFFFFF, 0) else _gstr(M_, hdrs, n, True)
+        parse_headers(text, r["headers"])
+        return 1
+
+    @R("WinHttpSendRequest", "ppupuup", dlls=WH)
+    def _whsend(c, hr, hdrs, n, opt, optlen, total, ctx):
+        r = wh(hr, "wh_request")
+        if r is None:
+            return err(6)
+        if hdrs:
+            text = gstr(hdrs, True) if n in (0xFFFFFFFF, 0) else _gstr(M_, hdrs, n, True)
+            parse_headers(text, r["headers"])
+        r["body"] = bytes(M_.read(opt, optlen)) if opt and optlen else b""
+        conn = r["conn"]
+        scheme = "https" if r["secure"] else "http"
+        default = 443 if r["secure"] else 80
+        port = conn["port"] or default
+        url = "%s://%s%s%s" % (scheme, conn["host"], "" if port == default else ":%d" % port,
+                               r["path"] if r["path"].startswith("/") else "/" + r["path"])
+        res, e = _fetch(url, r["headers"], r["verb"], r["body"] or None)
+        if res is None:
+            return err(12029)                        # ERROR_WINHTTP_CANNOT_CONNECT
+        r["resp"] = res
+        r["pos"] = 0
+        return 1
+
+    R("WinHttpWriteData", "ppup", dlls=WH)(lambda c, hr, buf, n, pw: (
+        M_.write32(pw, n) if pw else None, 1)[1])
+
+    @R("WinHttpReceiveResponse", "pp", dlls=WH)
+    def _whrecv(c, hr, res):
+        r = wh(hr, "wh_request")
+        if r is None:
+            return err(6)
+        return 1 if r["resp"] is not None else err(12019)   # INCORRECT_HANDLE_STATE
+
+    @R("WinHttpQueryHeaders", "puppppp"[:6], dlls=WH)
+    def _whqh(c, hr, level, name, buf, plen, pidx):
+        r = wh(hr, "wh_request")
+        if r is None or r["resp"] is None:
+            return err(12019)
+        status, hdrs, body = r["resp"]
+        info = level & 0xFFFF
+        num = level & 0x20000000
+        low = {k_.lower(): v for k_, v in hdrs.items()}
+        if info == 19:
+            val = str(status)
+        elif info == 20:
+            val = "OK" if status == 200 else ""
+        elif info in (21, 22):
+            lines = ["HTTP/1.1 %d" % status] + ["%s: %s" % kv for kv in hdrs.items()]
+            val = ("\0" if info == 21 else "\r\n").join(lines) + ("\0" if info == 21 else "\r\n")
+        elif info == 65535:
+            val = low.get(gstr(name, True).lower())
+        else:
+            key = {1: "content-type", 5: "content-length", 9: "date", 11: "expires",
+                   22: None, 33: "location", 34: "server", 45: "set-cookie",
+                   46: "last-modified"}.get(info)
+            val = low.get(key) if key else None
+        if val is None:
+            return err(12150)                        # ERROR_WINHTTP_HEADER_NOT_FOUND
+        if num:
+            try:
+                n_ = int(val)
+            except ValueError:
+                return err(12150)
+            if M_.read32(plen) < 4:
+                M_.write32(plen, 4)
+                return err(122)
+            M_.write32(buf, n_ & 0xFFFFFFFF)
+            M_.write32(plen, 4)
+            return 1
+        data = val.encode("utf-16-le")
+        if not buf or M_.read32(plen) < len(data) + 2:
+            M_.write32(plen, len(data) + 2)
+            return err(122)
+        M_.write(buf, data + b"\0\0")
+        M_.write32(plen, len(data))
+        return 1
+
+    @R("WinHttpQueryDataAvailable", "pp", dlls=WH)
+    def _whqda(c, hr, pn):
+        r = wh(hr, "wh_request")
+        if r is None or r["resp"] is None:
+            return err(12019)
+        if pn:
+            M_.write32(pn, len(r["resp"][2]) - r["pos"])
+        return 1
+
+    @R("WinHttpReadData", "ppup", dlls=WH)
+    def _whread(c, hr, buf, n, pread):
+        r = wh(hr, "wh_request")
+        if r is None or r["resp"] is None:
+            return err(12019)
+        data = r["resp"][2][r["pos"]:r["pos"] + n]
+        r["pos"] += len(data)
+        if data:
+            M_.write(buf, data)
+        if pread:
+            M_.write32(pread, len(data))
+        return 1
+
+    @R("WinHttpCloseHandle", "p", dlls=WH)
+    def _whclose(c, h):
+        if p.handles.kind(h) != "inet":
+            return err(6)
+        p.handles.close(h)
+        return 1
+
+    R("WinHttpSetOption", "puPu".replace("P", "p"), dlls=WH)(lambda c, *a: 1)
+    R("WinHttpQueryOption", "pupp", dlls=WH)(lambda c, *a: err(12018))
+    R("WinHttpSetTimeouts", "piiii", dlls=WH)(lambda c, *a: 1)
+    R("WinHttpSetCredentials", "puuppp", dlls=WH)(lambda c, *a: 1)
+    R("WinHttpSetStatusCallback", "ppup", "p", dlls=WH)(lambda c, *a: 0)
+    R("WinHttpCheckPlatform", "", dlls=WH)(lambda c: 1)
+    R("WinHttpCrackUrl", "puup", dlls=WH)(lambda c, u, n, f, cp: _crack(c, u, n, f, cp, True))
+    R("WinHttpDetectAutoProxyConfigUrl", "up", dlls=WH)(lambda c, fl, pp_: err(12180))
+    R("WinHttpGetProxyForUrl", "pppp", dlls=WH)(lambda c, *a: err(12180))
+
+    @R("WinHttpGetIEProxyConfigForCurrentUser", "p", dlls=WH)
+    def _whieproxy(c, cfg):
+        ps = k.ptr_size()
+        M_.write(cfg, bytes(4 * ps if ps == 8 else 16))
+        return 1
+
+    @R("WinHttpGetDefaultProxyConfiguration", "p", dlls=WH)
+    def _whdefproxy(c, info):
+        ps = k.ptr_size()
+        M_.write(info, struct.pack("<I", 1) + bytes(3 * ps - 4 + (ps if ps == 8 else 0)))
+        return 1
+
+    R("WinHttpSetDefaultProxyConfiguration", "p", dlls=WH)(lambda c, i: 1)
+
     # ---- kernel32 odds -------------------------------------------------------------------
     @R("MulDiv", "iii")
     def _muldiv(c, a, b, d):
@@ -54186,6 +54636,46 @@ def _sysmore_install(k):
             return 122
         M_.write32(buf, 0)
         return 0
+
+    # ---- ETW: sessions cannot be started (no kernel logger); providers are accepted ------------
+    ADV = ("advapi32.dll", "sechost.dll")
+    INVALID_TRACE = M64 if p.cpu_mode == 64 else 0xFFFFFFFF
+    R("StartTraceW StartTraceA", "ppp", dlls=ADV)(lambda c, ph, name, props: 5)   # ACCESS_DENIED
+    R("ControlTraceW ControlTraceA", "Qppu", dlls=ADV)(
+        lambda c, h, name, props, code: 4201)                  # ERROR_WMI_INSTANCE_NOT_FOUND
+    R("StopTraceW StopTraceA FlushTraceW QueryTraceW", "Qpp", dlls=ADV)(lambda c, *a: 4201)
+    R("OpenTraceW OpenTraceA", "p", "q", dlls=ADV)(
+        lambda c, log: (setattr(p, "last_error", 4201), -1)[1])
+    R("ProcessTrace", "pupp", dlls=ADV)(lambda c, *a: 6)        # ERROR_INVALID_HANDLE
+    R("CloseTrace", "Q", dlls=ADV)(lambda c, h: 6)
+    R("EnableTraceEx2", "QpuuQQup", dlls=ADV)(lambda c, *a: 4201)
+    R("EnableTrace", "uuupQ", dlls=ADV)(lambda c, *a: 4201)
+    R("QueryAllTracesW QueryAllTracesA", "pup", dlls=ADV)(
+        lambda c, arr, n, pcount: (M_.write32(pcount, 0) if pcount else None, 0)[1])
+    R("TraceSetInformation", "Qupu", dlls=ADV)(lambda c, *a: 50)
+
+    # ---- winsta.dll: a single console session ----------------------------------------------------
+    WS = ("winsta.dll",)
+    R("WinStationEnumerateW", "ppp", dlls=WS)(lambda c, srv, pp, pn: (
+        M_.write32(pn, 0) if pn else None, k.err(1168))[1])
+    R("WinStationQueryInformationW", "puupup", dlls=WS)(lambda c, *a: k.err(1168))
+    R("WinStationRegisterConsoleNotification", "ppu", dlls=WS)(lambda c, *a: 1)
+    R("WinStationUnRegisterConsoleNotification", "pp", dlls=WS)(lambda c, *a: 1)
+    R("WinStationFreeMemory", "p", dlls=WS)(lambda c, a: 1)
+    R("WinStationFreeGAPMemory", "upu", dlls=WS)(lambda c, *a: 1)
+    R("WinStationGetAllProcesses", "puppp", dlls=WS)(lambda c, *a: k.err(1168))
+    R("WinStationConnectW WinStationDisconnect WinStationReset WinStationShadow "
+      "WinStationShadowStop WinStationSendMessageW WinStationTerminateProcess",
+      "pupppupuu", dlls=WS)(lambda c, *a: k.err(5))
+    R("WinStationGetProcessSid", "puqppp", dlls=WS)(lambda c, *a: k.err(1168))
+    R("WinStationNameFromLogonIdW", "pup", dlls=WS)(
+        lambda c, srv, sid, buf: (M_.write(buf, "Console".encode("utf-16-le") + b"\0\0")
+                                  if buf else None, 1)[1])
+
+    R("SetProcessShutdownParameters", "uu")(lambda c, lvl, flags: 1)
+    R("GetProcessShutdownParameters", "pp")(
+        lambda c, pl, pf: (M_.write32(pl, 0x280) if pl else None,
+                           M_.write32(pf, 0) if pf else None, 1)[2])
 
 
 # ==========================================================================================
