@@ -210,7 +210,10 @@ python3 NOO.py --max-instructions N prog.exe   # optional runaway guard (default
 | **AutoHotkey v1.1 (x86) and v2.0 (x64)** | scripts with GUIs (Edit, Checkbox, DropDownList, Slider, Progress, ListView, TreeView), MsgBox, FileSelect / DirSelect, error dialogs, regex, files, registry, timers, DllCall |
 | **CPython 3.12** (MSVC build, x86 and x64) | the interpreter with its stdlib (json, re, datetime, OpenSSL `hashlib` via `libcrypto`) and **tkinter GUIs** |
 | **7-Zip** `7zr` / `7za` (x86, x64) | extracting, creating and testing `.7z` archives (LZMA + BCJ2, CRCs verified) |
-| **ripgrep 14** (Rust, x64) | parallel recursive search, `.gitignore` handling |
+| **Neovim 0.10** (x64, LuaJIT) | headless editing with its full runtime: Ex commands, substitutions, Lua API, `:wq` |
+| **ninja 1.12** (x86) | builds with parallel child processes, output captured through named pipes and an I/O completion port, incremental rebuilds |
+| **UPX 4.2** (x86, itself packed) | compresses and tests executables; the packed output runs |
+| **ripgrep 14** / **fd 10** (Rust) | parallel recursive search, `.gitignore` handling, `fd -x` spawning commands |
 | **jq 1.7** (x86, x64) | JSON processing with colored console output |
 | **fzf 0.55** (Go, x64) | Go runtime start-up incl. goroutine preemption |
 
@@ -222,7 +225,8 @@ lists), **MDI** frames and children, **RichEdit** (with RTF streaming), in-guest
 and Vista `IFileDialog`), a **GDI+** flat API (PNG/BMP/ICO/GIF images, lock bits,
 brushes, pens, paths, regions, text, transforms), COM `IStream`s, shell folders
 and PIDLs, shlwapi path/string helpers, crypt32, setupapi,
-Winsock, wininet and more. On 32-bit programs, stack clean-up for every one of
+Winsock, wininet, named pipes with overlapped I/O, I/O completion ports and APCs,
+job objects and more. On 32-bit programs, stack clean-up for every one of
 ~14,000 system exports comes from a ground-truth table, so even unimplemented
 calls cannot corrupt the stack.
 

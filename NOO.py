@@ -12465,7 +12465,14 @@ def _crt_install(crt):
     @R("_isatty isatty", "i")
     def __isatty(c, fd):
         fdo = crt.fds.get(fd)
-        return 64 if fdo is not None and fdo.kind in ("stdin", "stdout", "stderr") else 0
+        if fdo is None or fdo.kind not in ("stdin", "stdout", "stderr"):
+            return 0
+        k32 = getattr(p, "k32", None)
+        if fdo.kind != "stdin" and k32 is not None and hasattr(k32, "std_out_piped") and \
+                k32.std_out_piped(HandleTable.STDOUT_HANDLE if fdo.kind == "stdout"
+                                  else HandleTable.STDERR_HANDLE):
+            return 0
+        return 64
 
     @R("_setmode setmode", "ii")
     def __setmode(c, fd, mode):
@@ -12524,17 +12531,19 @@ def _crt_install(crt):
 
     @R("_open_osfhandle", "pi")
     def __open_osfhandle(c, h, flags):
+        # the CRT marks the descriptor as text only when _O_TEXT is passed explicitly
+        text = bool(flags & 0x4000)
         if h == HandleTable.STDOUT_HANDLE:
-            return crt.new_fd(_FD("stdout", None, not flags & O_BINARY, readable=False))
+            return crt.new_fd(_FD("stdout", None, text, readable=False))
         if h == HandleTable.STDERR_HANDLE:
-            return crt.new_fd(_FD("stderr", None, not flags & O_BINARY, readable=False))
+            return crt.new_fd(_FD("stderr", None, text, readable=False))
         if h == HandleTable.STDIN_HANDLE:
-            return crt.new_fd(_FD("stdin", None, not flags & O_BINARY, writable=False))
+            return crt.new_fd(_FD("stdin", None, text, writable=False))
         f = p.handles.get(h, "file")
         if f is None:
             crt.set_errno(_EBADF)
             return -1
-        fdo = _FD("file", f, not flags & O_BINARY, bool(flags & O_APPEND), getattr(f, "name", None))
+        fdo = _FD("file", f, text, bool(flags & O_APPEND), getattr(f, "name", None))
         fdo.handle = h
         return crt.new_fd(fdo)
 
@@ -14362,23 +14371,47 @@ class _K32:
                 return WAIT_OBJECT_0 + i
         return None
 
-    def wait(self, cpu, handles, wait_all, timeout):
+    def wait(self, cpu, handles, wait_all, timeout, alertable=False):
         p = self.p
         t = p.current_thread
         for h in handles:
             if p.handles.kind(h) is None and h not in (0xFFFFFFFF, M64):
                 p.last_error = ERROR_INVALID_HANDLE
                 return WAIT_FAILED
+        if alertable and self.run_apcs():
+            return 0xC0                          # WAIT_IO_COMPLETION
         r = self._try_wait(handles, wait_all, t.tid)
         if r is not None:
             return r
         if timeout == 0:
             return WAIT_TIMEOUT
         deadline = None if timeout == INFINITE else time.monotonic() + timeout / 1000.0
+        t.alertable = bool(alertable)
         t.state = "blocked"
         t.waiting_on = ("kwait", list(handles), wait_all, deadline)
         cpu.regs[RAX] = WAIT_TIMEOUT
         raise NOOYield()
+
+    # -- user APCs (QueueUserAPC, ReadFileEx/WriteFileEx completion routines) ------------
+    def queue_apc(self, t, fn, args):
+        t.__dict__.setdefault("apcs", []).append((fn, list(args)))
+
+    def run_apcs(self, t=None):
+        """Run the current (or given) thread's queued APCs; True if any ran."""
+        p = self.p
+        t = t or p.current_thread
+        q = t.__dict__.get("apcs")
+        if not q:
+            return False
+        prev = p.current_thread
+        p.current_thread = t
+        try:
+            while q:
+                fn, args = q.pop(0)
+                p.call_guest(fn, args)
+        finally:
+            p.current_thread = prev
+        return True
 
     def block(self, cpu, what, deadline=None, rax=0):
         t = self.p.current_thread
@@ -14393,6 +14426,10 @@ class _K32:
         w = t.waiting_on
         kind = w[0]
         now = time.monotonic()
+        if self.__dict__.get("np_pending"):
+            self.np_poll()                   # overlapped pipe reads may signal events
+        if self.__dict__.get("apc_reads"):
+            self.apc_poll()
         if kind == "kwait":
             _k, handles, wait_all, deadline = w
             r = self._try_wait(handles, wait_all, t.tid)
@@ -14489,7 +14526,10 @@ class _K32:
                                    for h in w[1]):
             poll = time.monotonic() + 0.01         # another emulated process may exit
             best = poll if best is None else min(best, poll)
-        if w[0] in ("sock", "sockselect", "pipe", "iocp"):
+        polled = w[0] in ("sock", "sockselect", "pipe", "iocp", "ovwait", "npconnect")
+        if not polled and (self.__dict__.get("np_pending") or self.__dict__.get("apc_reads")):
+            polled = w[0] == "kwait" or t.__dict__.get("alertable")
+        if polled:
             poll = time.monotonic() + 0.02         # external events: keep polling
             best = poll if best is None else min(best, poll)
         return best
@@ -15981,6 +16021,10 @@ def _k32_install(k):
 
     @R("SleepEx", "ui")
     def _sleepex(c, ms, alertable):
+        if alertable and k.run_apcs():
+            return 0xC0                             # WAIT_IO_COMPLETION
+        if alertable:
+            p.current_thread.alertable = True
         k.block(c, ("sleep",), time.monotonic() + (ms / 1000.0 if ms != INFINITE else 1e9), rax=0)
 
     @R("GetThreadPriority", "p")
@@ -16015,12 +16059,12 @@ def _k32_install(k):
 
     @R("WaitForSingleObjectEx", "pui")
     def _wfsox(c, h, ms, alert):
-        return k.wait(c, [h], False, ms)
+        return k.wait(c, [h], False, ms, bool(alert))
 
-    def _wfmo(c, n, arr, all_, ms):
+    def _wfmo(c, n, arr, all_, ms, alert=False):
         ps = k.ptr_size()
         hs = [k.p.mem.read64(arr + i * 8) if ps == 8 else k.p.mem.read32(arr + i * 4) for i in range(n)]
-        return k.wait(c, hs, bool(all_), ms)
+        return k.wait(c, hs, bool(all_), ms, alert)
 
     @R("WaitForMultipleObjects", "upiu")
     def _wfmo_(c, n, arr, all_, ms):
@@ -16028,12 +16072,12 @@ def _k32_install(k):
 
     @R("WaitForMultipleObjectsEx", "upiui")
     def _wfmox(c, n, arr, all_, ms, alert):
-        return _wfmo(c, n, arr, all_, ms)
+        return _wfmo(c, n, arr, all_, ms, bool(alert))
 
     @R("SignalObjectAndWait", "ppui")
     def _soaw(c, sig, h, ms, alert):
         _setevent(c, sig)
-        return k.wait(c, [h], False, ms)
+        return k.wait(c, [h], False, ms, bool(alert))
 
     def _named(name_ptr, wide):
         return k.s(name_ptr, wide) if name_ptr else None
@@ -16534,6 +16578,13 @@ def _k32_install(k):
 
     @R("QueueUserAPC", "ppp")
     def _qapc(c, fn, h, data):
+        if h in (0xFFFFFFFE, 0xFFFFFFFFFFFFFFFE):
+            t = p.current_thread
+        else:
+            t = p.handles.get(h, "thread")
+        if t is None or not fn:
+            return k.err(ERROR_INVALID_HANDLE)
+        k.queue_apc(t, fn, [data])
         return 1
 
     # =====================================================================
@@ -16558,6 +16609,10 @@ def _k32_install(k):
             obj.readers -= 1
         elif kind == "pipe_w":
             obj.writers -= 1
+        elif kind == "npsrv":
+            obj.refs -= 1
+            if obj.refs <= 0:
+                k.np_close_server(obj)
         meta = k.file_meta.get(h)
         p.handles.close(h)
         k.file_meta.pop(h, None)
@@ -16586,13 +16641,20 @@ def _k32_install(k):
                 else:
                     return k.err(ERROR_INVALID_HANDLE)
             else:
-                nh = p.handles.add(p.handles.get(h), kind)
+                obj = p.handles.get(h)
+                nh = p.handles.add(obj, kind)
+                if kind == "pipe_r":
+                    obj.readers += 1
+                elif kind == "pipe_w":
+                    obj.writers += 1
+                elif kind == "npsrv":
+                    obj.refs += 1
                 if h in k.file_meta:
                     k.file_meta[nh] = dict(k.file_meta[h])
         if out:
             k.wptr(out, nh)
         if opt & 1:                                # DUPLICATE_CLOSE_SOURCE
-            p.handles.close(h)
+            _closehandle(c, h)
         return 1
 
     @R("GetHandleInformation", "pp")
@@ -16721,12 +16783,89 @@ def _k32_install(k):
         if sink is not None and sink.get(stream) is not None:
             sink[stream](data)
             return
+        if h in (HandleTable.STDOUT_HANDLE, HandleTable.STDERR_HANDLE) and \
+                not std_out_piped(h) and data:
+            # real terminal: follow the console's text attribute with SGR codes and
+            # track the cursor row for WriteConsoleOutput rendering
+            attr = getattr(k, "console_attr", 7)
+            if attr != k.__dict__.get("vt_attr", 7):
+                data = vt_sgr(attr).encode() + data
+                k.vt_attr = attr
+            nl = data.count(b"\n")
+            if nl:
+                cur = getattr(k, "cursor", [0, 0])
+                k.cursor = [0, cur[1] + nl]
+                k.vt_row = k.cursor[1]
         p.log.guest_write(data, stream)
+
+    def vt_sgr(attr):
+        def ansi(c_):
+            return ((c_ & 4) >> 2) | (c_ & 2) | ((c_ & 1) << 2)
+        fg, bg = attr & 15, (attr >> 4) & 15
+        if (fg, bg) == (7, 0):
+            return "\x1b[0m"
+        return "\x1b[0;%d;%dm" % ((90 if fg & 8 else 30) + ansi(fg),
+                                    (100 if bg & 8 else 40) + ansi(bg))
+
+    def vt_goto(h, x, y):
+        """Move the real terminal cursor to console cell (x, y), relative to the row the
+        terminal cursor is on."""
+        row = k.__dict__.get("vt_row", getattr(k, "cursor", [0, 0])[1])
+        out = ""
+        if y > row:
+            out += "\n" * (y - row)
+        elif y < row:
+            out += "\x1b[%dA" % (row - y)
+        out += "\r" + ("\x1b[%dC" % x if x > 0 else "")
+        k.vt_row = y
+        p.log.guest_write(out.encode(), "stderr" if h == HandleTable.STDERR_HANDLE
+                          else "stdout")
+
+    def vt_cells(h, x, y, cells):
+        """Render [(char, attr)] at console cell (x, y) on a real terminal."""
+        vt_goto(h, x, y)
+        out = []
+        cur = None
+        for ch, a in cells:
+            if a != cur:
+                out.append(vt_sgr(a))
+                cur = a
+            out.append(ch if ch >= " " else " ")
+        out.append(vt_sgr(getattr(k, "console_attr", 7)))
+        k.vt_attr = getattr(k, "console_attr", 7)
+        p.log.guest_write("".join(out).encode("utf-8", "replace"),
+                          "stderr" if h == HandleTable.STDERR_HANDLE else "stdout")
+
+    k.vt_cells = vt_cells
+    k.vt_goto = vt_goto
+
+    def std_out_piped(h):
+        """Like Windows, a guest whose output NOO captures or whose host stream is not a
+        terminal gets a pipe for stdout/stderr, not a console (NOO_CONSOLE=1 overrides)."""
+        if h not in (HandleTable.STDOUT_HANDLE, HandleTable.STDERR_HANDLE):
+            return False
+        v = p.__dict__.get("_std_piped")
+        if v is None:
+            if os.environ.get("NOO_CONSOLE") == "1":
+                v = False
+            elif getattr(p.log, "capture", False):
+                v = True
+            else:
+                try:
+                    v = not sys.stdout.isatty()
+                except Exception:
+                    v = True
+            p._std_piped = v
+        return v
+
+    k.std_out_piped = std_out_piped
 
     def is_console(h):
         redir = p.__dict__.get("std_redirect") or {}
         if h in STD and redir.get(h) is not None:
             return False                            # redirected to a pipe / file
+        if std_out_piped(h):
+            return False
         return h in STD or p.handles.kind(h) in ("conin", "conout")
 
     def is_console_input(h):
@@ -16747,6 +16886,8 @@ def _k32_install(k):
         if up in ("NUL", "\\\\.\\NUL") or up.endswith("\\NUL") or up.startswith("NUL."):
             p.last_error = 0
             return p.handles.add(k.null_dev, "null")
+        if up.startswith("\\\\.\\PIPE\\") or up.startswith("\\\\?\\PIPE\\"):
+            return k.np_open_client(up[9:], access)
         if up.startswith("\\\\.\\"):
             p.log.warn("CreateFile on device %s — not available" % path)
             p.last_error = ERROR_FILE_NOT_FOUND
@@ -16889,8 +17030,10 @@ def _k32_install(k):
             data = data or b""
         elif kind == "null":
             data = b""
-        elif kind == "pipe_r":
-            pipe = p.handles.get(h)
+        elif kind == "npsrv":
+            return k.np_server_read(c, p.handles.get(h), h, buf, n, pread, ov)
+        elif kind == "pipe_r" or (kind == "pipe_w" and h in k.np_duplex):
+            pipe = p.handles.get(h) if kind == "pipe_r" else k.np_duplex[h]
             if not pipe.buf:
                 if pipe.writers <= 0:
                     return k.err(109)               # ERROR_BROKEN_PIPE
@@ -16943,6 +17086,13 @@ def _k32_install(k):
             return len(data)
         if kind == "null":
             return len(data)
+        if kind == "npsrv":
+            np_ = p.handles.get(h)
+            if not np_.connected or np_.s2c.readers <= 0:
+                p.last_error = 233 if not np_.connected else 232   # PIPE_NOT_CONNECTED / NO_DATA
+                return None
+            np_.s2c.buf += data
+            return len(data)
         if kind == "pipe_w":
             pipe = p.handles.get(h)
             if pipe.readers <= 0:
@@ -16968,22 +17118,116 @@ def _k32_install(k):
             _ov_done(ov, 0, r)
         return 1
 
+    def _ov_result(ov):
+        ps = k.ptr_size()
+        st = p.mem.read64(ov) if ps == 8 else p.mem.read32(ov)
+        nb = p.mem.read64(ov + ps) if ps == 8 else p.mem.read32(ov + ps)
+        return st, nb
+
     @R("ReadFileEx", "ppupp")
     def _readfileex(c, h, buf, n, ov, cb):
-        return _readfile(c, h, buf, n, 0, ov)
+        kind = p.handles.kind(h)
+        pipe = None
+        if kind == "pipe_r":
+            pipe = p.handles.get(h)
+        elif kind == "pipe_w" and h in k.np_duplex:
+            pipe = k.np_duplex[h]
+        elif kind == "npsrv":
+            pipe = p.handles.get(h).c2s
+        if pipe is not None and not pipe.buf:
+            if pipe.writers <= 0:
+                return k.err(109)                   # ERROR_BROKEN_PIPE: no routine queued
+            # completes later: the routine runs in an alertable wait of this thread
+            k.wptr(ov, 0x103)
+            k.apc_reads.append((pipe, buf, n, ov, cb, p.current_thread))
+            p.last_error = 0
+            return 1
+        tmp = p.heap_alloc(p.process_heap_handle, 8)
+        try:
+            ok = _readfile(c, h, buf, n, tmp, ov)
+            got = p.mem.read32(tmp)
+        finally:
+            p.heap_free(p.process_heap_handle, tmp)
+        if not ok:
+            return 0
+        _ov_done(ov, 0, got)
+        k.queue_apc(p.current_thread, cb, [0, got, ov])
+        return 1
 
     @R("WriteFileEx", "ppupp")
     def _writefileex(c, h, buf, n, ov, cb):
-        return _writefile(c, h, buf, n, 0, ov)
+        tmp = p.heap_alloc(p.process_heap_handle, 8)
+        try:
+            ok = _writefile(c, h, buf, n, tmp, 0)
+            got = p.mem.read32(tmp)
+        finally:
+            p.heap_free(p.process_heap_handle, tmp)
+        if not ok:
+            return 0
+        _ov_done(ov, 0, got)
+        k.queue_apc(p.current_thread, cb, [0, got, ov])
+        return 1
+
+    k.apc_reads = []
+
+    def apc_poll():
+        still = []
+        for ent in k.apc_reads:
+            pipe, buf, n, ov, cb, t = ent
+            if pipe.buf:
+                data = pipe_read(pipe, buf, n)
+                _ov_done(ov, 0, len(data))
+                k.queue_apc(t, cb, [0, len(data), ov])
+            elif pipe.writers <= 0:
+                _ov_done(ov, 0xC000014B, 0)
+                k.queue_apc(t, cb, [109, 0, ov])     # ERROR_BROKEN_PIPE
+            else:
+                still.append(ent)
+        k.apc_reads = still
+
+    k.apc_poll = apc_poll
+
+    _OV_ERR = {0xC0000011: ERROR_HANDLE_EOF, 0xC000014B: 109, 0xC0000120: 995,
+               0xC00000B0: 109}
+
+    def _ov_pending(ov):
+        if k.__dict__.get("np_pending"):
+            k.np_poll()
+        if k.__dict__.get("apc_reads"):
+            k.apc_poll()
+        st = p.mem.read64(ov) if p.cpu_mode == 64 else p.mem.read32(ov)
+        return (st & 0xFFFFFFFF) == 0x103
+
+    def _gor_result(ov, pn):
+        n = p.mem.read64(ov + 8) if p.cpu_mode == 64 else p.mem.read32(ov + 4)
+        st = (p.mem.read64(ov) if p.cpu_mode == 64 else p.mem.read32(ov)) & 0xFFFFFFFF
+        w32(pn, n)
+        if st in _OV_ERR:
+            return k.err(_OV_ERR[st])
+        if st & 0xC0000000 == 0xC0000000:
+            return k.err(31)                        # ERROR_GEN_FAILURE
+        return 1
+
+    def _ovwait_hook(t):
+        _k, ov, pn, _dl = t.waiting_on
+        if _ov_pending(ov):
+            return False
+        t.cpu.regs[RAX] = _gor_result(ov, pn)
+        return True
+
+    k.wait_hooks["ovwait"] = _ovwait_hook
 
     @R("GetOverlappedResult", "pppi")
     def _gor(c, h, ov, pn, wait):
-        n = p.mem.read64(ov + 8) if p.cpu_mode == 64 else p.mem.read32(ov + 4)
-        st = p.mem.read64(ov) if p.cpu_mode == 64 else p.mem.read32(ov)
-        w32(pn, n)
-        if st == 0xC0000011:
-            return k.err(ERROR_HANDLE_EOF)
-        return 1
+        if _ov_pending(ov):
+            if not wait:
+                return k.err(996)                   # ERROR_IO_INCOMPLETE
+            t = p.current_thread
+            t.state = "blocked"
+            t.waiting_on = ("ovwait", ov, pn, None)
+            c.regs[RAX] = 0
+            raise NOOYield()
+        return _gor_result(ov, pn)
 
     @R("GetOverlappedResultEx", "pppui")
     def _gorx(c, h, ov, pn, ms, alert):
@@ -16991,10 +17235,13 @@ def _k32_install(k):
 
     @R("CancelIo", "p")
     def _cancelio(c, h):
+        k.np_cancel(h)
         return 1
 
     @R("CancelIoEx", "pp")
     def _cancelioex(c, h, ov):
+        if k.np_cancel(h, ov or None):
+            return 1
         return k.err(1168)                          # ERROR_NOT_FOUND: nothing pending
 
     @R("CancelSynchronousIo", "p")
@@ -17108,6 +17355,8 @@ def _k32_install(k):
         redir = (p.__dict__.get("std_redirect") or {}).get(h) if h in STD else None
         if redir is not None:
             return {"pipe": 3, "file": 1, "null": 2}.get(redir[0], 2)
+        if k.std_out_piped(h):
+            return 3                                # FILE_TYPE_PIPE
         kind = p.handles.kind(h)
         if h in STD or kind in ("conin", "conout", "null"):
             return 2                                # FILE_TYPE_CHAR
@@ -17208,11 +17457,19 @@ def _k32_install(k):
             alloc = (eof + 4095) & ~4095
             nm = name.encode("utf-16-le")
             common = struct.pack("<IIqqqqqqII", 0, 0, ct, at, mt, mt, eof, alloc, attrs, len(nm))
-            if cls in (10, 11):                     # FILE_ID_BOTH_DIR_INFO
-                ent = common + struct.pack("<IBB", 0, 0, 0) + bytes(24) + bytes(2) + \
-                    struct.pack("<q", st.st_ino & 0x7FFFFFFFFFFFFFFF) + nm
-            elif cls in (14, 15):                   # FILE_FULL_DIR_INFO
+            fid = struct.pack("<q", st.st_ino & 0x7FFFFFFFFFFFFFFF)
+            if cls in (10, 11, "nt37"):             # FILE_ID_BOTH_DIR_INFO(RMATION)
+                ent = common + struct.pack("<IBB", 0, 0, 0) + bytes(24) + bytes(2) + fid + nm
+            elif cls in (14, 15, "nt2"):            # FILE_FULL_DIR_INFO(RMATION)
                 ent = common + struct.pack("<I", 0) + nm
+            elif cls == "nt1":                      # FILE_DIRECTORY_INFORMATION
+                ent = common + nm
+            elif cls == "nt3":                      # FILE_BOTH_DIR_INFORMATION
+                ent = common + struct.pack("<IBB", 0, 0, 0) + bytes(24) + nm
+            elif cls == "nt12":                     # FILE_NAMES_INFORMATION
+                ent = struct.pack("<III", 0, 0, len(nm)) + nm
+            elif cls == "nt38":                     # FILE_ID_FULL_DIR_INFORMATION
+                ent = common + struct.pack("<I4x", 0) + fid + nm
             else:                                   # FILE_ID_EXTD_DIR_INFO
                 ent = common + struct.pack("<II", 0, 0) + (st.st_ino & M64).to_bytes(16, "little") + nm
             ent = bytearray(ent)
@@ -18060,7 +18317,9 @@ def _k32_install(k):
     @R("PeekNamedPipe", "ppuppp")
     def _pnp(c, h, buf, n, pread, avail, left):
         pipe = p.handles.get(h)
-        if p.handles.kind(h) not in ("pipe_r", "pipe_w"):
+        if p.handles.kind(h) == "npsrv":
+            pipe = pipe.c2s
+        elif p.handles.kind(h) not in ("pipe_r", "pipe_w"):
             if h == HandleTable.STDIN_HANDLE:
                 w32(pread, 0)
                 w32(avail, 0)
@@ -18082,11 +18341,240 @@ def _k32_install(k):
     def _snphs(c, h, mode, maxc, to):
         return 1
 
-    @R("CreateNamedPipeA CreateNamedPipeW", "puuuuuup", "p")
-    def _cnp(c, name, om, pm, maxi, outs, ins, to, sa):
-        p.log.warn("CreateNamedPipe: named pipes are not supported")
-        p.last_error = ERROR_NOT_SUPPORTED
-        return INVALID
+    # -- named pipes (in-process: server and clients live in this runtime) ------------------
+    class _NPipe:
+        def __init__(self, name, mode, pmode):
+            self.name = name
+            self.mode = mode                        # PIPE_ACCESS_* | FILE_FLAG_OVERLAPPED
+            self.pmode = pmode
+            self.c2s = _KPipe(0)                    # client -> server
+            self.c2s.writers = 0
+            self.s2c = _KPipe(0)                    # server -> client
+            self.s2c.readers = 0
+            self.connected = False
+            self.ever = False
+            self.pending_connect = None             # (ov, handle)
+            self.refs = 1
+            self.handle = 0
+
+    k.npipes = {}                                   # NAME -> [listening _NPipe]
+    k.np_pending = []                               # pending overlapped reads
+
+    def np_complete(h, ov, nbytes, err=0):
+        """Finish an overlapped operation: OVERLAPPED, its event, and the IOCP."""
+        status = 0 if not err else {109: 0xC000014B, 995: 0xC0000120}.get(err, 0xC0000001)
+        _ov_done(ov, status, nbytes)
+        assoc = k.__dict__.get("port_assoc", {}).get(h)
+        if assoc is not None:
+            port, key = assoc
+            port.q.append((nbytes, key, ov, err))
+
+    def np_poll():
+        """Complete pending pipe reads whose data or end of stream has arrived."""
+        still = []
+        for ent in k.np_pending:
+            np_, h, buf, n, ov = ent
+            pipe = np_.c2s
+            if pipe.buf:
+                data = pipe_read(pipe, buf, n)
+                np_complete(h, ov, len(data))
+            elif np_.ever and pipe.writers <= 0:
+                np_complete(h, ov, 0, 109)
+            elif np_.refs <= 0:
+                np_complete(h, ov, 0, 995)
+            else:
+                still.append(ent)
+        k.np_pending = still
+
+    k.np_poll = np_poll
+
+    @R("CreateNamedPipeA", "puuuuuup", "p")
+    def _cnpa(c, name, om, pm, maxi, outs, ins, to, sa):
+        return _cnp(k.cs_(name), om, pm)
+
+    @R("CreateNamedPipeW", "puuuuuup", "p")
+    def _cnpw(c, name, om, pm, maxi, outs, ins, to, sa):
+        return _cnp(k.ws_(name), om, pm)
+
+    def _cnp(name, om, pm):
+        up = name.upper().replace("/", "\\")
+        if not (up.startswith("\\\\.\\PIPE\\") or up.startswith("\\\\?\\PIPE\\")):
+            p.last_error = 123                      # ERROR_INVALID_NAME
+            return INVALID
+        key = up[9:]
+        np_ = _NPipe(key, om, pm)
+        h = p.handles.add(np_, "npsrv")
+        np_.handle = h
+        k.npipes.setdefault(key, []).append(np_)
+        p.last_error = 0
+        return h
+
+    def np_open_client(key, access):
+        lst = [x for x in k.npipes.get(key, []) if not x.connected and x.refs > 0]
+        if not lst:
+            p.last_error = 231 if k.npipes.get(key) else ERROR_FILE_NOT_FOUND   # PIPE_BUSY
+            return INVALID
+        np_ = lst[0]
+        np_.connected = np_.ever = True
+        k.npipes[key].remove(np_)
+        want_w = access & (0x40000000 | 0x10000000 | 0x2)          # GENERIC_WRITE/ALL, FILE_WRITE
+        want_r = access & (0x80000000 | 0x10000000 | 0x1)
+        if want_w:
+            np_.c2s.writers += 1
+        if want_r:
+            np_.s2c.readers += 1
+        if want_w and not want_r:
+            h = p.handles.add(np_.c2s, "pipe_w")
+        elif want_r and not want_w:
+            h = p.handles.add(np_.s2c, "pipe_r")
+        else:
+            # duplex client: reads come from s2c, writes go to c2s
+            h = p.handles.add(np_.c2s, "pipe_w")
+            k.np_duplex[h] = np_.s2c
+        if np_.pending_connect is not None:
+            ov, sh = np_.pending_connect
+            np_.pending_connect = None
+            np_complete(sh, ov, 0)
+        p.last_error = 0
+        return h
+
+    k.np_open_client = np_open_client
+    k.np_duplex = {}
+
+    def np_cancel(h, ov=None):
+        """Cancel pending overlapped operations on a handle (all, or the one on ov):
+        each completes with ERROR_OPERATION_ABORTED, as on Windows."""
+        n = 0
+        o = p.handles.get(h)
+        if isinstance(o, _NPipe) and o.pending_connect is not None and \
+                (ov is None or o.pending_connect[0] == ov):
+            cov, sh = o.pending_connect
+            o.pending_connect = None
+            np_complete(sh, cov, 0, 995)
+            n += 1
+        still = []
+        for ent in k.np_pending:
+            if ent[1] == h and (ov is None or ent[4] == ov):
+                np_complete(h, ent[4], 0, 995)
+                n += 1
+            else:
+                still.append(ent)
+        k.np_pending = still
+        return n
+
+    k.np_cancel = np_cancel
+
+    def np_close_server(np_):
+        np_cancel(np_.handle)
+        np_.s2c.writers = 0
+        np_.c2s.readers = 0
+        lst = k.npipes.get(np_.name)
+        if lst and np_ in lst:
+            lst.remove(np_)
+        np_poll()
+
+    k.np_close_server = np_close_server
+
+    def ov_event_reset(ov):
+        """Starting an overlapped operation resets its hEvent (as Windows does)."""
+        ps = k.ptr_size()
+        ev = p.mem.read64(ov + 24) if ps == 8 else p.mem.read32(ov + 16)
+        e = p.handles.get(ev, "kevent") if ev else None
+        if e is not None:
+            e.signaled = False
+
+    k.ov_event_reset = ov_event_reset
+
+    def np_server_read(c, np_, h, buf, n, pread, ov):
+        pipe = np_.c2s
+        if ov:
+            ov_event_reset(ov)
+        if not np_.connected:
+            return k.err(536 if np_.ever else 233)  # ERROR_PIPE_LISTENING / NOT_CONNECTED
+        if pipe.buf:
+            data = pipe_read(pipe, buf, n)
+            w32(pread, len(data))
+            if ov:
+                np_complete(h, ov, len(data))
+            return 1
+        if pipe.writers <= 0:
+            return k.err(109)                       # ERROR_BROKEN_PIPE
+        if ov and np_.mode & 0x40000000:            # FILE_FLAG_OVERLAPPED
+            k.np_pending.append((np_, h, buf, n, ov))
+            if ov:
+                k.wptr(ov, 0x103)                   # STATUS_PENDING
+            return k.err(997)                       # ERROR_IO_PENDING
+        t = p.current_thread
+        t.state = "blocked"
+        t.waiting_on = ("pipe", pipe, buf, n, pread, None)
+        c.regs[RAX] = 0
+        raise NOOYield()
+
+    k.np_server_read = np_server_read
+
+    @R("ConnectNamedPipe", "pp")
+    def _connp(c, h, ov):
+        np_ = p.handles.get(h, "npsrv")
+        if np_ is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        if np_.connected:
+            return k.err(535)                       # ERROR_PIPE_CONNECTED
+        if ov:
+            np_.pending_connect = (ov, h)
+            k.wptr(ov, 0x103)
+            return k.err(997)                       # ERROR_IO_PENDING
+        t = p.current_thread
+        t.state = "blocked"
+        t.waiting_on = ("npconnect", np_, None)
+        c.regs[RAX] = 1
+        raise NOOYield()
+
+    k.wait_hooks["npconnect"] = lambda t: t.waiting_on[1].connected
+
+    @R("DisconnectNamedPipe", "p")
+    def _discp(c, h):
+        np_ = p.handles.get(h, "npsrv")
+        if np_ is None:
+            return k.err(ERROR_INVALID_HANDLE)
+        np_.connected = False
+        np_.c2s = _KPipe(0)
+        np_.c2s.writers = 0
+        np_.s2c = _KPipe(0)
+        np_.s2c.readers = 0
+        k.npipes.setdefault(np_.name, []).append(np_)
+        return 1
+
+    @R("WaitNamedPipeA", "pu")
+    def _wnpa(c, name, to):
+        up = k.cs_(name).upper()
+        return 1 if any(not x.connected for x in k.npipes.get(up[9:], [])) else k.err(121)
+
+    @R("WaitNamedPipeW", "pu")
+    def _wnpw(c, name, to):
+        up = k.ws_(name).upper()
+        return 1 if any(not x.connected for x in k.npipes.get(up[9:], [])) else k.err(121)
+
+    @R("GetNamedPipeInfo", "ppppp")
+    def _gnpi(c, h, pflags, pout, pin, pmax):
+        np_ = p.handles.get(h, "npsrv")
+        w32(pflags, 1 if np_ is not None else 0)     # PIPE_SERVER_END
+        w32(pout, 4096)
+        w32(pin, 4096)
+        w32(pmax, 255)
+        return 1
+
+    @R("GetNamedPipeClientProcessId GetNamedPipeServerProcessId", "pp")
+    def _gnpcpid(c, h, pid):
+        w32(pid, p.pid if hasattr(p, "pid") else 1)
+        return 1
+
+    @R("CallNamedPipeA CallNamedPipeW", "ppupupu")
+    def _callnp(c, *a):
+        return k.err(ERROR_FILE_NOT_FOUND)
+
+    @R("TransactNamedPipe", "ppupupp")
+    def _tnp(c, *a):
+        return k.err(ERROR_NOT_SUPPORTED)
 
     k.wait_pipe = pipe_read
 
@@ -18413,6 +18901,8 @@ def _k32_install(k):
         if not is_console(h):
             return k.err(ERROR_INVALID_HANDLE)
         k.cursor = [_s32(coord << 16) >> 16, _s32(coord) >> 16]
+        if h in (HandleTable.STDOUT_HANDLE, HandleTable.STDERR_HANDLE):
+            vt_goto(h, k.cursor[0], k.cursor[1])
         return 1
 
     @R("GetConsoleCursorInfo", "pp")
@@ -18434,13 +18924,57 @@ def _k32_install(k):
     def _scsb(c, h, r1, clip, dest, fill):
         return 1
 
-    @R("WriteConsoleOutputA WriteConsoleOutputW", "ppuup")
-    def _wco(c, h, buf, size, coord, region):
+    def _wco(c, h, buf, size, coord, region, wide):
+        if not is_console(h):
+            return k.err(ERROR_INVALID_HANDLE)
+        if not region or not buf:
+            return 1
+        l, t, r, b = struct.unpack("<hhhh", p.mem.read(region, 8))
+        bw, bh = size & 0xFFFF, (size >> 16) & 0xFFFF
+        bx, by = coord & 0xFFFF, (coord >> 16) & 0xFFFF
+        if h not in (HandleTable.STDOUT_HANDLE, HandleTable.STDERR_HANDLE):
+            return 1
+        for row in range(t, b + 1):
+            sy = by + (row - t)
+            if sy >= bh:
+                break
+            cells = []
+            for col in range(l, r + 1):
+                sx = bx + (col - l)
+                if sx >= bw:
+                    break
+                ch, a = struct.unpack("<HH", p.mem.read(buf + (sy * bw + sx) * 4, 4))
+                cells.append((chr(ch) if wide else bytes((ch & 0xFF,)).decode("cp437"), a))
+            vt_cells(h, l, row, cells)
+        vt_goto(h, k.cursor[0], k.cursor[1])
         return 1
 
-    @R("WriteConsoleOutputCharacterA WriteConsoleOutputCharacterW WriteConsoleOutputAttribute",
-       "ppuup")
-    def _wcoc(c, h, buf, n, coord, pw):
+    R("WriteConsoleOutputA", "ppuup")(lambda c, h, b_, s_, co, rg: _wco(c, h, b_, s_, co, rg,
+                                                                         False))
+    R("WriteConsoleOutputW", "ppuup")(lambda c, h, b_, s_, co, rg: _wco(c, h, b_, s_, co, rg,
+                                                                         True))
+
+    def _wcoc(c, h, buf, n, coord, pw, wide):
+        if not is_console(h):
+            return k.err(ERROR_INVALID_HANDLE)
+        w32(pw, n)
+        if h in (HandleTable.STDOUT_HANDLE, HandleTable.STDERR_HANDLE) and buf and n:
+            raw = p.mem.read(buf, n * (2 if wide else 1))
+            text = raw.decode("utf-16-le" if wide else "cp437", "replace")
+            attr = getattr(k, "console_attr", 7)
+            vt_cells(h, _s32(coord << 16) >> 16, _s32(coord) >> 16, [(ch, attr) for ch in text])
+            vt_goto(h, k.cursor[0], k.cursor[1])
+        return 1
+
+    R("WriteConsoleOutputCharacterA", "ppuup")(
+        lambda c, h, b_, n, co, pw: _wcoc(c, h, b_, n, co, pw, False))
+    R("WriteConsoleOutputCharacterW", "ppuup")(
+        lambda c, h, b_, n, co, pw: _wcoc(c, h, b_, n, co, pw, True))
+
+    @R("WriteConsoleOutputAttribute", "ppuup")
+    def _wcoa(c, h, buf, n, coord, pw):
+        if not is_console(h):
+            return k.err(ERROR_INVALID_HANDLE)
         w32(pw, n)
         return 1
 
@@ -20093,17 +20627,22 @@ def _k32_install(k):
         return 1
 
     def _gqcs_fill(t, port, pbytes, pkey, pov):
-        nbytes, key, ov = port.q.popleft()
+        ent = port.q.popleft()
+        nbytes, key, ov = ent[:3]
+        err = ent[3] if len(ent) > 3 else 0
         p.mem.write32(pbytes, nbytes)
         k.wptr(pkey, key)
         k.wptr(pov, ov)
+        if err:
+            p.last_error = err
+            return 0
         return 1
 
     def _gqcsx_fill(t, port, ents, count, premoved):
         ps = k.ptr_size()
         n = 0
         while port.q and n < count:
-            nbytes, key, ov = port.q.popleft()
+            nbytes, key, ov = port.q.popleft()[:3]
             e = ents + n * (4 * ps)
             k.wptr(e, key)
             k.wptr(e + ps, ov)
@@ -20114,6 +20653,8 @@ def _k32_install(k):
         return 1
 
     def _iocp_wait(c, port, timeout, fill):
+        if k.__dict__.get("np_pending"):
+            k.np_poll()
         if port.q:
             return fill()
         if timeout == 0:
@@ -20127,6 +20668,8 @@ def _k32_install(k):
 
     def _iocp_wake(t):
         _k, port, fill, deadline = t.waiting_on
+        if k.__dict__.get("np_pending"):
+            k.np_poll()
         if port.q:
             t.cpu.regs[RAX] = fill()
             return True
@@ -22976,6 +23519,22 @@ def _oa_install(k):
     def _vbfb(c, v, lcid, fl, out):
         return bstr_from("True" if v else "False", out)
 
+    @R("VarBstrFromDate", "duup", dlls=_OA)
+    def _vbfdate(c, v, lcid, fl, out):
+        return bstr_from(to_text(VT_DATE, v), out)
+
+    @R("VarBstrFromR4", "fuup", dlls=_OA)
+    def _vbfr4(c, v, lcid, fl, out):
+        return bstr_from(to_text(VT_R8, float("%.7g" % v)), out)
+
+    @R("VarBstrFromI2", "iuup", dlls=_OA)
+    def _vbfi2(c, v, lcid, fl, out):
+        return bstr_from(str(((v & 0xFFFF) ^ 0x8000) - 0x8000), out)
+
+    @R("VarBstrFromUI1", "uuup", dlls=_OA)
+    def _vbfui1(c, v, lcid, fl, out):
+        return bstr_from(str(v & 0xFF), out)
+
     # -- SAFEARRAY ------------------------------------------------------------------------
     def sa_off():
         return (16, 24) if ps() == 8 else (12, 16)      # pvData, rgsabound
@@ -23772,7 +24331,8 @@ def _nt_install(k):
         iosb_set(iosb, 0, 0)
         return 0
 
-    _DIR_CLASS = {1: 14, 2: 14, 3: 10, 37: 10, 38: 14, 12: 14, 60: 19, 63: 10}
+    _DIR_CLASS = {1: "nt1", 2: "nt2", 3: "nt3", 37: "nt37", 38: "nt38", 12: "nt12", 60: 19,
+                  63: 19}
 
     @R("NtQueryDirectoryFile ZwQueryDirectoryFile", "ppppppuuupu", dlls=NT)
     def _ntqdf(c, h, ev, apc, ctx, iosb, buf, n, cls, single, mask, restart):
@@ -39816,6 +40376,11 @@ def _user_install(k):
     @reg("MsgWaitForMultipleObjectsEx", "upuuu")
     def _mwfmoex(c, n, hs, timeout, mask, flags):
         handles = [wm.rp(hs + wm.ps * i) for i in range(n)] if n else []
+        k32 = getattr(p, "k32", None)
+        if flags & 2 and k32 is not None and k32.run_apcs():   # MWMO_ALERTABLE
+            return 0xC0
+        if flags & 2:
+            p.current_thread.alertable = True
         return _msgwait(c, handles, bool(flags & 1), timeout, mask)
 
     @reg("GetQueueStatus", "u")
@@ -49325,6 +49890,17 @@ def _shell_install(k):
         return 1
     reg_path("PathCompactPathEx", "ppuu", _compact_ex)
 
+    def _compact_px(w_, hdc, path, dx):
+        """PathCompactPath: fit a path into dx pixels of the DC's font (in place)."""
+        s = gs(path, w_)
+        dc = p.gdi.get(hdc, "dc") if hdc else None
+        font = dc.gfont() if dc is not None else _GFont("sans", 11)
+        if font.width(s) <= dx:
+            return 1
+        ws(path, _ellipsize(font, s, max(0, dx), "path"), w_, len(s) + 1)
+        return 1
+    reg_path("PathCompactPath", "ppu", _compact_px)
+
     def _rel_to(w_, out, frm, fa, to, ta):
         f, t = gs(frm, w_), gs(to, w_)
         if not (fa & 0x10):
@@ -52000,6 +52576,204 @@ def _sysmore_install(k):
     R("BufferedPaintRenderAnimation", "pp", dlls=("uxtheme.dll",))(lambda c, h, dc: 0)
     R("BeginBufferedAnimation", "pppppppp", "p", dlls=("uxtheme.dll",))(lambda c, *a: 0)
     R("EndBufferedAnimation", "pi", dlls=("uxtheme.dll",))(lambda c, *a: 0)
+
+    # ---- small leftovers seen in MFC apps -------------------------------------------------
+    def _compressed_size(c, name, phigh, _w=True):
+        try:
+            host = p.vfs.resolve(k.s(name, _w))
+            n = os.path.getsize(host)
+        except Exception:
+            if phigh:
+                M_.write32(phigh, 0)
+            p.last_error = 2
+            return 0xFFFFFFFF
+        if phigh:
+            M_.write32(phigh, (n >> 32) & 0xFFFFFFFF)
+        return n & 0xFFFFFFFF
+    R("GetCompressedFileSizeW", "pp")(lambda c, n, ph: _compressed_size(c, n, ph, True))
+    R("GetCompressedFileSizeA", "pp")(lambda c, n, ph: _compressed_size(c, n, ph, False))
+    R("GetCompressedFileSizeTransactedW", "ppp")(
+        lambda c, n, ph, t: _compressed_size(c, n, ph, True))
+
+    OLE = ("ole32.dll", "combase.dll")
+
+    @R("CoRegisterMessageFilter", "pp", dlls=OLE)
+    def _crmf(c, newf, pold):
+        if pold:
+            (M_.write64 if p.cpu_mode == 64 else M_.write32)(pold, 0)
+        return 0
+
+    R("CoLockObjectExternal", "pii", dlls=OLE)(lambda c, u, lock, last: 0)
+    R("CoFreeUnusedLibraries", "", "v", dlls=OLE)(lambda c: None)
+    R("CoFreeUnusedLibrariesEx", "uu", "v", dlls=OLE)(lambda c, d, r: None)
+    R("CoFreeAllLibraries", "", "v", dlls=OLE)(lambda c: None)
+    R("CoDisconnectObject", "pu", dlls=OLE)(lambda c, u, r: 0)
+    R("CoIsHandlerConnected", "p", dlls=OLE)(lambda c, u: 1)
+    R("CoAddRefServerProcess", "", dlls=OLE)(lambda c: 1)
+    R("CoReleaseServerProcess", "", dlls=OLE)(lambda c: 0)
+    R("CoSuspendClassObjects CoResumeClassObjects", "", dlls=OLE)(lambda c: 0)
+
+    # oleacc: no accessibility server; callers fall back to their own handling
+    ACC = ("oleacc.dll",)
+
+    def _acc_out(pp):
+        if pp:
+            (M_.write64 if p.cpu_mode == 64 else M_.write32)(pp, 0)
+
+    R("AccessibleObjectFromWindow", "pupp", dlls=ACC)(
+        lambda c, h, oid, riid, pp: (_acc_out(pp), 0x80004005)[1])
+    R("AccessibleObjectFromPoint", "Qpp" if p.cpu_mode == 64 else "iipp", dlls=ACC)(
+        lambda c, *a: (_acc_out(a[-2]), 0x80004005)[1])
+    R("AccessibleObjectFromEvent", "puupp", dlls=ACC)(
+        lambda c, h, o, ch, pp, pv: (_acc_out(pp), 0x80004005)[1])
+    R("CreateStdAccessibleObject", "pipp", dlls=ACC)(
+        lambda c, h, oid, riid, pp: (_acc_out(pp), 0x80004001)[1])
+    R("CreateStdAccessibleProxyW CreateStdAccessibleProxyA", "ppipp", dlls=ACC)(
+        lambda c, h, cls, oid, riid, pp: (_acc_out(pp), 0x80004001)[1])
+    R("LresultFromObject", "ppp", "p", dlls=ACC)(lambda c, riid, wp, punk: 0)
+    R("ObjectFromLresult", "pppp", dlls=ACC)(
+        lambda c, lr, riid, wp, pp: (_acc_out(pp), 0x80070057)[1])
+    R("WindowFromAccessibleObject", "pp", dlls=ACC)(
+        lambda c, a, ph: (_acc_out(ph), 0x80004005)[1])
+    R("AccessibleChildren", "piipp", dlls=ACC)(
+        lambda c, a, st, n, arr, pn: (M_.write32(pn, 0) if pn else None, 0x80004005)[1])
+    R("GetRoleTextW GetRoleTextA GetStateTextW GetStateTextA", "upu", dlls=ACC)(
+        lambda c, r, buf, n: (M_.write16(buf, 0) if buf and n else None, 0)[1])
+    R("GetOleaccVersionInfo", "pp", "v", dlls=ACC)(
+        lambda c, pv, pb: (M_.write32(pv, 0x70000) if pv else None,
+                           M_.write32(pb, 0) if pb else None, None)[2])
+
+    # ---- job objects: jobs exist and accept processes; limits are recorded, not enforced ----
+    def _job(h):
+        o = p.handles.get(h) if h else None
+        return o if isinstance(o, dict) and o.get("job") else None
+
+    for w_ in (False, True):
+        sfx = "W" if w_ else "A"
+
+        def _cjo(c, sa, name, _w=w_):
+            return p.handles.add({"job": 1, "name": k.s(name, _w) if name else "", "procs": [],
+                                  "info": {}}, "job")
+        R("CreateJobObject" + sfx, "pp", "p")(_cjo)
+        R("OpenJobObject" + sfx, "uip", "p")(lambda c, acc, inh, name: k.err(2))
+
+    @R("AssignProcessToJobObject", "pp")
+    def _apjo(c, hj, hp):
+        j = _job(hj)
+        if j is None:
+            return k.err(6)
+        j["procs"].append(hp)
+        return 1
+
+    @R("IsProcessInJob", "ppp")
+    def _ipij(c, hp, hj, pb):
+        j = _job(hj) if hj else None
+        inside = j is not None and (hp in j["procs"] or cur_proc(hp))
+        if pb:
+            M_.write32(pb, 1 if inside and j is not None and hp in j["procs"] else 0)
+        return 1
+
+    def job_size(cls, n):
+        x64 = p.cpu_mode == 64
+        return {1: 48, 2: 64 if x64 else 48, 3: 12, 4: 4, 5: 4, 6: 8, 8: 16,
+                9: 144 if x64 else 112, 11: 16}.get(cls, n)
+
+    @R("QueryInformationJobObject", "pipup")
+    def _qijo(c, hj, cls, buf, n, pret):
+        j = _job(hj)
+        if j is None:
+            return k.err(6)                                     # ERROR_INVALID_HANDLE
+        size = job_size(cls, n)
+        if n < size:
+            return k.err(24)                                    # ERROR_BAD_LENGTH
+        data = j["info"].get(cls, bytes(size))
+        if cls == 3:                                            # BasicProcessIdList
+            data = struct.pack("<II", 0, 0) + bytes(size - 8)
+        M_.write(buf, data[:size].ljust(size, b"\0"))
+        if pret:
+            M_.write32(pret, size)
+        return 1
+
+    @R("SetInformationJobObject", "pipu")
+    def _sijo(c, hj, cls, buf, n):
+        j = _job(hj)
+        if j is None:
+            return k.err(6)
+        j["info"][cls] = bytes(M_.read(buf, n)) if buf and n else b""
+        return 1
+
+    R("TerminateJobObject", "pu")(lambda c, hj, code: 1 if _job(hj) else k.err(6))
+    R("CreateJobSet", "upu")(lambda c, n, sets, flags: k.err(50))
+
+    # ---- iphlpapi: the sandbox has no network adapters -----------------------------------
+    IPH = ("iphlpapi.dll",)
+    ERROR_NO_DATA, ERROR_NOT_SUPPORTED, ERROR_NOT_FOUND = 232, 50, 1168
+
+    def _sz0(psize):
+        if psize:
+            M_.write32(psize, 0)
+
+    R("GetAdaptersAddresses", "uuppp", dlls=IPH)(
+        lambda c, fam, fl, res, buf, psize: (_sz0(psize), ERROR_NO_DATA)[1])
+    R("GetAdaptersInfo", "pp", dlls=IPH)(lambda c, buf, psize: (_sz0(psize), ERROR_NO_DATA)[1])
+    R("GetInterfaceInfo", "pp", dlls=IPH)(lambda c, buf, psize: (_sz0(psize), ERROR_NO_DATA)[1])
+    R("GetNetworkParams", "pp", dlls=IPH)(lambda c, buf, psize: ERROR_NOT_SUPPORTED)
+    R("GetNumberOfInterfaces", "p", dlls=IPH)(lambda c, pn: (M_.write32(pn, 0) if pn else None,
+                                                              0)[1])
+    R("ConvertInterfaceIndexToLuid", "up", dlls=IPH)(lambda c, i, pl: ERROR_NOT_FOUND)
+    R("ConvertInterfaceLuidToIndex", "pp", dlls=IPH)(lambda c, pl, pi_: ERROR_NOT_FOUND)
+    R("ConvertInterfaceLuidToNameW ConvertInterfaceLuidToNameA", "ppz", dlls=IPH)(
+        lambda c, pl, buf, n: ERROR_NOT_FOUND)
+    R("ConvertInterfaceNameToLuidW ConvertInterfaceNameToLuidA", "pp", dlls=IPH)(
+        lambda c, name, pl: ERROR_NOT_FOUND)
+    R("ConvertInterfaceLuidToGuid", "pp", dlls=IPH)(lambda c, pl, pg: ERROR_NOT_FOUND)
+    R("if_nametoindex", "p", dlls=IPH)(lambda c, name: 0)
+    R("if_indextoname", "up", "p", dlls=IPH)(lambda c, i, buf: 0)
+    R("GetBestInterface", "up", dlls=IPH)(lambda c, addr, pi_: ERROR_NOT_SUPPORTED)
+    R("GetBestInterfaceEx", "pp", dlls=IPH)(lambda c, addr, pi_: ERROR_NOT_SUPPORTED)
+    R("GetBestRoute", "uup", dlls=IPH)(lambda c, d, s_, r: ERROR_NOT_SUPPORTED)
+    R("NotifyAddrChange NotifyRouteChange", "pp", dlls=IPH)(lambda c, h, ov: ERROR_NOT_SUPPORTED)
+    R("NotifyIpInterfaceChange NotifyUnicastIpAddressChange NotifyRouteChange2", "uppip",
+      dlls=IPH)(lambda c, *a: ERROR_NOT_SUPPORTED)
+    R("CancelMibChangeNotify2", "p", dlls=IPH)(lambda c, h: 0)
+    R("CancelIPChangeNotify", "p", dlls=IPH)(lambda c, ov: 1)
+    R("FreeMibTable", "p", "v", dlls=IPH)(
+        lambda c, t: p.heap_free(p.process_heap_handle, t) if t else None)
+
+    def _empty_table(pp, size=8):
+        t = p.heap_alloc(p.process_heap_handle, size)
+        M_.write(t, bytes(size))
+        (M_.write64 if p.cpu_mode == 64 else M_.write32)(pp, t)
+        return 0
+
+    for nm in ("GetIfTable2", "GetIpInterfaceTable", "GetUnicastIpAddressTable",
+               "GetIpForwardTable2", "GetIpNetTable2", "GetAnycastIpAddressTable",
+               "GetMulticastIpAddressTable"):
+        sig = "p" if nm == "GetIfTable2" else "up"
+        R(nm, sig, dlls=IPH)(lambda c, *a: _empty_table(a[-1]))
+
+    for nm in ("GetIfTable", "GetIpAddrTable", "GetIpForwardTable", "GetIpNetTable",
+               "GetTcpTable", "GetUdpTable"):
+        def _tbl(c, buf, psize, order, _n=nm):
+            if not psize:
+                return 87
+            if not buf or M_.read32(psize) < 4:
+                M_.write32(psize, 4)
+                return 122                                      # ERROR_INSUFFICIENT_BUFFER
+            M_.write32(buf, 0)
+            return 0
+        R(nm, "ppi", dlls=IPH)(_tbl)
+    R("GetExtendedTcpTable GetExtendedUdpTable", "ppiuuu", dlls=IPH)(
+        lambda c, buf, psize, order, af, cls, res: _tbl_ext(buf, psize))
+
+    def _tbl_ext(buf, psize):
+        if not psize:
+            return 87
+        if not buf or M_.read32(psize) < 4:
+            M_.write32(psize, 4)
+            return 122
+        M_.write32(buf, 0)
+        return 0
 
 
 # ==========================================================================================
@@ -60520,9 +61294,19 @@ class NOOProcess:
             self.vfs = VirtualFileSystem(self.sandbox.fs_root, log,
                                          self.sandbox.allow_host_fs, self.sandbox.allow_host_write)
             exe_dir = os.path.dirname(self.exe_host_path)
-            self.vfs.mount_host_dir(exe_dir, "C:\\app")
-            self.vfs.setcwd("C:\\app")
-            self.exe_win_path = "C:\\app\\" + os.path.basename(self.exe_host_path)
+            sub = os.path.basename(exe_dir)
+            if sub.lower() in ("bin", "bin32", "bin64", "cmd") and \
+                    os.path.dirname(exe_dir) not in ("", "/"):
+                # <root>\bin\app.exe layouts find their data through ..\share, ..\lib:
+                # expose the whole root, keep the exe's directory as the working one
+                self.vfs.mount_host_dir(os.path.dirname(exe_dir), "C:\\app")
+                self.vfs.setcwd("C:\\app\\" + sub)
+                self.exe_win_path = "C:\\app\\%s\\%s" % (sub, os.path.basename(
+                    self.exe_host_path))
+            else:
+                self.vfs.mount_host_dir(exe_dir, "C:\\app")
+                self.vfs.setcwd("C:\\app")
+                self.exe_win_path = "C:\\app\\" + os.path.basename(self.exe_host_path)
             self.registry = VirtualRegistry(log)
         self.handles = HandleTable()
         self.api = WinAPI(self)
@@ -61060,6 +61844,7 @@ class NOOProcess:
                     t.state = "running"
                     t.waiting_on = None
                     cpu.finish_yield()
+                    self._after_resume(t)
                 except NOOCPUFault as f:
                     if not self._try_seh(t, f):
                         raise
@@ -61894,6 +62679,13 @@ class NOOProcess:
         if w is None:
             return True
         k32 = getattr(self, "k32", None)
+        if t.__dict__.get("alertable"):
+            if k32 is not None and k32.__dict__.get("apc_reads"):
+                k32.apc_poll()
+            if t.__dict__.get("apcs"):
+                t.cpu.regs[RAX] = 0xC0               # WAIT_IO_COMPLETION
+                t.apc_resume = True
+                return True
         if k32 is not None:
             prev = self.current_thread
             self.current_thread = t            # last-error / tid belong to the waiter
@@ -62249,6 +63041,15 @@ class NOOProcess:
                 self._crash_report(t, f)
                 raise NOOExitProcess(0xC0000005)
 
+    def _after_resume(self, t):
+        """A blocked thread just returned from its wait: run APCs it was woken for."""
+        t.alertable = False
+        if t.__dict__.get("apc_resume"):
+            t.apc_resume = False
+            k32 = getattr(self, "k32", None)
+            if k32 is not None:
+                k32.run_apcs(t)
+
     def _run_others(self, me):
         """One scheduling round over every thread that is not stuck in a Python
         frame below us (i.e. not inside its own nested wait)."""
@@ -62260,6 +63061,7 @@ class NOOProcess:
                 o.state = "suspended" if getattr(o, "suspend", 0) else "running"
                 o.waiting_on = None
                 o.cpu.finish_yield()
+                self._after_resume(o)
             if o.state != "running":
                 continue
             ran += 1
@@ -62318,6 +63120,7 @@ class NOOProcess:
                         t.state = "suspended" if getattr(t, "suspend", 0) else "running"
                         t.waiting_on = None
                         t.cpu.finish_yield()   # thunk ret + stdcall cleanup
+                        self._after_resume(t)
                 alive = [t for t in self.threads if t.state in ("running", "guiwait")]
                 if not alive:
                     blocked = [t for t in self.threads if t.state in ("blocked", "suspended")]
@@ -62431,6 +63234,7 @@ class NOOProcess:
                         t.state = "suspended" if getattr(t, "suspend", 0) else "running"
                         t.waiting_on = None
                         t.cpu.finish_yield()
+                        self._after_resume(t)
                 alive = [t for t in self.threads if t.state in ("running", "guiwait")]
                 if not alive:
                     return "exited"
