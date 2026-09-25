@@ -30165,6 +30165,7 @@ def _alpha_blend(ddc, x, y, w, h, sdc, sx, sy, sw, sh, blend):
         return False
     per_pixel = fmt & 1                                 # AC_SRC_ALPHA
     dpx, spx = dsurf.px, ssurf.px
+    dalpha = dbm is not None and dbm.dib is not None and dbm.bpp == 32
     for j in range(h):
         yy = Y0 + j
         if not 0 <= yy < dsurf.h:
@@ -30192,11 +30193,15 @@ def _alpha_blend(ddc, x, y, w, h, sdc, sx, sy, sw, sh, blend):
                 dpx[do] = min(255, sb + dpx[do] * inv // 255)
                 dpx[do + 1] = min(255, sg + dpx[do + 1] * inv // 255)
                 dpx[do + 2] = min(255, sr + dpx[do + 2] * inv // 255)
+                if dalpha:
+                    dpx[do + 3] = min(255, sa + dpx[do + 3] * inv // 255)
             else:
                 inv = 255 - sca
                 dpx[do] = (sb * sca + dpx[do] * inv) // 255
                 dpx[do + 1] = (sg * sca + dpx[do + 1] * inv) // 255
                 dpx[do + 2] = (sr * sca + dpx[do + 2] * inv) // 255
+                if dalpha:
+                    dpx[do + 3] = (spx[so + 3] * sca + dpx[do + 3] * inv) // 255
     gdi.end(ddc, tg)
     return True
 
@@ -32788,6 +32793,121 @@ def _gdi_install(k):
     def _d3dkmt(c, a):
         return 0xC00000BB                                 # STATUS_NOT_SUPPORTED
 
+    # ---- uxtheme buffered painting: a 32-bpp top-down DIB in a memory DC -------------------
+    UXT = ("uxtheme.dll",)
+    bpaint = {}                                           # buffer DC handle -> state
+
+    @reg("BeginBufferedPaint", "ppupp", "p", dlls=UXT)
+    def _bbp(c, hdc, prc, fmt, params, phdc):
+        if not prc:
+            if phdc:
+                k.wptr(phdc, 0)
+            return 0
+        l_, t_, r_, b_ = _rd_rect(M_, prc)
+        w, h = max(1, r_ - l_), max(1, b_ - t_)
+        flags, blend = 0, None
+        if params:
+            flags = M_.read32(params + 4)
+            pb = M_.read64(params + 16) if k.p.cpu_mode == 64 else M_.read32(params + 12)
+            if pb:
+                blend = M_.read32(pb)
+        dc = gdi.new_dc("mem")
+        tdc = DC(hdc)
+        if tdc is not None:
+            dc.layout = tdc.layout
+        stride = w * 4
+        addr = M_.alloc(stride * h, MEM_READ | MEM_WRITE, tag="dibsection")
+        bm = _GBitmap(w, h, 32)
+        bm.dib = _DibSec(addr, w, h, 32, True, [], None, True)
+        bm.dib.hdr = struct.pack("<IiiHHIIiiII", 40, w, -h, 1, 32, 0, stride * h, 0, 0, 0, 0)
+        bm.dib.last = bytes(stride * h)
+        hbm = gdi.add(bm)
+        _select(c, dc.h, hbm)
+        dc.wox, dc.woy = l_, t_
+        dc.changed()
+        bpaint[dc.h] = {"target": hdc, "rect": (l_, t_, r_, b_), "bm": hbm, "addr": addr,
+                        "w": w, "h": h, "blend": blend, "flags": flags}
+        if phdc:
+            k.wptr(phdc, dc.h)
+        return dc.h
+
+    @reg("EndBufferedPaint", "pi", dlls=UXT)
+    def _ebp(c, hbp, update):
+        st = bpaint.pop(hbp, None)
+        if st is None:
+            return 0x80070057
+        dc = DC(hbp)
+        if update and dc is not None and DC(st["target"]) is not None:
+            dc.wox = dc.woy = 0
+            dc.changed()
+            l_, t_, r_, b_ = st["rect"]
+            tdc = DC(st["target"])
+            if st["blend"] is not None:
+                bf = st["blend"]
+                _alpha_blend(tdc, l_, t_, st["w"], st["h"], dc, 0, 0, st["w"], st["h"],
+                             (bf & 255, (bf >> 8) & 255, (bf >> 16) & 255, (bf >> 24) & 255))
+            else:
+                _blit(tdc, l_, t_, st["w"], st["h"], dc, 0, 0, 0xCC0020)
+        _deldc(c, hbp)
+        gdi.delete(st["bm"])
+        return 0
+
+    @reg("GetBufferedPaintBits", "ppp", dlls=UXT)
+    def _gbpb(c, hbp, pbits, prow):
+        st = bpaint.get(hbp)
+        if st is None:
+            return 0x80070057
+        if pbits:
+            k.wptr(pbits, st["addr"])
+        if prow:
+            M_.write32(prow, st["w"])
+        return 0
+
+    reg("GetBufferedPaintDC", "p", "p", dlls=UXT)(lambda c, hbp: hbp if hbp in bpaint else 0)
+    reg("GetBufferedPaintTargetDC", "p", "p", dlls=UXT)(
+        lambda c, hbp: bpaint[hbp]["target"] if hbp in bpaint else 0)
+
+    @reg("GetBufferedPaintTargetRect", "pp", dlls=UXT)
+    def _gbptr(c, hbp, prc):
+        st = bpaint.get(hbp)
+        if st is None or not prc:
+            return 0x80070057
+        _wr_rect(M_, prc, st["rect"])
+        return 0
+
+    def _bp_rows(st, prc):
+        l_, t_, r_, b_ = st["rect"]
+        if prc:
+            x0, y0, x1, y1 = _rd_rect(M_, prc)
+        else:
+            x0, y0, x1, y1 = l_, t_, r_, b_
+        x0, x1 = max(x0, l_) - l_, min(x1, r_) - l_
+        y0, y1 = max(y0, t_) - t_, min(y1, b_) - t_
+        if x1 <= x0 or y1 <= y0:
+            return
+        for y in range(y0, y1):
+            yield st["addr"] + (y * st["w"] + x0) * 4, x1 - x0
+
+    @reg("BufferedPaintClear", "pp", dlls=UXT)
+    def _bpclear(c, hbp, prc):
+        st = bpaint.get(hbp)
+        if st is None:
+            return 0x80070057
+        for a, n in _bp_rows(st, prc):
+            M_.write(a, bytes(n * 4))
+        return 0
+
+    @reg("BufferedPaintSetAlpha", "ppu", dlls=UXT)
+    def _bpsetalpha(c, hbp, prc, alpha):
+        st = bpaint.get(hbp)
+        if st is None:
+            return 0x80070057
+        for a, n in _bp_rows(st, prc):
+            row = bytearray(M_.read(a, n * 4))
+            row[3::4] = bytes((alpha & 255,)) * n
+            M_.write(a, bytes(row))
+        return 0
+
     return gdi
 
 
@@ -34905,7 +35025,9 @@ class _GIcon(_GObj):
         self.res = None
 
 
-def _draw_icon(dc, surf, clip, xy, ic, cx, cy, flags):
+def _draw_icon(dc, surf, clip, xy, ic, cx, cy, flags, dst_alpha=False):
+    """dst_alpha: the target is a 32-bpp DIB whose alpha byte is updated the way
+    AlphaBlend does (alpha icons) or cleared by the mask raster ops."""
     X, Y = xy
     sw_, sh_ = ic.w, ic.ht
     px = ic.color.px
@@ -34929,9 +35051,13 @@ def _draw_icon(dc, surf, clip, xy, ic, cx, cy, flags):
                     continue
                 if a == 255:
                     surf.px[do:do + 3] = px[o * 4:o * 4 + 3]
+                    if dst_alpha:
+                        surf.px[do + 3] = 255
                 else:
                     for ch in range(3):
                         surf.px[do + ch] = (px[o * 4 + ch] * a + surf.px[do + ch] * (255 - a)) // 255
+                    if dst_alpha:
+                        surf.px[do + 3] = min(255, a + surf.px[do + 3] * (255 - a) // 255)
                 continue
             m = ic.mask[o] if ic.mask is not None else 0
             if flags & 1 and m and not (flags & 2):
@@ -43168,7 +43294,8 @@ def _user_install2(k):
             return 0
         surf, ox, oy, clip, bm = tg = gdi.begin(dc)
         X, Y = dc.lp2dp(x, y)
-        _draw_icon(dc, surf, clip, (X + ox, Y + oy), ic, cx or ic.w, cy or ic.ht, flags or 3)
+        _draw_icon(dc, surf, clip, (X + ox, Y + oy), ic, cx or ic.w, cy or ic.ht, flags or 3,
+                   dst_alpha=bm is not None and bm.dib is not None and bm.bpp == 32)
         gdi.end(dc, tg)
         return 1
 
@@ -44875,6 +45002,7 @@ def _gui_install(k):
     _stream_install(k)
     _gdiplus_install(k)
     _propsheet_install(k)
+    _wic_install(k)
 
 
 # -- displays: headless (PNG dump / scripted input), Tk, AetherOS web sessions ----------------------
@@ -46382,11 +46510,10 @@ def _sysdlls_install(k):
     ux("IsThemeActive IsAppThemed GetThemeAppProperties", "", 0)
     ux("BufferedPaintInit BufferedPaintUnInit", "", 0)
     ux("CloseThemeData IsThemeDialogTextureEnabled GetWindowTheme SetThemeAppProperties", "p", 0)
-    ux("OpenThemeData EnableThemeDialogTexture EndBufferedPaint", "pp", 0)
+    ux("OpenThemeData EnableThemeDialogTexture", "pp", 0)
     ux("OpenThemeDataEx OpenThemeDataForDpi SetWindowTheme IsThemePartDefined "
-       "IsThemeBackgroundPartiallyTransparent BufferedPaintSetAlpha DrawThemeParentBackground",
+       "IsThemeBackgroundPartiallyTransparent DrawThemeParentBackground",
        "ppp", 0)
-    ux("BeginBufferedPaint", "ppppp", 0)                   # NULL: callers fall back to plain GDI
     ux("GetThemeColor GetThemeInt GetThemeEnumValue GetThemeBool", "ppppp", E_FAIL)
     ux("DrawThemeBackground DrawThemeBackgroundEx GetThemeFont GetCurrentThemeName "
        "GetThemeTransitionDuration", "pppppp", E_FAIL)
@@ -49661,6 +49788,34 @@ def _cc_install_bars(k, notify, NMHDR_SZ, hfont, gfont, paint, IL, py_class):
             data, sidx = M_.read32(a + 12), M_.read32(a + 16)
         return bmp, cmd, state, style, data, sidx
 
+    def tb_dispinfo(w, b):
+        """TBN_GETDISPINFO for a button whose image is I_IMAGECALLBACK."""
+        got = {}
+
+        def after(a):
+            got["mask"] = M_.read32(a)
+            got["img"] = _s32(M_.read32(a + (16 if ps == 8 else 12)))
+
+        if ps == 8:
+            extra = struct.pack("<IiQi4xQi4x", 1, b["cmd"], b["data"], -1, 0, 0)
+        else:
+            extra = struct.pack("<IiIiIi", 1, b["cmd"], b["data"] & 0xFFFFFFFF, -1, 0, 0)
+        notify(w, -717 if tb_unicode(w) else -716, extra, after)
+        img = got.get("img", -1)
+        if got.get("mask", 0) & 0x10000000:                      # TBNF_DI_SETITEM
+            b["bitmap"] = img
+        return img
+
+    def tb_unicode(w):
+        v = w.py.get("nf_uni")
+        if v is None:
+            par = w.parent if w.parent is not None and w.parent is not wm.desktop else None
+            v = True
+            if par is not None:
+                v = (wm.send(par.hwnd, 0x0055, w.hwnd, 3) & 0xFFFFFFFF) != 1
+            w.py["nf_uni"] = v
+        return v
+
     def toolbar_proc(hwnd, msg, wp, lp, wide):
         w = W(hwnd)
         if w is None:
@@ -49736,12 +49891,15 @@ def _cc_install_bars(k, notify, NMHDR_SZ, hfont, gfont, paint, IL, py_class):
                     off = 1 if pressed or checked else 0
                     t = tb_text(w, b)
                     list_style = w.style & 0x1000
-                    if il and b["bitmap"] >= 0:
+                    bidx = b["bitmap"]
+                    if bidx == -1:                               # I_IMAGECALLBACK
+                        bidx = tb_dispinfo(w, b)
+                    if il and bidx >= 0:
                         ix = r[0] + ((r[2] - r[0] - il.cx) // 2 if not list_style else 4) + off
                         iy = r[1] + 3 + off if t and not list_style else \
                             r[1] + (r[3] - r[1] - il.cy) // 2 + off
                         X, Y = pt.xy(ix, iy)
-                        idx = b["bitmap"] & 0xFFFF
+                        idx = bidx & 0xFFFF
                         dil = IL(s.get("il_dis", 0))
                         hil = IL(s.get("il_hot", 0))
                         if not enabled and dil is not None and idx < len(dil.images):
@@ -50010,6 +50168,25 @@ def _cc_install_bars(k, notify, NMHDR_SZ, hfont, gfont, paint, IL, py_class):
             mx = max([r[2] for r in rects if r] or [0])
             M_.write(lp, struct.pack("<ii", mx, bh))
             return 1
+        if msg == 0x463:                                         # TB_GETIDEALSIZE
+            if not lp:
+                return 0
+            rects, bh = tb_layout(w)
+            if wp:
+                M_.write32(lp + 4, bh)
+            else:
+                M_.write32(lp, max([r[2] for r in rects if r] or [0]))
+            return 1
+        if msg == 0x465:                                         # TB_GETMETRICS
+            if lp:
+                mask = M_.read32(lp + 4)
+                vals = {1: (8, (7, 6)), 2: (16, (0, 0)), 4: (24, (0, 0))}
+                for bit, (off, v) in vals.items():
+                    if mask & bit:
+                        M_.write(lp + off, struct.pack("<ii", *v))
+            return 0
+        if msg in (0x466, 0x468, 0x469):                         # TB_SETMETRICS, pressed IL
+            return 0
         if msg in (0x425, 0x426, 0x427, 0x429, 0x42A, 0x42B, 0x42C, 0x42D, 0x42E, 0x43B,
                    0x43C, 0x446, 0x447, 0x448, 0x457, 0x458, 0x44B, 0x44C, 0x422, 0x424,
                    0x437, 0x438, 0x439, 0x441, 0x442, 0x44F, 0x450, 0x451, 0x452, 0x453, 0x456):
@@ -50238,6 +50415,11 @@ def _cc_install_bars(k, notify, NMHDR_SZ, hfont, gfont, paint, IL, py_class):
             return 0
         if msg in (0x404, 0x417):                                 # RB_SETBARINFO / SIZETORECT
             return 1
+        if msg in (WM_NOTIFY, 0x0111, 0x0055):                  # forwarded to the parent
+            par = w.parent if w.parent is not None and w.parent is not wm.desktop else None
+            if par is not None:
+                return wm.send(par.hwnd, msg, wp, lp)
+            return 0
         if msg in (0x405, 0x403, 0x408, 0x409, 0x410, 0x411, 0x413, 0x414, 0x415,
                    0x416, 0x417, 0x41C, 0x41E, 0x41F, 0x420, 0x421, 0x425):
             return 0
@@ -55501,6 +55683,8 @@ def _stream_install(k):
             vcall(obj, 5, [pos & 0xFFFFFFFF, (pos >> 32) & 0xFFFFFFFF, origin, 0])
 
     p.stream_new = new_stream
+    p.stream_cls = STREAM_CLS
+    p.stream_entries = streams
     p.stream_read_all = guest_read_all
     p.stream_write = guest_write
     p.stream_seek = guest_seek
@@ -61241,6 +61425,1560 @@ def _propsheet_install(k):
     k.reg("SHFindFiles", "pp", dlls=SH)(lambda c, *a: 0)
 
 
+# ==========================================================================================
+# 10u. WIC (windowscodecs.dll): imaging factory, PNG/BMP/ICO/GIF decoders, format converter,
+#      scaler, clipper, flip/rotator, in-memory bitmaps with locks, IWICStream, PNG/BMP
+#      encoders, WICConvertBitmapSource. Pixels go through the GDI+ codecs (straight BGRA).
+# ==========================================================================================
+def _wic_pf(n):
+    return _guid_from_str("{6fddc324-4e03-4bfe-b185-3d77768dc9%02x}" % n)
+
+
+WIC_PF_DONTCARE = _wic_pf(0x00)
+WIC_PF_1IDX, WIC_PF_2IDX, WIC_PF_4IDX, WIC_PF_8IDX = [_wic_pf(n) for n in (1, 2, 3, 4)]
+WIC_PF_BW, WIC_PF_2GRAY, WIC_PF_4GRAY, WIC_PF_8GRAY = [_wic_pf(n) for n in (5, 6, 7, 8)]
+WIC_PF_555, WIC_PF_565, WIC_PF_16GRAY = _wic_pf(0x09), _wic_pf(0x0a), _wic_pf(0x0b)
+WIC_PF_24BGR, WIC_PF_24RGB = _wic_pf(0x0c), _wic_pf(0x0d)
+WIC_PF_32BGR, WIC_PF_32BGRA, WIC_PF_32PBGRA = _wic_pf(0x0e), _wic_pf(0x0f), _wic_pf(0x10)
+WIC_PF_48RGB, WIC_PF_64RGBA, WIC_PF_64PRGBA = _wic_pf(0x15), _wic_pf(0x16), _wic_pf(0x17)
+WIC_PF_32RGBA = _guid_from_str("{f5c7ad2d-6a8d-43dd-a7a8-a29935261ae9}")
+WIC_PF_32PRGBA = _guid_from_str("{3cc4a650-a527-4d37-a916-3142c7ebedba}")
+WIC_PF_32RGB = _guid_from_str("{d98c6b95-3efe-47d6-bb25-eb1748ab0cf1}")
+WIC_PF_5551 = _guid_from_str("{05ec7c2b-f1e6-4961-ad46-e1cc810a87d2}")
+
+# bits per pixel of the formats the converter handles
+_WIC_BPP = {WIC_PF_24BGR: 24, WIC_PF_24RGB: 24, WIC_PF_32BGR: 32, WIC_PF_32BGRA: 32,
+            WIC_PF_32PBGRA: 32, WIC_PF_32RGBA: 32, WIC_PF_32PRGBA: 32, WIC_PF_32RGB: 32,
+            WIC_PF_8GRAY: 8, WIC_PF_555: 16, WIC_PF_565: 16, WIC_PF_5551: 16,
+            WIC_PF_16GRAY: 16, WIC_PF_48RGB: 48, WIC_PF_64RGBA: 64, WIC_PF_64PRGBA: 64,
+            WIC_PF_1IDX: 1, WIC_PF_2IDX: 2, WIC_PF_4IDX: 4, WIC_PF_8IDX: 8, WIC_PF_BW: 1,
+            WIC_PF_2GRAY: 2, WIC_PF_4GRAY: 4}
+
+# formats the converter can produce
+_WIC_OUT = {f for f, b in _WIC_BPP.items() if b >= 8 and f != WIC_PF_8IDX}
+
+WIC_CF_PNG = _guid_from_str("{1b7cfaf4-713f-473c-bbcd-6137425faeaf}")
+WIC_CF_BMP = _guid_from_str("{0af1d87e-fcfe-4188-bdeb-a7906471cbe3}")
+WIC_CF_ICO = _guid_from_str("{a3a860c4-338f-4c17-919a-fba4b5628f21}")
+WIC_CF_GIF = _guid_from_str("{1f8a5601-7d4d-4cbd-9c82-1bc8d4eeb9a5}")
+WIC_CF_JPEG = _guid_from_str("{19e4a5aa-5662-4fc5-a0c0-1758028e1057}")
+WIC_CF_TIFF = _guid_from_str("{163bcc30-e2e9-4f0b-961d-a3e9fdb788a3}")
+
+CLSID_WIC_FACTORY1 = _guid_from_str("{cacaf262-9370-4615-a13b-9f5539da4c0a}")
+CLSID_WIC_FACTORY2 = _guid_from_str("{317d06e8-5f24-433d-bdf7-79ce68d8abc2}")
+CLSID_WIC_PNG_DEC = _guid_from_str("{389ea17b-5078-4cde-b6ef-25c15175c751}")
+CLSID_WIC_PNG_DEC2 = _guid_from_str("{e018945b-aa86-4008-9bd4-6777a1e40c11}")
+CLSID_WIC_BMP_DEC = _guid_from_str("{6b462062-7cbf-400d-9fdb-813dd10f2778}")
+CLSID_WIC_ICO_DEC = _guid_from_str("{c61bfcdf-2e0f-4aad-a8d7-e06bafebcdfe}")
+CLSID_WIC_GIF_DEC = _guid_from_str("{381dda3c-9ce9-4834-a23e-1f98f8fc52be}")
+CLSID_WIC_PNG_ENC = _guid_from_str("{27949969-876a-41d7-9447-568f6a35a4dc}")
+CLSID_WIC_BMP_ENC = _guid_from_str("{69be8bb4-d66d-47c8-865a-ed1589433782}")
+
+IID_IWICFACTORY = _guid_from_str("{ec5ec8a9-c395-4314-9c77-54d7a935ff70}")
+IID_IWICFACTORY2 = _guid_from_str("{7b816b45-1996-4476-b132-de9e247c8af0}")
+IID_IWICSOURCE = _guid_from_str("{00000120-a8f2-4877-ba0a-fd2b6645fb94}")
+IID_IWICBITMAP = _guid_from_str("{00000121-a8f2-4877-ba0a-fd2b6645fb94}")
+IID_IWICLOCK = _guid_from_str("{00000123-a8f2-4877-ba0a-fd2b6645fb94}")
+IID_IWICCONVERTER = _guid_from_str("{00000301-a8f2-4877-ba0a-fd2b6645fb94}")
+IID_IWICSCALER = _guid_from_str("{00000302-a8f2-4877-ba0a-fd2b6645fb94}")
+IID_IWICCLIPPER = _guid_from_str("{e4fbcf03-223d-4e81-9333-d635556dd1b5}")
+IID_IWICFLIPROT = _guid_from_str("{5009834f-2d6a-41ce-9e1b-17c5aff7a782}")
+IID_IWICDECODER = _guid_from_str("{9edde9e7-8dee-47ea-99df-e6faf2ed44bf}")
+IID_IWICFRAME = _guid_from_str("{3b16811b-6a43-4ec9-a813-3d930c13b940}")
+IID_IWICENCODER = _guid_from_str("{00000103-a8f2-4877-ba0a-fd2b6645fb94}")
+IID_IWICFRAMEENC = _guid_from_str("{00000105-a8f2-4877-ba0a-fd2b6645fb94}")
+IID_IWICSTREAM = _guid_from_str("{135ff860-22b7-4ddf-b0f6-218f4f299a43}")
+IID_IWICPALETTE = _guid_from_str("{00000040-a8f2-4877-ba0a-fd2b6645fb94}")
+IID_IPROPERTYBAG2 = _guid_from_str("{22f55882-280b-11d0-a8a9-00a0c90c2004}")
+CLSID_NOO_WIC = _guid_from_str("{4e4f4f57-4943-0000-0000-000000000001}")
+
+WINCODEC_ERR_WRONGSTATE, WINCODEC_ERR_VALUEOUTOFRANGE = 0x88982F04, 0x88982F05
+WINCODEC_ERR_NOTINITIALIZED, WINCODEC_ERR_ALREADYLOCKED = 0x88982F0C, 0x88982F0D
+WINCODEC_ERR_PROPERTYNOTFOUND, WINCODEC_ERR_CODECNOTHUMBNAIL = 0x88982F40, 0x88982F44
+WINCODEC_ERR_PALETTEUNAVAILABLE, WINCODEC_ERR_COMPONENTNOTFOUND = 0x88982F45, 0x88982F50
+WINCODEC_ERR_BADIMAGE, WINCODEC_ERR_FRAMEMISSING = 0x88982F60, 0x88982F62
+WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT, WINCODEC_ERR_UNSUPPORTEDOPERATION = 0x88982F80, 0x88982F81
+WINCODEC_ERR_INSUFFICIENTBUFFER, WINCODEC_ERR_NOPREVIEW = 0x88982F8C, 0x88982F8F
+WINCODEC_ERR_UNKNOWNIMAGEFORMAT = 0x88982F07
+
+
+def _wic_stride(w, bpp):
+    return ((w * bpp + 31) // 32) * 4
+
+
+def _wic_premul(px):
+    """Straight BGRA -> premultiplied, in place."""
+    alphas = px[3::4]
+    if alphas.count(255) == len(alphas):
+        return px
+    for i, a in enumerate(alphas):
+        if a != 255:
+            o = i * 4
+            px[o] = px[o] * a // 255
+            px[o + 1] = px[o + 1] * a // 255
+            px[o + 2] = px[o + 2] * a // 255
+    return px
+
+
+def _wic_unpremul(px):
+    alphas = px[3::4]
+    if alphas.count(255) == len(alphas):
+        return px
+    for i, a in enumerate(alphas):
+        if a and a != 255:
+            o = i * 4
+            px[o] = min(255, px[o] * 255 // a)
+            px[o + 1] = min(255, px[o + 1] * 255 // a)
+            px[o + 2] = min(255, px[o + 2] * 255 // a)
+    return px
+
+
+def _wic_to_bgra(raw, w, h, fmt, palette=None):
+    """Tightly packed rows of `fmt` -> straight BGRA bytearray (w*h*4); None if unknown."""
+    n = w * h
+    out = bytearray(n * 4)
+    if fmt in (WIC_PF_32BGRA, WIC_PF_32PBGRA, WIC_PF_32BGR):
+        out[:] = raw[:n * 4]
+        if fmt == WIC_PF_32BGR:
+            out[3::4] = b"\xff" * n
+        elif fmt == WIC_PF_32PBGRA:
+            _wic_unpremul(out)
+        return out
+    if fmt in (WIC_PF_32RGBA, WIC_PF_32PRGBA, WIC_PF_32RGB):
+        out[0::4] = raw[2:n * 4:4]
+        out[1::4] = raw[1:n * 4:4]
+        out[2::4] = raw[0:n * 4:4]
+        out[3::4] = b"\xff" * n if fmt == WIC_PF_32RGB else raw[3:n * 4:4]
+        if fmt == WIC_PF_32PRGBA:
+            _wic_unpremul(out)
+        return out
+    if fmt in (WIC_PF_24BGR, WIC_PF_24RGB):
+        a, b = (0, 2) if fmt == WIC_PF_24BGR else (2, 0)
+        out[0::4] = raw[a:n * 3:3]
+        out[1::4] = raw[1:n * 3:3]
+        out[2::4] = raw[b:n * 3:3]
+        out[3::4] = b"\xff" * n
+        return out
+    if fmt == WIC_PF_8GRAY:
+        g = raw[:n]
+        out[0::4] = g
+        out[1::4] = g
+        out[2::4] = g
+        out[3::4] = b"\xff" * n
+        return out
+    if fmt == WIC_PF_16GRAY:
+        g = raw[1:n * 2:2]
+        out[0::4] = g
+        out[1::4] = g
+        out[2::4] = g
+        out[3::4] = b"\xff" * n
+        return out
+    if fmt in (WIC_PF_555, WIC_PF_565, WIC_PF_5551):
+        for i in range(n):
+            v = raw[i * 2] | (raw[i * 2 + 1] << 8)
+            if fmt == WIC_PF_565:
+                r, g, b = (v >> 11) & 31, (v >> 5) & 63, v & 31
+                out[i * 4:i * 4 + 4] = bytes(((b << 3) | (b >> 2), (g << 2) | (g >> 4),
+                                              (r << 3) | (r >> 2), 255))
+            else:
+                r, g, b = (v >> 10) & 31, (v >> 5) & 31, v & 31
+                a = 255 if fmt == WIC_PF_555 or v & 0x8000 else 0
+                out[i * 4:i * 4 + 4] = bytes(((b << 3) | (b >> 2), (g << 3) | (g >> 2),
+                                              (r << 3) | (r >> 2), a))
+        return out
+    if fmt == WIC_PF_48RGB:
+        out[0::4] = raw[5:n * 6:6]
+        out[1::4] = raw[3:n * 6:6]
+        out[2::4] = raw[1:n * 6:6]
+        out[3::4] = b"\xff" * n
+        return out
+    if fmt in (WIC_PF_64RGBA, WIC_PF_64PRGBA):
+        out[0::4] = raw[5:n * 8:8]
+        out[1::4] = raw[3:n * 8:8]
+        out[2::4] = raw[1:n * 8:8]
+        out[3::4] = raw[7:n * 8:8]
+        if fmt == WIC_PF_64PRGBA:
+            _wic_unpremul(out)
+        return out
+    bpp = _WIC_BPP.get(fmt)
+    if bpp in (1, 2, 4, 8) and fmt not in (WIC_PF_8GRAY,):
+        gray = fmt in (WIC_PF_BW, WIC_PF_2GRAY, WIC_PF_4GRAY)
+        mask = (1 << bpp) - 1
+        pal = palette
+        if gray or not pal:
+            pal = [0xFF000000 | (v * 255 // mask) * 0x10101 for v in range(mask + 1)]
+        rowb = (w * bpp + 7) // 8
+        for y in range(h):
+            row = raw[y * rowb:(y + 1) * rowb]
+            for x in range(w):
+                bit = x * bpp
+                v = (row[bit >> 3] >> (8 - bpp - (bit & 7))) & mask
+                c_ = pal[v] if v < len(pal) else 0xFF000000
+                struct.pack_into("<I", out, (y * w + x) * 4, c_)
+        return out
+    return None
+
+
+def _wic_from_bgra(px, w, h, fmt, palette=None):
+    """Straight BGRA -> tightly packed rows of `fmt`; None if unknown."""
+    n = w * h
+    if fmt == WIC_PF_32BGRA:
+        return bytes(px)
+    if fmt == WIC_PF_32PBGRA:
+        return bytes(_wic_premul(bytearray(px)))
+    if fmt == WIC_PF_32BGR:
+        out = bytearray(px)
+        out[3::4] = b"\xff" * n
+        return bytes(out)
+    if fmt in (WIC_PF_32RGBA, WIC_PF_32PRGBA, WIC_PF_32RGB):
+        src = _wic_premul(bytearray(px)) if fmt == WIC_PF_32PRGBA else px
+        out = bytearray(n * 4)
+        out[0::4] = src[2::4]
+        out[1::4] = src[1::4]
+        out[2::4] = src[0::4]
+        out[3::4] = b"\xff" * n if fmt == WIC_PF_32RGB else src[3::4]
+        return bytes(out)
+    if fmt in (WIC_PF_24BGR, WIC_PF_24RGB):
+        a, b = (0, 2) if fmt == WIC_PF_24BGR else (2, 0)
+        out = bytearray(n * 3)
+        out[a::3] = px[0::4]
+        out[1::3] = px[1::4]
+        out[b::3] = px[2::4]
+        return bytes(out)
+    if fmt in (WIC_PF_8GRAY, WIC_PF_16GRAY):
+        g = bytes((px[i] * 29 + px[i + 1] * 150 + px[i + 2] * 77) >> 8
+                  for i in range(0, n * 4, 4))
+        if fmt == WIC_PF_8GRAY:
+            return g
+        out = bytearray(n * 2)
+        out[0::2] = g
+        out[1::2] = g
+        return bytes(out)
+    if fmt in (WIC_PF_555, WIC_PF_565, WIC_PF_5551):
+        out = bytearray(n * 2)
+        for i in range(n):
+            b, g, r, a = px[i * 4:i * 4 + 4]
+            if fmt == WIC_PF_565:
+                v = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+            else:
+                v = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3) | \
+                    (0x8000 if fmt == WIC_PF_5551 and a >= 128 else 0)
+            out[i * 2:i * 2 + 2] = struct.pack("<H", v)
+        return bytes(out)
+    if fmt == WIC_PF_48RGB:
+        out = bytearray(n * 6)
+        for c_, o in ((2, 0), (1, 2), (0, 4)):
+            out[o::6] = px[c_::4]
+            out[o + 1::6] = px[c_::4]
+        return bytes(out)
+    if fmt in (WIC_PF_64RGBA, WIC_PF_64PRGBA):
+        src = _wic_premul(bytearray(px)) if fmt == WIC_PF_64PRGBA else px
+        out = bytearray(n * 8)
+        for c_, o in ((2, 0), (1, 2), (0, 4), (3, 6)):
+            out[o::8] = src[c_::4]
+            out[o + 1::8] = src[c_::4]
+        return bytes(out)
+    return None
+
+
+def _wic_scale(px, sw, sh, dw, dh, smooth):
+    """Resize straight BGRA; nearest neighbour, or area-averaged/bilinear when smooth."""
+    out = bytearray(dw * dh * 4)
+    if not sw or not sh:
+        return out
+    if not smooth:
+        xs = [min(sw - 1, (x * sw) // dw) for x in range(dw)]
+        for y in range(dh):
+            sy = min(sh - 1, (y * sh) // dh)
+            row = px[sy * sw * 4:(sy + 1) * sw * 4]
+            o = y * dw * 4
+            for x, sx in enumerate(xs):
+                out[o + x * 4:o + x * 4 + 4] = row[sx * 4:sx * 4 + 4]
+        return out
+    if dw <= sw and dh <= sh:
+        # box filter over premultiplied colour so transparent edges do not bleed
+        for y in range(dh):
+            y0, y1 = y * sh // dh, max(y * sh // dh + 1, (y + 1) * sh // dh)
+            for x in range(dw):
+                x0, x1 = x * sw // dw, max(x * sw // dw + 1, (x + 1) * sw // dw)
+                tb = tg = tr = ta = 0
+                for yy in range(y0, y1):
+                    base = yy * sw * 4
+                    for xx in range(x0, x1):
+                        o = base + xx * 4
+                        a = px[o + 3]
+                        tb += px[o] * a
+                        tg += px[o + 1] * a
+                        tr += px[o + 2] * a
+                        ta += a
+                cnt = (y1 - y0) * (x1 - x0)
+                o = (y * dw + x) * 4
+                if ta:
+                    out[o] = min(255, tb // ta)
+                    out[o + 1] = min(255, tg // ta)
+                    out[o + 2] = min(255, tr // ta)
+                out[o + 3] = ta // cnt
+        return out
+    for y in range(dh):
+        fy = max(0.0, (y + 0.5) * sh / dh - 0.5)
+        y0 = min(sh - 1, int(fy))
+        y1 = min(sh - 1, y0 + 1)
+        wy = fy - y0
+        for x in range(dw):
+            fx = max(0.0, (x + 0.5) * sw / dw - 0.5)
+            x0 = min(sw - 1, int(fx))
+            x1 = min(sw - 1, x0 + 1)
+            wx = fx - x0
+            o = (y * dw + x) * 4
+            a00, a01 = (y0 * sw + x0) * 4, (y0 * sw + x1) * 4
+            a10, a11 = (y1 * sw + x0) * 4, (y1 * sw + x1) * 4
+            for c_ in range(4):
+                top = px[a00 + c_] * (1 - wx) + px[a01 + c_] * wx
+                bot = px[a10 + c_] * (1 - wx) + px[a11 + c_] * wx
+                out[o + c_] = int(top * (1 - wy) + bot * wy + 0.5)
+    return out
+
+
+def _wic_install(k):
+    p = k.p
+    M_ = p.mem
+    gdi = p.gdi
+    E_NOTIMPL, E_FAIL, E_INVALIDARG = 0x80004001, 0x80004005, 0x80070057
+
+    def P():
+        return 8 if p.cpu_mode == 64 else 4
+
+    def put_ptr(pp, v):
+        if pp:
+            (M_.write64 if P() == 8 else M_.write32)(pp, v & (M64 if P() == 8 else 0xFFFFFFFF))
+
+    def rd_ptr(a):
+        return M_.read64(a) if P() == 8 else M_.read32(a)
+
+    def guid_at(a):
+        return bytes(M_.read(a, 16)) if a else b""
+
+    def meth(argc, fn, argc64=None):
+        """COM method taking argc arguments including `this` (argc counts x86 stack slots;
+        argc64 the x64 argument count when a double makes them differ)."""
+        def impl(p_, entry, cpu):
+            n = argc if cpu.mode != 64 or argc64 is None else argc64
+            cpu.get_arg(n - 1)
+            return fn(entry, *[cpu.get_arg(i) for i in range(1, n)])
+        return impl
+
+    objs = {}                                     # iface ptr -> entry, for our sources
+    gen = [0]                                     # bumped when bitmap memory may change
+
+    def new_obj(cls, data, iid):
+        entry = p._com_build_object(cls, CLSID_NOO_WIC)
+        entry["data"].update(data)
+        for ptr in entry["ifaces"].values():
+            objs[ptr] = entry
+        entry["refs"] = 1
+        return entry["ifaces"][iid]
+
+    def forget(p_, entry):
+        for ptr in entry["ifaces"].values():
+            objs.pop(ptr, None)
+        hook = entry["data"].get("on_free")
+        if hook:
+            hook(entry)
+
+    def ours(ptr):
+        e = objs.get(ptr)
+        if e is not None and e["id"] in p.com_objects:
+            return e
+        return None
+
+    def vcall(obj, slot, args):
+        vt = rd_ptr(obj)
+        fn = rd_ptr(vt + slot * P())
+        return p.call_guest(fn, [obj] + list(args)) & 0xFFFFFFFF
+
+    def addref(ptr):
+        e = ours(ptr)
+        if e is not None:
+            e["refs"] += 1
+        elif ptr:
+            vcall(ptr, 1, [])
+
+    def release(ptr):
+        e = ours(ptr)
+        if e is not None:
+            e["refs"] = max(0, e["refs"] - 1)
+            if not e["refs"]:
+                p.com_objects.pop(e["id"], None)
+                forget(p, e)
+        elif ptr:
+            vcall(ptr, 2, [])
+
+    # ---- the source model: every source yields (w, h, fmt, tightly packed pixels) -------------
+    def src_info(ptr):
+        """(w, h, fmt) of any IWICBitmapSource (ours or the guest's)."""
+        e = ours(ptr)
+        if e is not None:
+            d = e["data"]
+            if "info" in d:
+                return d["info"](e)
+            return d["w"], d["h"], d["fmt"]
+        tmp = p.heap_alloc(p.process_heap_handle, 32)
+        try:
+            M_.write(tmp, bytes(32))
+            vcall(ptr, 3, [tmp, tmp + 4])
+            vcall(ptr, 4, [tmp + 8])
+            return M_.read32(tmp), M_.read32(tmp + 4), bytes(M_.read(tmp + 8, 16))
+        finally:
+            p.heap_free(p.process_heap_handle, tmp)
+
+    def src_pixels(ptr):
+        """(w, h, fmt, raw) with raw rows packed tightly (no stride padding)."""
+        e = ours(ptr)
+        if e is not None:
+            d = e["data"]
+            c = d.get("cache")
+            if c is not None and c[0] == gen[0]:
+                return c[1]
+            r = d["pixels"](e)
+            if d.get("cacheable", True):
+                d["cache"] = (gen[0], r)
+            return r
+        w, h, fmt = src_info(ptr)
+        bpp = _WIC_BPP.get(fmt, 32)
+        rowb = (w * bpp + 7) // 8
+        stride = _wic_stride(w, bpp)
+        size = stride * h
+        buf = p.heap_alloc(p.process_heap_handle, max(size, 1))
+        try:
+            hr = vcall(ptr, 7, [0, stride, size, buf])
+            if hr & 0x80000000:
+                return None
+            raw = b"".join(bytes(M_.read(buf + y * stride, rowb)) for y in range(h))
+        finally:
+            p.heap_free(p.process_heap_handle, buf)
+        return w, h, fmt, raw
+
+    def src_bgra(ptr):
+        r = src_pixels(ptr)
+        if r is None:
+            return None
+        w, h, fmt, raw = r
+        px = _wic_to_bgra(raw, w, h, fmt)
+        return None if px is None else (w, h, px)
+
+    def as_format(ptr, fmt):
+        """Pixels of a source converted to fmt: (w, h, raw) or None."""
+        r = src_pixels(ptr)
+        if r is None:
+            return None
+        w, h, sfmt, raw = r
+        if sfmt == fmt:
+            return w, h, raw
+        if sfmt == WIC_PF_32BGRA and fmt == WIC_PF_32PBGRA:
+            return w, h, bytes(_wic_premul(bytearray(raw)))
+        px = _wic_to_bgra(raw, w, h, sfmt)
+        if px is None:
+            return None
+        out = _wic_from_bgra(px, w, h, fmt)
+        return None if out is None else (w, h, out)
+
+    # ---- IWICBitmapSource methods shared by every source class -------------------------------
+    def m_getsize(e, pw, ph):
+        if not pw or not ph:
+            return E_INVALIDARG
+        w, h, _f = src_info(e["ifaces"][IID_IWICSOURCE])
+        M_.write32(pw, w)
+        M_.write32(ph, h)
+        return S_OK
+
+    def m_getfmt(e, pf):
+        if not pf:
+            return E_INVALIDARG
+        _w, _h, f = src_info(e["ifaces"][IID_IWICSOURCE])
+        M_.write(pf, f)
+        return S_OK
+
+    def m_getres(e, px_, py_):
+        if not px_ or not py_:
+            return E_INVALIDARG
+        dx, dy = e["data"].get("dpi", (96.0, 96.0))
+        M_.write(px_, struct.pack("<d", dx))
+        M_.write(py_, struct.pack("<d", dy))
+        return S_OK
+
+    def m_copypal(e, pal):
+        return WINCODEC_ERR_PALETTEUNAVAILABLE
+
+    def copy_out(w, h, fmt, raw, prc, stride, size, buf):
+        bpp = _WIC_BPP.get(fmt, 32)
+        if prc:
+            x, y, cw, ch = struct.unpack("<iiii", M_.read(prc, 16))
+        else:
+            x, y, cw, ch = 0, 0, w, h
+        if x < 0 or y < 0 or cw < 0 or ch < 0 or x + cw > w or y + ch > h:
+            return E_INVALIDARG
+        if not cw or not ch:
+            return S_OK
+        rowb = (w * bpp + 7) // 8
+        need = (cw * bpp + 7) // 8
+        if stride < need:
+            return E_INVALIDARG
+        if size < stride * (ch - 1) + need:
+            return WINCODEC_ERR_INSUFFICIENTBUFFER
+        if not buf:
+            return E_INVALIDARG
+        if bpp % 8 == 0:
+            bx = x * bpp // 8
+            if stride == need and bx == 0 and need == rowb:
+                M_.write(buf, raw[y * rowb:(y + ch) * rowb])
+            else:
+                for j in range(ch):
+                    o = (y + j) * rowb + bx
+                    M_.write(buf + j * stride, raw[o:o + need])
+            return S_OK
+        # sub-byte formats: re-pack bits of each row
+        for j in range(ch):
+            row = raw[(y + j) * rowb:(y + j + 1) * rowb]
+            out = bytearray(need)
+            for i in range(cw * bpp):
+                sb = x * bpp + i
+                if row[sb >> 3] & (0x80 >> (sb & 7)):
+                    out[i >> 3] |= 0x80 >> (i & 7)
+            M_.write(buf + j * stride, bytes(out))
+        return S_OK
+
+    def m_copypixels(e, prc, stride, size, buf):
+        r = src_pixels(e["ifaces"][IID_IWICSOURCE])
+        if r is None:
+            return WINCODEC_ERR_NOTINITIALIZED
+        w, h, fmt, raw = r
+        return copy_out(w, h, fmt, raw, prc, stride & 0xFFFFFFFF, size & 0xFFFFFFFF, buf)
+
+    SRC_METHODS = ("QueryInterface", "AddRef", "Release", "GetSize", "GetPixelFormat",
+                   "GetResolution", "CopyPalette", "CopyPixels")
+    SRC_IMPL = {"GetSize": meth(3, m_getsize), "GetPixelFormat": meth(2, m_getfmt),
+                "GetResolution": meth(3, m_getres), "CopyPalette": meth(2, m_copypal),
+                "CopyPixels": meth(5, m_copypixels)}
+
+    class _WicNotInit(Exception):
+        pass
+
+    def guarded(fn):
+        def impl(p_, entry, cpu):
+            try:
+                return fn(p_, entry, cpu)
+            except _WicNotInit:
+                return WINCODEC_ERR_NOTINITIALIZED
+        return impl
+
+    def source_class(name, iid, extra_methods, extra_impl):
+        impl = {m: guarded(f) for m, f in SRC_IMPL.items()}
+        impl.update(extra_impl)
+        return {"name": name, "iids": {iid: SRC_METHODS + extra_methods,
+                                       IID_IWICSOURCE: SRC_METHODS},
+                "impl": impl, "on_release": forget}
+
+    def wrapped_source(e):
+        s = e["data"].get("src")
+        if not s:
+            raise _WicNotInit()
+        return s
+
+    def free_src(entry):
+        s = entry["data"].get("src")
+        if s:
+            entry["data"]["src"] = 0
+            release(s)
+
+    # ---- decoded frames ---------------------------------------------------------------------
+    FRAME_CLS = source_class(
+        "WICBitmapFrameDecode", IID_IWICFRAME,
+        ("GetMetadataQueryReader", "GetColorContexts", "GetThumbnail"),
+        {"GetMetadataQueryReader": meth(2, lambda e, pp: (put_ptr(pp, 0),
+                                                            WINCODEC_ERR_UNSUPPORTEDOPERATION)[1]),
+         "GetColorContexts": meth(4, lambda e, n, pp, pn: (M_.write32(pn, 0) if pn else None,
+                                                           S_OK)[1]),
+         "GetThumbnail": meth(2, lambda e, pp: (put_ptr(pp, 0),
+                                                 WINCODEC_ERR_CODECNOTHUMBNAIL)[1])})
+
+    def new_frame(w, h, fmt, raw, dpi=(96.0, 96.0)):
+        return new_obj(FRAME_CLS, {"w": w, "h": h, "fmt": fmt, "dpi": dpi,
+                                   "pixels": lambda e: (w, h, fmt, raw)}, IID_IWICFRAME)
+
+    def ico_frames(data):
+        """Every image of an .ico file as (w, h, BGRA straight)."""
+        out = []
+        if len(data) < 6:
+            return out
+        _r, typ, n = struct.unpack_from("<HHH", data, 0)
+        for i in range(n):
+            off = 6 + 16 * i
+            if off + 16 > len(data):
+                break
+            _w, _h, _cc, _rs, _a, _b, size, dataoff = struct.unpack_from("<BBBBHHII", data, off)
+            ic = _icon_from_dib(data[dataoff:dataoff + size], False)
+            if ic is None:
+                continue
+            im = p._gdip["icon_image"](ic)
+            out.append((im.w, im.h, bytes(im.surf.px)))
+        return out
+
+    def decode(data):
+        """File bytes -> (container guid, [(w, h, fmt, raw, dpi)]) or None."""
+        if data[:4] in (b"\0\0\1\0", b"\0\0\2\0"):
+            fr = ico_frames(data)
+            return (WIC_CF_ICO, [(w, h, WIC_PF_32BGRA, px, (96.0, 96.0)) for w, h, px in fr]) \
+                if fr else None
+        im = p._gdip["decode"](data)
+        if im is None:
+            return None
+        cf = {b"\x89P": WIC_CF_PNG, b"BM": WIC_CF_BMP, b"GI": WIC_CF_GIF}.get(data[:2], WIC_CF_PNG)
+        dpi = im.dpi
+        if cf == WIC_CF_GIF and im.frames:
+            return cf, [(im.w, im.h, WIC_PF_32BGRA, bytes(f[0]), dpi) for f in im.frames]
+        px = bytes(im.surf.px)
+        if cf == WIC_CF_GIF or p._gdip["has_alpha"](im):
+            return cf, [(im.w, im.h, WIC_PF_32BGRA, px, dpi)]
+        if cf == WIC_CF_BMP and im.fmt == 0x22009 and data[28:30] == b"\x20\x00":
+            return cf, [(im.w, im.h, WIC_PF_32BGR, px, dpi)]
+        return cf, [(im.w, im.h, WIC_PF_24BGR, _wic_from_bgra(px, im.w, im.h, WIC_PF_24BGR), dpi)]
+
+    def sniff(data):
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            return WIC_CF_PNG
+        if data[:2] == b"BM":
+            return WIC_CF_BMP
+        if data[:4] in (b"\0\0\1\0", b"\0\0\2\0"):
+            return WIC_CF_ICO
+        if data[:3] == b"GIF":
+            return WIC_CF_GIF
+        if data[:2] == b"\xff\xd8":
+            return WIC_CF_JPEG
+        if data[:4] in (b"II*\0", b"MM\0*"):
+            return WIC_CF_TIFF
+        return None
+
+    # ---- decoder ----------------------------------------------------------------------------
+    def read_stream(ptr):
+        p.stream_seek(ptr, 0, 0)
+        return p.stream_read_all(ptr)
+
+    def dec_initialize(e, stream, opts):
+        d = e["data"]
+        if d.get("frames") is not None:
+            return WINCODEC_ERR_WRONGSTATE
+        if not stream:
+            return E_INVALIDARG
+        data = read_stream(stream)
+        cf = sniff(data)
+        if cf is None or (d.get("cf") and d["cf"] != cf):
+            return WINCODEC_ERR_UNKNOWNIMAGEFORMAT if cf is None else WINCODEC_ERR_BADIMAGE
+        r = decode(data)
+        if r is None:
+            return WINCODEC_ERR_BADIMAGE if cf != WIC_CF_JPEG else WINCODEC_ERR_COMPONENTNOTFOUND
+        d["cf"], d["frames"] = r
+        return S_OK
+
+    def dec_frames(e):
+        f = e["data"].get("frames")
+        if f is None:
+            raise _WicNotInit()
+        return f
+
+    def dec_getframe(e, idx, pp):
+        if not pp:
+            return E_INVALIDARG
+        fr = dec_frames(e)
+        if idx >= len(fr):
+            put_ptr(pp, 0)
+            return E_INVALIDARG
+        w, h, fmt, raw, dpi = fr[idx]
+        put_ptr(pp, new_frame(w, h, fmt, raw, dpi))
+        return S_OK
+
+    def dec_getframecount(e, pn):
+        if not pn:
+            return E_INVALIDARG
+        M_.write32(pn, len(dec_frames(e)))
+        return S_OK
+
+    def dec_querycap(e, stream, pcap):
+        if not stream or not pcap:
+            return E_INVALIDARG
+        data = read_stream(stream)
+        cf = sniff(data)
+        want = e["data"].get("cf")
+        M_.write32(pcap, 0 if cf is None or (want and cf != want) else 0x1F)
+        return S_OK
+
+    def dec_container(e, pg):
+        cf = e["data"].get("cf")
+        if not pg:
+            return E_INVALIDARG
+        if cf is None:
+            raise _WicNotInit()
+        M_.write(pg, cf)
+        return S_OK
+
+    DEC_METHODS = ("QueryInterface", "AddRef", "Release", "QueryCapability", "Initialize",
+                   "GetContainerFormat", "GetDecoderInfo", "CopyPalette",
+                   "GetMetadataQueryReader", "GetPreview", "GetColorContexts", "GetThumbnail",
+                   "GetFrameCount", "GetFrame")
+    DEC_CLS = {"name": "WICBitmapDecoder", "iids": {IID_IWICDECODER: DEC_METHODS},
+               "on_release": forget,
+               "impl": {m: guarded(f) for m, f in {
+                   "QueryCapability": meth(3, dec_querycap),
+                   "Initialize": meth(3, dec_initialize),
+                   "GetContainerFormat": meth(2, dec_container),
+                   "GetDecoderInfo": meth(2, lambda e, pp: (put_ptr(pp, 0), E_NOTIMPL)[1]),
+                   "CopyPalette": meth(2, lambda e, pal: WINCODEC_ERR_PALETTEUNAVAILABLE),
+                   "GetMetadataQueryReader": meth(2, lambda e, pp: (
+                       put_ptr(pp, 0), WINCODEC_ERR_UNSUPPORTEDOPERATION)[1]),
+                   "GetPreview": meth(2, lambda e, pp: (put_ptr(pp, 0), WINCODEC_ERR_NOPREVIEW)[1]),
+                   "GetColorContexts": meth(4, lambda e, n, pp, pn: (
+                       M_.write32(pn, 0) if pn else None, WINCODEC_ERR_UNSUPPORTEDOPERATION)[1]),
+                   "GetThumbnail": meth(2, lambda e, pp: (put_ptr(pp, 0),
+                                                           WINCODEC_ERR_CODECNOTHUMBNAIL)[1]),
+                   "GetFrameCount": meth(2, dec_getframecount),
+                   "GetFrame": meth(3, dec_getframe)}.items()}}
+
+    def new_decoder(cf=None):
+        return new_obj(DEC_CLS, {"cf": cf, "frames": None}, IID_IWICDECODER)
+
+    # ---- format converter -------------------------------------------------------------------
+    def conv_pixels(e):
+        d = e["data"]
+        r = as_format(wrapped_source(e), d["fmt"])
+        if r is None:
+            return None
+        return r[0], r[1], d["fmt"], r[2]
+
+    def conv_info(e):
+        w, h, _f = src_info(wrapped_source(e))
+        return w, h, e["data"]["fmt"]
+
+    def conv_init(e, src, pfmt, dither, pal, *rest):
+        d = e["data"]
+        if d.get("src"):
+            return WINCODEC_ERR_WRONGSTATE
+        if not src or not pfmt:
+            return E_INVALIDARG
+        fmt = guid_at(pfmt)
+        if fmt not in _WIC_OUT:
+            return WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT
+        _w, _h, sf = src_info(src)
+        if sf not in _WIC_BPP:
+            return WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT
+        addref(src)
+        d.update(src=src, fmt=fmt)
+        return S_OK
+
+    def conv_canconvert(e, psrc, pdst, pres):
+        if not psrc or not pdst or not pres:
+            return E_INVALIDARG
+        ok = guid_at(psrc) in _WIC_BPP and guid_at(pdst) in _WIC_OUT
+        M_.write32(pres, 1 if ok else 0)
+        return S_OK
+
+    CONV_CLS = source_class("WICFormatConverter", IID_IWICCONVERTER,
+                            ("Initialize", "CanConvert"),
+                            {"Initialize": meth(8, conv_init, 7),
+                             "CanConvert": meth(4, conv_canconvert)})
+
+    def new_converter():
+        return new_obj(CONV_CLS, {"info": conv_info, "pixels": conv_pixels, "fmt": b"",
+                                  "on_free": free_src}, IID_IWICCONVERTER)
+
+    # ---- scaler -----------------------------------------------------------------------------
+    def scaler_info(e):
+        d = e["data"]
+        _w, _h, f = src_info(wrapped_source(e))
+        return d["dw"], d["dh"], f
+
+    def scaler_pixels(e):
+        d = e["data"]
+        src = wrapped_source(e)
+        r = src_pixels(src)
+        if r is None:
+            return None
+        sw, sh, fmt, raw = r
+        if (sw, sh) == (d["dw"], d["dh"]):
+            return r
+        px = _wic_to_bgra(raw, sw, sh, fmt)
+        if px is None:
+            return None
+        out = _wic_scale(px, sw, sh, d["dw"], d["dh"], d["mode"] != 0)
+        return d["dw"], d["dh"], fmt, _wic_from_bgra(out, d["dw"], d["dh"], fmt)
+
+    def scaler_init(e, src, w, h, mode):
+        d = e["data"]
+        if d.get("src"):
+            return WINCODEC_ERR_WRONGSTATE
+        if not src or not w or not h:
+            return E_INVALIDARG
+        addref(src)
+        d.update(src=src, dw=w, dh=h, mode=mode)
+        return S_OK
+
+    SCALER_CLS = source_class("WICBitmapScaler", IID_IWICSCALER, ("Initialize",),
+                              {"Initialize": meth(5, scaler_init)})
+
+    # ---- clipper ----------------------------------------------------------------------------
+    def clip_info(e):
+        d = e["data"]
+        _w, _h, f = src_info(wrapped_source(e))
+        return d["rc"][2], d["rc"][3], f
+
+    def clip_pixels(e):
+        d = e["data"]
+        r = src_pixels(wrapped_source(e))
+        if r is None:
+            return None
+        w, h, fmt, raw = r
+        x, y, cw, ch = d["rc"]
+        bpp = _WIC_BPP.get(fmt, 32)
+        rowb = (w * bpp + 7) // 8
+        if bpp % 8:
+            px = _wic_to_bgra(raw, w, h, fmt)
+            fmt = WIC_PF_32BGRA
+            raw, rowb, bpp = px, w * 4, 32
+        bx, nb = x * bpp // 8, cw * bpp // 8
+        out = b"".join(raw[(y + j) * rowb + bx:(y + j) * rowb + bx + nb] for j in range(ch))
+        return cw, ch, fmt, out
+
+    def clip_init(e, src, prc):
+        d = e["data"]
+        if d.get("src"):
+            return WINCODEC_ERR_WRONGSTATE
+        if not src or not prc:
+            return E_INVALIDARG
+        rc = struct.unpack("<iiii", M_.read(prc, 16))
+        w, h, _f = src_info(src)
+        if rc[0] < 0 or rc[1] < 0 or rc[2] < 0 or rc[3] < 0 or rc[0] + rc[2] > w or \
+                rc[1] + rc[3] > h:
+            return E_INVALIDARG
+        addref(src)
+        d.update(src=src, rc=rc)
+        return S_OK
+
+    CLIP_CLS = source_class("WICBitmapClipper", IID_IWICCLIPPER, ("Initialize",),
+                            {"Initialize": meth(3, clip_init)})
+
+    # ---- flip / rotate ----------------------------------------------------------------------
+    def fr_info(e):
+        w, h, f = src_info(wrapped_source(e))
+        return (h, w, f) if e["data"]["opt"] & 1 else (w, h, f)
+
+    def fr_pixels(e):
+        opt = e["data"]["opt"]
+        r = src_pixels(wrapped_source(e))
+        if r is None:
+            return None
+        w, h, fmt, raw = r
+        px = _wic_to_bgra(raw, w, h, fmt)
+        if px is None:
+            return None
+        rot = opt & 3                                   # 0, 90, 180, 270 clockwise
+        pix = [px[i:i + 4] for i in range(0, len(px), 4)]
+        grid = [pix[y * w:(y + 1) * w] for y in range(h)]
+        for _ in range(rot):
+            grid = [list(row) for row in zip(*grid[::-1])]
+        if opt & 8:
+            grid = [row[::-1] for row in grid]
+        if opt & 0x10:
+            grid = grid[::-1]
+        nh, nw = len(grid), len(grid[0]) if grid else 0
+        out = bytearray(b"".join(b"".join(row) for row in grid))
+        return nw, nh, fmt, _wic_from_bgra(out, nw, nh, fmt)
+
+    def fr_init(e, src, opt):
+        d = e["data"]
+        if d.get("src"):
+            return WINCODEC_ERR_WRONGSTATE
+        if not src:
+            return E_INVALIDARG
+        addref(src)
+        d.update(src=src, opt=opt)
+        return S_OK
+
+    FLIP_CLS = source_class("WICBitmapFlipRotator", IID_IWICFLIPROT, ("Initialize",),
+                            {"Initialize": meth(3, fr_init)})
+
+    def new_wrapper(cls, iid, info, pixels):
+        return new_obj(cls, {"info": info, "pixels": pixels, "on_free": free_src}, iid)
+
+    # ---- IWICBitmap + IWICBitmapLock (pixels live in guest memory) ---------------------------
+    def bmp_pixels(e):
+        d = e["data"]
+        w, h, fmt, stride = d["w"], d["h"], d["fmt"], d["stride"]
+        rowb = (w * _WIC_BPP[fmt] + 7) // 8
+        if rowb == stride:
+            raw = bytes(M_.read(d["mem"], stride * h)) if h else b""
+        else:
+            raw = b"".join(bytes(M_.read(d["mem"] + y * stride, rowb)) for y in range(h))
+        return w, h, fmt, raw
+
+    def free_bitmap(entry):
+        d = entry["data"]
+        if d.get("mem"):
+            p.heap_free(p.process_heap_handle, d["mem"])
+            d["mem"] = 0
+
+    def bmp_lock(e, prc, flags, pp):
+        d = e["data"]
+        if not pp:
+            return E_INVALIDARG
+        if prc:
+            x, y, w, h = struct.unpack("<iiii", M_.read(prc, 16))
+        else:
+            x, y, w, h = 0, 0, d["w"], d["h"]
+        if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > d["w"] or y + h > d["h"]:
+            return E_INVALIDARG
+        if flags & 2 and d["locks"] or d["locks"] < 0:
+            put_ptr(pp, 0)
+            return WINCODEC_ERR_ALREADYLOCKED
+        bpp = _WIC_BPP[d["fmt"]]
+        ptr = d["mem"] + y * d["stride"] + x * bpp // 8
+        size = d["stride"] * (h - 1) + (w * bpp + 7) // 8
+        d["locks"] = -1 if flags & 2 else d["locks"] + 1
+        e["refs"] += 1
+        gen[0] += 1
+
+        def unlock(le, _d=d, _e=e):
+            _d["locks"] = 0 if _d["locks"] < 0 else max(0, _d["locks"] - 1)
+            gen[0] += 1
+            release(_e["ifaces"][IID_IWICBITMAP])
+
+        put_ptr(pp, new_obj(LOCK_CLS, {"w": w, "h": h, "fmt": d["fmt"], "stride": d["stride"],
+                                       "ptr": ptr, "size": size, "on_free": unlock},
+                            IID_IWICLOCK))
+        return S_OK
+
+    def lock_getsize(e, pw, ph):
+        if not pw or not ph:
+            return E_INVALIDARG
+        M_.write32(pw, e["data"]["w"])
+        M_.write32(ph, e["data"]["h"])
+        return S_OK
+
+    def lock_getdata(e, psize, pp):
+        if not psize or not pp:
+            return E_INVALIDARG
+        gen[0] += 1
+        M_.write32(psize, e["data"]["size"])
+        put_ptr(pp, e["data"]["ptr"])
+        return S_OK
+
+    LOCK_CLS = {"name": "WICBitmapLock", "on_release": forget,
+                "iids": {IID_IWICLOCK: ("QueryInterface", "AddRef", "Release", "GetSize",
+                                        "GetStride", "GetDataPointer", "GetPixelFormat")},
+                "impl": {"GetSize": meth(3, lock_getsize),
+                         "GetStride": meth(2, lambda e, ps: (
+                             M_.write32(ps, e["data"]["stride"]) if ps else None,
+                             S_OK if ps else E_INVALIDARG)[1]),
+                         "GetDataPointer": meth(3, lock_getdata),
+                         "GetPixelFormat": meth(2, lambda e, pf: (
+                             M_.write(pf, e["data"]["fmt"]) if pf else None,
+                             S_OK if pf else E_INVALIDARG)[1])}}
+
+    def bmp_setres(e, *a):
+        if P() == 4:
+            dx = struct.unpack("<d", struct.pack("<II", a[0] & 0xFFFFFFFF, a[1] & 0xFFFFFFFF))[0]
+            dy = struct.unpack("<d", struct.pack("<II", a[2] & 0xFFFFFFFF, a[3] & 0xFFFFFFFF))[0]
+            e["data"]["dpi"] = (dx, dy)
+        return S_OK
+
+    BITMAP_CLS = source_class("WICBitmap", IID_IWICBITMAP,
+                              ("Lock", "SetPalette", "SetResolution"),
+                              {"Lock": meth(4, bmp_lock),
+                               "SetPalette": meth(2, lambda e, pal: S_OK),
+                               "SetResolution": meth(5, bmp_setres, 3)})
+
+    def new_bitmap(w, h, fmt, raw=None, dpi=(96.0, 96.0)):
+        """-> iface ptr, or 0 when the format is not supported."""
+        bpp = _WIC_BPP.get(fmt)
+        if bpp is None or w <= 0 or h <= 0:
+            return 0
+        stride = _wic_stride(w, bpp)
+        mem = p.heap_alloc(p.process_heap_handle, max(stride * h, 1))
+        if not mem:
+            return 0
+        rowb = (w * bpp + 7) // 8
+        if raw is not None:
+            if rowb == stride:
+                M_.write(mem, bytes(raw[:stride * h]))
+            else:
+                for y in range(h):
+                    M_.write(mem + y * stride, bytes(raw[y * rowb:(y + 1) * rowb]))
+        else:
+            M_.write(mem, bytes(stride * h))
+        return new_obj(BITMAP_CLS, {"w": w, "h": h, "fmt": fmt, "stride": stride, "mem": mem,
+                                    "locks": 0, "dpi": dpi, "pixels": bmp_pixels,
+                                    "cacheable": False, "on_free": free_bitmap},
+                       IID_IWICBITMAP)
+
+    # ---- IWICStream: an IStream plus Initialize* --------------------------------------------
+    STREAM_M = ("QueryInterface", "AddRef", "Release", "Read", "Write", "Seek", "SetSize",
+                "CopyTo", "Commit", "Revert", "LockRegion", "UnlockRegion", "Stat", "Clone")
+    base_impl = p.stream_cls["impl"]
+
+    def ws_write(p_, e, cpu):
+        d = e["data"]
+        if d.get("membuf"):
+            cpu.get_arg(3)
+            pv, cb, pw = cpu.get_arg(1), cpu.get_arg(2) & 0xFFFFFFFF, cpu.get_arg(3)
+            addr, cap = d["membuf"]
+            pos = d["pos"]
+            if pos + cb > cap:
+                return 0x80030070                              # STG_E_MEDIUMFULL
+        hr = base_impl["Write"](p_, e, cpu)
+        if d.get("membuf") and not hr & 0x80000000:
+            addr, cap = d["membuf"]
+            M_.write(addr, bytes(d["buf"][:cap]))
+        return hr
+
+    def ws_from_memory(e, pv, n):
+        d = e["data"]
+        if d.get("inited"):
+            return WINCODEC_ERR_WRONGSTATE
+        d.update(buf=bytearray(M_.read(pv, n)) if pv and n else bytearray(), pos=0,
+                 membuf=(pv, n), inited=True)
+        return S_OK
+
+    def ws_from_file(e, path, access):
+        d = e["data"]
+        if d.get("inited"):
+            return WINCODEC_ERR_WRONGSTATE
+        name = k.ws_(path)
+        writing = bool(access & 0x40000000)
+        try:
+            host = p.vfs.resolve(name, for_write=writing)
+        except Exception:
+            return 0x80070005
+        data = b""
+        if writing:
+            try:
+                open(host, "wb").close()
+            except OSError:
+                return 0x80070005
+        else:
+            try:
+                with open(host, "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                return 0x80070002
+        d.update(buf=bytearray(data), pos=0, file=host, writable=writing,
+                 readonly=not writing, name=name.rpartition("\\")[2], inited=True)
+        return S_OK
+
+    def ws_from_istream(e, other):
+        d = e["data"]
+        if d.get("inited"):
+            return WINCODEC_ERR_WRONGSTATE
+        if not other:
+            return E_INVALIDARG
+        d.update(buf=bytearray(p.stream_read_all(other)), pos=0, inited=True)
+        return S_OK
+
+    def ws_from_region(e, other, *a):
+        d = e["data"]
+        if d.get("inited"):
+            return WINCODEC_ERR_WRONGSTATE
+        if P() == 4:
+            off, size = a[0] | (a[1] << 32), a[2] | (a[3] << 32)
+        else:
+            off, size = a[0], a[1]
+        p.stream_seek(other, 0, 0)
+        data = p.stream_read_all(other)
+        d.update(buf=bytearray(data[off:off + size]), pos=0, inited=True)
+        return S_OK
+
+    WSTREAM_IMPL = dict(base_impl)
+    WSTREAM_IMPL.update({
+        "Write": ws_write,
+        "InitializeFromIStream": meth(2, ws_from_istream),
+        "InitializeFromFilename": meth(3, ws_from_file),
+        "InitializeFromMemory": meth(3, ws_from_memory),
+        "InitializeFromIStreamRegion": meth(6, ws_from_region, 4)})
+    WSTREAM_CLS = {"name": "WICStream",
+                   "iids": {IID_IWICSTREAM: STREAM_M + (
+                       "InitializeFromIStream", "InitializeFromFilename",
+                       "InitializeFromMemory", "InitializeFromIStreamRegion"),
+                       IID_ISTREAM: STREAM_M, IID_ISEQSTREAM: STREAM_M[:5]},
+                   "impl": WSTREAM_IMPL}
+
+    def new_wic_stream():
+        entry = p._com_build_object(WSTREAM_CLS, CLSID_NOO_WIC)
+        entry["data"].update({"buf": bytearray(), "pos": 0})
+        entry["refs"] = 1
+        for ptr in entry["ifaces"].values():
+            p.stream_entries[ptr] = entry
+        return entry["ifaces"][IID_IWICSTREAM]
+
+    # ---- property bag (encoder options) -----------------------------------------------------
+    BAG_CLS = {"name": "WICEncoderOptions",
+               "iids": {IID_IPROPERTYBAG2: ("QueryInterface", "AddRef", "Release", "Read",
+                                            "Write", "CountProperties", "GetPropertyInfo",
+                                            "LoadObject")},
+               "impl": {"Read": meth(6, lambda e, *a: E_FAIL),
+                        "Write": meth(4, lambda e, *a: S_OK),
+                        "CountProperties": meth(2, lambda e, pn: (
+                            M_.write32(pn, 0) if pn else None, S_OK)[1]),
+                        "GetPropertyInfo": meth(5, lambda e, i, n, pb, pn: (
+                            M_.write32(pn, 0) if pn else None, E_INVALIDARG)[1]),
+                        "LoadObject": meth(5, lambda e, *a: E_NOTIMPL)}}
+
+    # ---- encoder ----------------------------------------------------------------------------
+    def enc_init(e, stream, opt):
+        d = e["data"]
+        if d.get("stream"):
+            return WINCODEC_ERR_WRONGSTATE
+        if not stream:
+            return E_INVALIDARG
+        addref(stream)
+        d["stream"] = stream
+        return S_OK
+
+    def enc_newframe(e, ppframe, ppopts):
+        d = e["data"]
+        if not d.get("stream"):
+            return WINCODEC_ERR_NOTINITIALIZED
+        if d["frames"]:
+            return WINCODEC_ERR_WRONGSTATE if d["cf"] != WIC_CF_GIF else S_OK
+        if not ppframe:
+            return E_INVALIDARG
+        fd = {"w": 0, "h": 0, "fmt": WIC_PF_32BGRA, "rows": bytearray(), "done": False,
+              "dpi": (96.0, 96.0), "enc": e}
+        d["frames"].append(fd)
+        put_ptr(ppframe, new_obj(FENC_CLS, {"f": fd}, IID_IWICFRAMEENC))
+        if ppopts:
+            put_ptr(ppopts, new_obj(BAG_CLS, {}, IID_IPROPERTYBAG2))
+        return S_OK
+
+    def enc_commit(e):
+        d = e["data"]
+        if not d.get("stream") or not d["frames"] or not all(f["done"] for f in d["frames"]):
+            return WINCODEC_ERR_WRONGSTATE
+        f = d["frames"][0]
+        px = _wic_to_bgra(bytes(f["rows"]), f["w"], f["h"], f["fmt"])
+        if px is None:
+            return WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT
+        if d["cf"] == WIC_CF_PNG:
+            blob = _png_encode_rgba(f["w"], f["h"], px, f["fmt"] not in (
+                WIC_PF_24BGR, WIC_PF_24RGB, WIC_PF_32BGR, WIC_PF_32RGB, WIC_PF_8GRAY))
+        else:
+            blob = _bmp_encode(f["w"], f["h"], px, f["fmt"] in (
+                WIC_PF_32BGRA, WIC_PF_32PBGRA, WIC_PF_32RGBA))
+        p.stream_write(d["stream"], blob)
+        d["committed"] = True
+        return S_OK
+
+    def free_encoder(entry):
+        s = entry["data"].get("stream")
+        if s:
+            entry["data"]["stream"] = 0
+            release(s)
+
+    ENC_CLS = {"name": "WICBitmapEncoder", "on_release": forget,
+               "iids": {IID_IWICENCODER: ("QueryInterface", "AddRef", "Release", "Initialize",
+                                          "GetContainerFormat", "GetEncoderInfo",
+                                          "SetColorContexts", "SetPalette", "SetThumbnail",
+                                          "SetPreview", "CreateNewFrame", "Commit",
+                                          "GetMetadataQueryWriter")},
+               "impl": {"Initialize": meth(3, enc_init),
+                        "GetContainerFormat": meth(2, lambda e, pg: (
+                            M_.write(pg, e["data"]["cf"]) if pg else None,
+                            S_OK if pg else E_INVALIDARG)[1]),
+                        "GetEncoderInfo": meth(2, lambda e, pp: (put_ptr(pp, 0), E_NOTIMPL)[1]),
+                        "SetColorContexts": meth(3, lambda e, n, pp:
+                                                 WINCODEC_ERR_UNSUPPORTEDOPERATION),
+                        "SetPalette": meth(2, lambda e, pal: WINCODEC_ERR_UNSUPPORTEDOPERATION),
+                        "SetThumbnail": meth(2, lambda e, s: WINCODEC_ERR_UNSUPPORTEDOPERATION),
+                        "SetPreview": meth(2, lambda e, s: WINCODEC_ERR_UNSUPPORTEDOPERATION),
+                        "CreateNewFrame": meth(3, enc_newframe),
+                        "Commit": meth(1, enc_commit),
+                        "GetMetadataQueryWriter": meth(2, lambda e, pp: (
+                            put_ptr(pp, 0), WINCODEC_ERR_UNSUPPORTEDOPERATION)[1])}}
+
+    ENC_FORMATS = (WIC_PF_32BGRA, WIC_PF_32BGR, WIC_PF_24BGR, WIC_PF_32PBGRA, WIC_PF_32RGBA,
+                   WIC_PF_24RGB, WIC_PF_8GRAY, WIC_PF_48RGB, WIC_PF_64RGBA)
+
+    def fenc_setsize(e, w, h):
+        f = e["data"]["f"]
+        f["w"], f["h"] = w, h
+        return S_OK
+
+    def fenc_setfmt(e, pf):
+        if not pf:
+            return E_INVALIDARG
+        f = e["data"]["f"]
+        want = guid_at(pf)
+        png = f["enc"]["data"]["cf"] == WIC_CF_PNG
+        if want not in ENC_FORMATS or (not png and want not in (WIC_PF_32BGRA, WIC_PF_32BGR,
+                                                                 WIC_PF_24BGR)):
+            want = WIC_PF_32BGRA if want in (WIC_PF_32PBGRA, WIC_PF_32PRGBA,
+                                             WIC_PF_32RGBA) else WIC_PF_24BGR
+            if png and want == WIC_PF_24BGR:
+                want = WIC_PF_32BGRA
+        if want == WIC_PF_32PBGRA:
+            want = WIC_PF_32BGRA
+        f["fmt"] = want
+        M_.write(pf, want)
+        return S_OK
+
+    def fenc_writepixels(e, lines, stride, size, pb):
+        f = e["data"]["f"]
+        if not f["w"] or not f["h"]:
+            return WINCODEC_ERR_WRONGSTATE
+        rowb = (f["w"] * _WIC_BPP[f["fmt"]] + 7) // 8
+        have = len(f["rows"]) // rowb
+        if have + lines > f["h"]:
+            return E_INVALIDARG
+        for j in range(lines):
+            f["rows"] += M_.read(pb + j * stride, rowb)
+        return S_OK
+
+    def fenc_writesource(e, src, prc):
+        f = e["data"]["f"]
+        if not src:
+            return E_INVALIDARG
+        w, h, _sf = src_info(src)
+        if not f["w"]:
+            f["w"], f["h"] = w, h
+        r = as_format(src, f["fmt"])
+        if r is None:
+            f["fmt"] = WIC_PF_32BGRA
+            r = as_format(src, f["fmt"])
+            if r is None:
+                return WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT
+        sw, sh, raw = r
+        bpp = _WIC_BPP[f["fmt"]]
+        srow = (sw * bpp + 7) // 8
+        if prc:
+            x, y, cw, ch = struct.unpack("<iiii", M_.read(prc, 16))
+        else:
+            x, y, cw, ch = 0, 0, sw, sh
+        if cw != f["w"]:
+            return E_INVALIDARG
+        for j in range(ch):
+            o = (y + j) * srow + x * bpp // 8
+            f["rows"] += raw[o:o + (cw * bpp + 7) // 8]
+        return S_OK
+
+    def fenc_commit(e):
+        f = e["data"]["f"]
+        rowb = (f["w"] * _WIC_BPP[f["fmt"]] + 7) // 8
+        if not f["w"] or len(f["rows"]) < rowb * f["h"]:
+            return WINCODEC_ERR_WRONGSTATE
+        f["done"] = True
+        return S_OK
+
+    FENC_CLS = {"name": "WICBitmapFrameEncode", "on_release": forget,
+                "iids": {IID_IWICFRAMEENC: ("QueryInterface", "AddRef", "Release", "Initialize",
+                                            "SetSize", "SetResolution", "SetPixelFormat",
+                                            "SetColorContexts", "SetPalette", "SetThumbnail",
+                                            "WritePixels", "WriteSource", "Commit",
+                                            "GetMetadataQueryWriter")},
+                "impl": {"Initialize": meth(2, lambda e, bag: S_OK),
+                         "SetSize": meth(3, fenc_setsize),
+                         "SetResolution": meth(5, lambda e, *a: S_OK, 3),
+                         "SetPixelFormat": meth(2, fenc_setfmt),
+                         "SetColorContexts": meth(3, lambda e, n, pp:
+                                                 WINCODEC_ERR_UNSUPPORTEDOPERATION),
+                         "SetPalette": meth(2, lambda e, pal: WINCODEC_ERR_UNSUPPORTEDOPERATION),
+                         "SetThumbnail": meth(2, lambda e, s: WINCODEC_ERR_UNSUPPORTEDOPERATION),
+                         "WritePixels": meth(5, fenc_writepixels),
+                         "WriteSource": meth(3, fenc_writesource),
+                         "Commit": meth(1, fenc_commit),
+                         "GetMetadataQueryWriter": meth(2, lambda e, pp: (
+                             put_ptr(pp, 0), WINCODEC_ERR_UNSUPPORTEDOPERATION)[1])}}
+
+    def new_encoder(cf):
+        if cf not in (WIC_CF_PNG, WIC_CF_BMP):
+            return 0
+        return new_obj(ENC_CLS, {"cf": cf, "frames": [], "stream": 0,
+                                 "on_free": free_encoder}, IID_IWICENCODER)
+
+    # ---- the imaging factory ----------------------------------------------------------------
+    def f_dec_from_stream(e, stream, vendor, opts, pp):
+        if not stream or not pp:
+            return E_INVALIDARG
+        dec = new_decoder()
+        de = ours(dec)
+        hr = dec_initialize(de, stream, opts)
+        if hr:
+            release(dec)
+            put_ptr(pp, 0)
+            return WINCODEC_ERR_COMPONENTNOTFOUND if hr == WINCODEC_ERR_UNKNOWNIMAGEFORMAT else hr
+        put_ptr(pp, dec)
+        return S_OK
+
+    def f_dec_from_file(e, path, vendor, access, opts, pp):
+        if not path or not pp:
+            return E_INVALIDARG
+        st = new_wic_stream()
+        hr = ws_from_file(p.stream_entries[st], path, 0x80000000)
+        if hr:
+            release_stream(st)
+            put_ptr(pp, 0)
+            return hr
+        hr = f_dec_from_stream(e, st, vendor, opts, pp)
+        release_stream(st)
+        return hr
+
+    def release_stream(st):
+        e = p.stream_entries.get(st)
+        if e is not None:
+            e["refs"] = max(0, e["refs"] - 1)
+            if not e["refs"]:
+                p.com_objects.pop(e["id"], None)
+
+    def f_dec_from_handle(e, hfile, vendor, opts, pp):
+        if not pp:
+            return E_INVALIDARG
+        fo = p.handles.get(hfile, "file")
+        data = None
+        if fo is not None:
+            try:
+                fd_ = fo.fileno()
+                data = os.pread(fd_, os.fstat(fd_).st_size, 0)
+            except (OSError, AttributeError, ValueError):
+                data = None
+        if data is None:
+            put_ptr(pp, 0)
+            return E_INVALIDARG
+        st = new_wic_stream()
+        p.stream_entries[st]["data"].update(buf=bytearray(data), inited=True)
+        hr = f_dec_from_stream(e, st, vendor, opts, pp)
+        release_stream(st)
+        return hr
+
+    def f_create_decoder(e, pcf, vendor, pp):
+        if not pcf or not pp:
+            return E_INVALIDARG
+        cf = guid_at(pcf)
+        if cf not in (WIC_CF_PNG, WIC_CF_BMP, WIC_CF_ICO, WIC_CF_GIF):
+            put_ptr(pp, 0)
+            return WINCODEC_ERR_COMPONENTNOTFOUND
+        put_ptr(pp, new_decoder(cf))
+        return S_OK
+
+    def f_create_encoder(e, pcf, vendor, pp):
+        if not pcf or not pp:
+            return E_INVALIDARG
+        enc = new_encoder(guid_at(pcf))
+        put_ptr(pp, enc)
+        return S_OK if enc else WINCODEC_ERR_COMPONENTNOTFOUND
+
+    def out_new(pp, ptr):
+        if not pp:
+            return E_INVALIDARG
+        put_ptr(pp, ptr)
+        return S_OK if ptr else E_OUTOFMEMORY
+
+    def f_bitmap(e, w, h, pfmt, opt, pp):
+        if not pp or not pfmt:
+            return E_INVALIDARG
+        fmt = guid_at(pfmt)
+        if fmt not in _WIC_BPP:
+            put_ptr(pp, 0)
+            return WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT
+        return out_new(pp, new_bitmap(w, h, fmt))
+
+    def f_bitmap_from_source(e, src, opt, pp):
+        return f_bitmap_from_rect(e, src, 0, 0, 0, 0, pp)
+
+    def f_bitmap_from_rect(e, src, x, y, w, h, pp):
+        if not src or not pp:
+            return E_INVALIDARG
+        r = src_pixels(src)
+        if r is None:
+            return E_FAIL
+        sw, sh, fmt, raw = r
+        if not w and not h:
+            w, h = sw, sh
+        if fmt not in _WIC_BPP:
+            px = _wic_to_bgra(raw, sw, sh, fmt)
+            if px is None:
+                return WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT
+            fmt, raw = WIC_PF_32BGRA, px
+        if (x, y, w, h) != (0, 0, sw, sh):
+            if x < 0 or y < 0 or x + w > sw or y + h > sh or w <= 0 or h <= 0:
+                return E_INVALIDARG
+            bpp = _WIC_BPP[fmt]
+            if bpp % 8:
+                px = _wic_to_bgra(raw, sw, sh, fmt)
+                fmt, raw, bpp = WIC_PF_32BGRA, px, 32
+            rowb = sw * bpp // 8
+            raw = b"".join(raw[(y + j) * rowb + x * bpp // 8:(y + j) * rowb + (x + w) * bpp // 8]
+                           for j in range(h))
+        se = ours(src)
+        dpi = se["data"].get("dpi", (96.0, 96.0)) if se is not None else (96.0, 96.0)
+        return out_new(pp, new_bitmap(w, h, fmt, raw, dpi))
+
+    def f_bitmap_from_memory(e, w, h, pfmt, stride, size, pb, pp):
+        if not pp or not pfmt or not pb:
+            return E_INVALIDARG
+        fmt = guid_at(pfmt)
+        bpp = _WIC_BPP.get(fmt)
+        if bpp is None:
+            put_ptr(pp, 0)
+            return WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT
+        rowb = (w * bpp + 7) // 8
+        if stride < rowb or size < stride * (h - 1) + rowb:
+            return WINCODEC_ERR_INSUFFICIENTBUFFER
+        raw = b"".join(bytes(M_.read(pb + y * stride, rowb)) for y in range(h))
+        return out_new(pp, new_bitmap(w, h, fmt, raw))
+
+    def f_bitmap_from_hbitmap(e, hbm, hpal, opt, pp):
+        if not pp:
+            return E_INVALIDARG
+        bm = gdi.get(hbm, "bitmap")
+        if bm is None:
+            put_ptr(pp, 0)
+            return E_INVALIDARG
+        if bm.dib is not None:
+            _dib_pull(M_, bm)
+        w, h = bm.surf.w, bm.surf.h
+        px = bytes(bm.surf.px[:w * h * 4])
+        if opt == 2 or bm.bpp != 32:                     # WICBitmapIgnoreAlpha / no alpha
+            return out_new(pp, new_bitmap(w, h, WIC_PF_32BGR, px))
+        fmt = WIC_PF_32PBGRA if opt == 1 else WIC_PF_32BGRA
+        return out_new(pp, new_bitmap(w, h, fmt, px))
+
+    def f_bitmap_from_hicon(e, hicon, pp):
+        if not pp:
+            return E_INVALIDARG
+        ic = gdi.get(hicon)
+        if ic is None or getattr(ic, "kind", None) not in ("icon", "cursor"):
+            put_ptr(pp, 0)
+            return E_INVALIDARG
+        im = p._gdip["icon_image"](ic)
+        return out_new(pp, new_bitmap(im.w, im.h, WIC_PF_32BGRA, bytes(im.surf.px)))
+
+    FACTORY_M = ("QueryInterface", "AddRef", "Release", "CreateDecoderFromFilename",
+                 "CreateDecoderFromStream", "CreateDecoderFromFileHandle", "CreateComponentInfo",
+                 "CreateDecoder", "CreateEncoder", "CreatePalette", "CreateFormatConverter",
+                 "CreateBitmapScaler", "CreateBitmapClipper", "CreateBitmapFlipRotator",
+                 "CreateStream", "CreateColorContext", "CreateColorTransformer", "CreateBitmap",
+                 "CreateBitmapFromSource", "CreateBitmapFromSourceRect",
+                 "CreateBitmapFromMemory", "CreateBitmapFromHBITMAP", "CreateBitmapFromHICON",
+                 "CreateComponentEnumerator", "CreateFastMetadataEncoderFromDecoder",
+                 "CreateFastMetadataEncoderFromFrameDecode", "CreateQueryWriter",
+                 "CreateQueryWriterFromReader")
+    unsupported = lambda n: meth(n, lambda e, *a: (put_ptr(a[-1], 0),
+                                                   WINCODEC_ERR_UNSUPPORTEDOPERATION)[1])
+    FACTORY_IMPL = {
+        "CreateDecoderFromFilename": meth(6, f_dec_from_file),
+        "CreateDecoderFromStream": meth(5, f_dec_from_stream),
+        "CreateDecoderFromFileHandle": meth(5, f_dec_from_handle),
+        "CreateComponentInfo": meth(3, lambda e, cl, pp: (put_ptr(pp, 0),
+                                                          WINCODEC_ERR_COMPONENTNOTFOUND)[1]),
+        "CreateDecoder": meth(4, f_create_decoder),
+        "CreateEncoder": meth(4, f_create_encoder),
+        "CreatePalette": unsupported(2),
+        "CreateFormatConverter": meth(2, lambda e, pp: out_new(pp, new_converter())),
+        "CreateBitmapScaler": meth(2, lambda e, pp: out_new(pp, new_wrapper(
+            SCALER_CLS, IID_IWICSCALER, scaler_info, scaler_pixels))),
+        "CreateBitmapClipper": meth(2, lambda e, pp: out_new(pp, new_wrapper(
+            CLIP_CLS, IID_IWICCLIPPER, clip_info, clip_pixels))),
+        "CreateBitmapFlipRotator": meth(2, lambda e, pp: out_new(pp, new_wrapper(
+            FLIP_CLS, IID_IWICFLIPROT, fr_info, fr_pixels))),
+        "CreateStream": meth(2, lambda e, pp: out_new(pp, new_wic_stream())),
+        "CreateColorContext": unsupported(2),
+        "CreateColorTransformer": unsupported(2),
+        "CreateBitmap": meth(6, f_bitmap),
+        "CreateBitmapFromSource": meth(4, f_bitmap_from_source),
+        "CreateBitmapFromSourceRect": meth(7, f_bitmap_from_rect),
+        "CreateBitmapFromMemory": meth(8, f_bitmap_from_memory),
+        "CreateBitmapFromHBITMAP": meth(5, f_bitmap_from_hbitmap),
+        "CreateBitmapFromHICON": meth(3, f_bitmap_from_hicon),
+        "CreateComponentEnumerator": unsupported(4),
+        "CreateFastMetadataEncoderFromDecoder": unsupported(3),
+        "CreateFastMetadataEncoderFromFrameDecode": unsupported(3),
+        "CreateQueryWriter": unsupported(4),
+        "CreateQueryWriterFromReader": unsupported(4),
+        "CreateImageEncoder": unsupported(3),
+    }
+    FACTORY_CLS = {"name": "WICImagingFactory",
+                   "iids": {IID_IWICFACTORY: FACTORY_M,
+                            IID_IWICFACTORY2: FACTORY_M + ("CreateImageEncoder",)},
+                   "impl": FACTORY_IMPL}
+    for cl in (CLSID_WIC_FACTORY1, CLSID_WIC_FACTORY2):
+        p.com_classes[cl] = FACTORY_CLS
+
+    # decoder / encoder classes creatable directly through CoCreateInstance
+    def on_create(init):
+        def hook(entry):
+            entry["data"].update({k_: (list(v) if isinstance(v, list) else v)
+                                  for k_, v in init.items()})
+            for ptr in entry["ifaces"].values():
+                objs[ptr] = entry
+        return hook
+
+    for cl, cf in ((CLSID_WIC_PNG_DEC, WIC_CF_PNG), (CLSID_WIC_PNG_DEC2, WIC_CF_PNG),
+                   (CLSID_WIC_BMP_DEC, WIC_CF_BMP), (CLSID_WIC_ICO_DEC, WIC_CF_ICO),
+                   (CLSID_WIC_GIF_DEC, WIC_CF_GIF)):
+        p.com_classes[cl] = dict(DEC_CLS, name="WIC decoder",
+                                 on_create=on_create({"cf": cf, "frames": None}))
+    for cl, cf in ((CLSID_WIC_PNG_ENC, WIC_CF_PNG), (CLSID_WIC_BMP_ENC, WIC_CF_BMP)):
+        p.com_classes[cl] = dict(ENC_CLS, name="WIC encoder", on_create=on_create(
+            {"cf": cf, "frames": [], "stream": 0, "on_free": free_encoder}))
+
+    # ---- flat exports -----------------------------------------------------------------------
+    WIC = ("windowscodecs.dll",)
+
+    @k.reg("WICConvertBitmapSource", "ppp", dlls=WIC)
+    def _wiccbs(c, pfmt, src, pp):
+        if not pfmt or not src or not pp:
+            return E_INVALIDARG
+        conv = new_converter()
+        ce = ours(conv)
+        fmt = guid_at(pfmt)
+        _w, _h, sf = src_info(src)
+        if sf == fmt:
+            release(conv)
+            addref(src)
+            put_ptr(pp, src)
+            return S_OK
+        if fmt not in _WIC_OUT or sf not in _WIC_BPP:
+            release(conv)
+            put_ptr(pp, 0)
+            return WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT
+        addref(src)
+        ce["data"].update(src=src, fmt=fmt)
+        put_ptr(pp, ce["ifaces"][IID_IWICSOURCE])
+        return S_OK
+
+    @k.reg("WICCreateImagingFactory_Proxy", "up", dlls=WIC)
+    def _wicproxy(c, ver, pp):
+        ptr, hr = p.com_instantiate(CLSID_WIC_FACTORY1, IID_IWICFACTORY)
+        put_ptr(pp, ptr)
+        return hr
+
+    @k.reg("WICCreateBitmapFromSectionEx", "uupppuuup", dlls=WIC)
+    def _wiccbfsx(c, w, h, pfmt, hsec, stride, off, access, pp):
+        return _from_section(w, h, pfmt, hsec, stride, off, pp)
+
+    @k.reg("WICCreateBitmapFromSection", "uupppuup", dlls=WIC)
+    def _wiccbfs(c, w, h, pfmt, hsec, stride, off, pp):
+        return _from_section(w, h, pfmt, hsec, stride, off, pp)
+
+    def _from_section(w, h, pfmt, hsec, stride, off, pp):
+        fmt = guid_at(pfmt)
+        bpp = _WIC_BPP.get(fmt)
+        if bpp is None or not pp:
+            return E_INVALIDARG
+        view = k.map_view(hsec, off, stride * h) if hasattr(k, "map_view") else 0
+        if not view:
+            return E_INVALIDARG
+        rowb = (w * bpp + 7) // 8
+        raw = b"".join(bytes(M_.read(view + y * stride, rowb)) for y in range(h))
+        return out_new(pp, new_bitmap(w, h, fmt, raw))
+
+    p.wic = {"new_bitmap": new_bitmap, "src_bgra": src_bgra, "decode": decode}
+
+
 # Bitmap glyphs rasterized from the DejaVu fonts (c) Bitstream / DejaVu
 # authors (Bitstream Vera / DejaVu license); regenerate with tools/mkfonts.py
 _NOO_FONT_B64 = (
@@ -65197,6 +66935,9 @@ class NOOProcess:
                 # memory stays mapped (small, bounded leak — documented);
                 # the object is logically destroyed
                 self.com_objects.pop(entry["id"], None)
+                hook = entry["class"].get("on_release")
+                if hook is not None:
+                    hook(self, entry)
             return entry["refs"]
         impl = entry["class"]["impl"].get(mname)
         if impl is None:
@@ -65212,6 +66953,9 @@ class NOOProcess:
         if cls is None:
             return 0, REGDB_E_CLASSNOTREG
         entry = self._com_build_object(cls, clsid_b)
+        hook = cls.get("on_create")
+        if hook is not None:
+            hook(entry)
         ptr = self._com_qi(entry, iid_b)
         if not ptr:
             self.com_objects.pop(entry["id"], None)

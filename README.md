@@ -197,7 +197,7 @@ python3 NOO.py --max-instructions N prog.exe   # optional runaway guard (default
 | **1** | Simple console applications (x86 and x64) | 🟢 supported |
 | **2** | Programs using the C/C++ runtimes (msvcrt, ucrt, MSVC, MinGW, Rust, Go) | 🟢 supported |
 | **3** | Win32 GUI: windows, messages, menus, dialogs, GDI painting | 🟢 supported |
-| **4** | Common controls, RichEdit, common dialogs, MDI, GDI+, shell folders, COM basics, packed (UPX) programs | 🟡 good |
+| **4** | Common controls, RichEdit, common dialogs, MDI, GDI+, WIC, shell folders, COM basics, packed (UPX) programs | 🟡 good |
 | **5** | Drivers, .NET, DirectX / Direct2D | 🔴 unsupported |
 
 **Verified with real, unmodified programs** (downloaded release builds):
@@ -206,7 +206,7 @@ python3 NOO.py --max-instructions N prog.exe   # optional runaway guard (default
 |---|---|
 | **WinMerge 2.16** (x86, MFC) | MDI document window opens maximized, side-by-side diff with highlighting, location pane, splitters, ReBar toolbar with GDI+-converted icons (enabled and disabled) |
 | **Notepad++ 8.6.9** (x86, C++) | starts, menus, full icon toolbar, tabs, Scintilla editing with syntax/brace highlighting, status bar, session save, clean exit |
-| **Process Hacker 2.39** (x86) | main window with the live process tree (idle, System, itself), services/network tabs, plugins, status bar; its PE viewer shows headers and sections in a property sheet |
+| **Process Hacker 2.39** (x86) | main window with the live process tree (idle, System, itself), ToolStatus toolbar with WIC-decoded PNG icons and a search box, services/network tabs, plugins, status bar; its PE viewer shows headers and sections in a property sheet |
 | **Rufus 4.5** (x64, UPX-packed) | unpacks itself, full main window, clean shutdown |
 | **AutoHotkey v1.1 (x86) and v2.0 (x64)** | scripts with GUIs (Edit, Checkbox, DropDownList, Slider, Progress, ListView, TreeView), MsgBox, FileSelect / DirSelect, error dialogs, regex, files, registry, timers, DllCall |
 | **CPython 3.12** (MSVC build, x86 and x64) | the interpreter with its stdlib (json, re, datetime, OpenSSL `hashlib` via `libcrypto`) and **tkinter GUIs** |
@@ -224,7 +224,9 @@ Toolbar, ReBar, StatusBar, Tab, Trackbar, UpDown, Progress, Tooltips, image
 lists), **MDI** frames and children, **RichEdit** (with RTF streaming), in-guest
 **Open/Save, Color, Font, Find/Replace and Browse-for-Folder** dialogs (classic
 and Vista `IFileDialog`), a **GDI+** flat API (PNG/BMP/ICO/GIF images, lock bits,
-brushes, pens, paths, regions, text, transforms), COM `IStream`s, shell folders
+brushes, pens, paths, regions, text, transforms), **WIC** (`windowscodecs`: PNG/BMP/ICO/GIF
+decoders, PNG/BMP encoders, format converter, scaler, clipper, flip/rotate, lockable
+bitmaps), uxtheme buffered painting, COM `IStream`s, shell folders
 and PIDLs, shlwapi path/string helpers, crypt32, setupapi,
 Winsock, wininet, named pipes with overlapped I/O, I/O completion ports and APCs,
 job objects and more. On 32-bit programs, stack clean-up for every one of
