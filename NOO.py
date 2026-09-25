@@ -28522,14 +28522,18 @@ def _gdi_install(k):
             bm += (struct.pack("<I", 0) + struct.pack("<Q", bits)) if ps == 8 else \
                 struct.pack("<I", bits)
             data = bm
-            if o.dib is not None and n >= len(bm) + 60:
+            dsize = 104 if ps == 8 else 84                     # sizeof(DIBSECTION)
+            if o.dib is not None and (n >= dsize or not buf):
                 d = o.dib
+                bitf = d.masks and bpp in (16, 32) and not (
+                    bpp == 32 and tuple(d.masks) == (0xFF0000, 0xFF00, 0xFF)) and not (
+                    bpp == 16 and tuple(d.masks) == (0x7C00, 0x3E0, 0x1F))
                 bih = struct.pack("<IiiHHIIiiII", 40, w, hh if not d.topdown else -hh, 1, bpp,
-                                  3 if d.masks and bpp in (16, 32) else 0, d.size, 0, 0,
-                                  len(d.colors), 0)
+                                  3 if bitf else 0, d.size, 0, 0, len(d.colors), 0)
                 masks = struct.pack("<III", *(d.masks or (0, 0, 0)))
-                data = bm + bih + masks + struct.pack("<IP" if False else "<I", 0) + \
-                    (struct.pack("<I", 0) if ps == 8 else b"")
+                # dshSection (HANDLE) and dsOffset
+                tail = struct.pack("<4xQI4x", 0, 0) if ps == 8 else struct.pack("<II", 0, 0)
+                data = bm + bih + masks + tail
         elif o.kind == "palette":
             if buf and n >= 2:
                 M_.write16(buf, len(o.entries))
@@ -32748,11 +32752,37 @@ def _icon_from_dib(data, cursor=False):
     return ic
 
 
+def _png_unfilter(line, prev, f, bpp):
+    n = len(line)
+    if f == 1:
+        for i in range(bpp, n):
+            line[i] = (line[i] + line[i - bpp]) & 255
+    elif f == 2:
+        for i in range(n):
+            line[i] = (line[i] + prev[i]) & 255
+    elif f == 3:
+        for i in range(n):
+            a = line[i - bpp] if i >= bpp else 0
+            line[i] = (line[i] + ((a + prev[i]) >> 1)) & 255
+    elif f == 4:
+        for i in range(n):
+            if i >= bpp:
+                a, c = line[i - bpp], prev[i - bpp]
+            else:
+                a = c = 0
+            b = prev[i]
+            pp = a + b - c
+            pa, pb, pc = abs(pp - a), abs(pp - b), abs(pp - c)
+            line[i] = (line[i] + (a if pa <= pb and pa <= pc else (b if pb <= pc else c))) & 255
+
+
 def _png_decode(data):
-    """Minimal PNG decoder (8-bit RGB/RGBA/gray/palette, non-interlaced) -> (w, h, rgba)."""
+    """PNG decoder (every bit depth and color type, Adam7 interlace) -> (w, h, rgba)."""
     try:
+        if data[:8] != b"\x89PNG\r\n\x1a\n":
+            return None
         pos = 8
-        idat = b""
+        idat = []
         w = h = depth = ctype = interlace = 0
         plte = b""
         trns = b""
@@ -32763,62 +32793,99 @@ def _png_decode(data):
             if t == b"IHDR":
                 w, h, depth, ctype, _c, _f, interlace = struct.unpack(">IIBBBBB", chunk)
             elif t == b"IDAT":
-                idat += chunk
+                idat.append(chunk)
             elif t == b"PLTE":
                 plte = chunk
             elif t == b"tRNS":
                 trns = chunk
             elif t == b"IEND":
                 break
-        if depth != 8 or interlace:
+        if not w or not h or w * h > 64 << 20:
             return None
         ch = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[ctype]
-        raw = _zlib.decompress(idat)
-        stride = w * ch
+        bits = ch * depth
+        bpp = max(1, bits // 8)
+        raw = _zlib.decompress(b"".join(idat))
         out = bytearray(w * h * 4)
-        prev = bytearray(stride)
+        passes = ([(0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4),
+                   (1, 0, 2, 2), (0, 1, 1, 2)] if interlace else [(0, 0, 1, 1)])
+        # palette / transparency lookups
+        pal = None
+        if ctype == 3:
+            pal = []
+            for i in range(256):
+                rgb = plte[i * 3:i * 3 + 3] or b"\0\0\0"
+                pal.append(bytes(rgb) + bytes((trns[i] if i < len(trns) else 255,)))
+        key = None
+        if trns and ctype == 0:
+            key = struct.unpack(">H", trns[:2])[0]
+        elif trns and ctype == 2:
+            key = struct.unpack(">HHH", trns[:6])
         o = 0
-        for y in range(h):
-            f = raw[o]
-            line = bytearray(raw[o + 1:o + 1 + stride])
-            o += 1 + stride
-            if f == 1:
-                for i in range(ch, stride):
-                    line[i] = (line[i] + line[i - ch]) & 255
-            elif f == 2:
-                for i in range(stride):
-                    line[i] = (line[i] + prev[i]) & 255
-            elif f == 3:
-                for i in range(stride):
-                    a = line[i - ch] if i >= ch else 0
-                    line[i] = (line[i] + ((a + prev[i]) >> 1)) & 255
-            elif f == 4:
-                for i in range(stride):
-                    a = line[i - ch] if i >= ch else 0
-                    b = prev[i]
-                    c = prev[i - ch] if i >= ch else 0
-                    pp = a + b - c
-                    pa, pb, pc = abs(pp - a), abs(pp - b), abs(pp - c)
-                    pr = a if pa <= pb and pa <= pc else (b if pb <= pc else c)
-                    line[i] = (line[i] + pr) & 255
-            prev = line
-            for x in range(w):
-                d = (y * w + x) * 4
-                if ctype == 6:
-                    out[d:d + 4] = line[x * 4:x * 4 + 4]
-                elif ctype == 2:
-                    out[d:d + 3] = line[x * 3:x * 3 + 3]
-                    out[d + 3] = 255
-                elif ctype == 0:
-                    v = line[x]
-                    out[d:d + 4] = bytes((v, v, v, 255))
-                elif ctype == 4:
-                    v = line[x * 2]
-                    out[d:d + 4] = bytes((v, v, v, line[x * 2 + 1]))
+        for (x0, y0, dx, dy) in passes:
+            pw = (w - x0 + dx - 1) // dx
+            ph = (h - y0 + dy - 1) // dy
+            if pw <= 0 or ph <= 0:
+                continue
+            stride = (pw * bits + 7) // 8
+            prev = bytearray(stride)
+            for j in range(ph):
+                f = raw[o]
+                line = bytearray(raw[o + 1:o + 1 + stride])
+                o += 1 + stride
+                if f:
+                    _png_unfilter(line, prev, f, bpp)
+                prev = line
+                row = bytearray(pw * 4)
+                if depth == 8 and ctype == 6:
+                    row[:] = line
+                elif depth == 8 and ctype == 2 and key is None:
+                    row[0::4] = line[0::3]
+                    row[1::4] = line[1::3]
+                    row[2::4] = line[2::3]
+                    row[3::4] = b"\xff" * pw
+                elif depth == 16 and ctype == 6:
+                    row[:] = line[0::2]
                 else:
-                    i = line[x]
-                    out[d:d + 3] = plte[i * 3:i * 3 + 3]
-                    out[d + 3] = trns[i] if i < len(trns) else 255
+                    if depth < 8:
+                        mask = (1 << depth) - 1
+                        vals = [(line[(i * depth) >> 3] >> (8 - depth - ((i * depth) & 7))) & mask
+                                for i in range(pw * ch)]
+                        sc = 255 // mask
+                    elif depth == 8:
+                        vals = line
+                        sc = 1
+                    else:
+                        vals = [(line[i] << 8) | line[i + 1] for i in range(0, len(line), 2)]
+                        sc = 0
+                    for i in range(pw):
+                        d = i * 4
+                        if ctype == 3:
+                            row[d:d + 4] = pal[vals[i]]
+                            continue
+                        smp = vals[i * ch:(i + 1) * ch]
+                        if sc == 0:
+                            v8 = [v >> 8 for v in smp]
+                        else:
+                            v8 = [v * sc for v in smp]
+                        if ctype == 0:
+                            row[d:d + 4] = bytes((v8[0], v8[0], v8[0],
+                                                  0 if key is not None and smp[0] == key else 255))
+                        elif ctype == 4:
+                            row[d:d + 4] = bytes((v8[0], v8[0], v8[0], v8[1]))
+                        elif ctype == 2:
+                            row[d:d + 4] = bytes((v8[0], v8[1], v8[2],
+                                                  0 if key is not None and tuple(smp) == key
+                                                  else 255))
+                        else:
+                            row[d:d + 4] = bytes(v8)
+                y = y0 + j * dy
+                if dx == 1:
+                    out[y * w * 4:(y + 1) * w * 4] = row
+                else:
+                    for i in range(pw):
+                        x = x0 + i * dx
+                        out[(y * w + x) * 4:(y * w + x) * 4 + 4] = row[i * 4:i * 4 + 4]
         return w, h, out
     except Exception:
         return None
@@ -33009,6 +33076,8 @@ def _bitmap_from_packed(p, data, bm_dib=False):
         _dib_rows_to_surf(p.mem, tmp + bits_off, w, h, bpp, top, colors, masks, bm.surf,
                           comp=comp)
         bm.src_bpp = bpp
+        bm.src_colors = colors
+        bm.src_masks = masks
         if bpp == 32 and any(data[bits_off + 3:bits_off + 4 * w * h:4] or b""):
             bm.has_alpha = True
             s = bm.surf
@@ -40614,12 +40683,6 @@ def _user_install2(k):
             bm = _bitmap_from_packed(p, data)
             if bm is None:
                 return 0
-            if flags & 0x2000:                                 # LR_CREATEDIBSECTION
-                w_, h_ = bm.surf.w, bm.surf.h
-                addr = M_.alloc(w_ * h_ * 4, MEM_READ | MEM_WRITE, tag="dibsection")
-                bm.dib = _DibSec(addr, w_, h_, 32, False, [], (0xFF0000, 0xFF00, 0xFF))
-                bm.bpp = 32
-                _dib_push(M_, bm)
             if flags & 0x20:                                   # LR_LOADTRANSPARENT
                 s = bm.surf
                 key = bytes(s.px[0:3])
@@ -40636,6 +40699,26 @@ def _user_install2(k):
                     v = mp.get(bytes(s.px[i:i + 3]))
                     if v is not None:
                         s.px[i:i + 3] = v
+            if flags & 0x2000:                                 # LR_CREATEDIBSECTION
+                # keep the resource's own depth and palette, as Windows does
+                w_, h_ = bm.surf.w, bm.surf.h
+                sbpp = getattr(bm, "src_bpp", 32)
+                if sbpp not in (1, 4, 8, 16, 24, 32):
+                    sbpp = 32
+                cols = list(getattr(bm, "src_colors", None) or [])
+                if sbpp <= 8 and not cols:
+                    sbpp = 32
+                masks = getattr(bm, "src_masks", None) if sbpp in (16, 32) else None
+                if sbpp == 16 and not masks:
+                    masks = (0x7C00, 0x3E0, 0x1F)
+                if sbpp == 32 and not masks:
+                    masks = (0xFF0000, 0xFF00, 0xFF)
+                stride = ((w_ * sbpp + 31) // 32) * 4
+                addr = M_.alloc(max(1, stride * h_), MEM_READ | MEM_WRITE, tag="dibsection")
+                bm.dib = _DibSec(addr, w_, h_, sbpp, False, cols[:1 << sbpp] if sbpp <= 8
+                                 else [], masks)
+                bm.bpp = sbpp
+                _dib_push(M_, bm)
             return gdi.add(bm)
         if typ in (1, 2):
             want = cx or (16 if flags & 0x40 == 0 and cx == 16 else 32)
@@ -42525,6 +42608,8 @@ def _gui_install(k):
     _comdlg_install(k)
     _sysmore_install(k)
     _mdi_install(k)
+    _stream_install(k)
+    _gdiplus_install(k)
 
 
 # -- displays: headless (PNG dump / scripted input), Tk, AetherOS web sessions ----------------------
@@ -47219,10 +47304,38 @@ def _cc_install_bars(k, notify, NMHDR_SZ, hfont, gfont, paint, IL, py_class):
                         iy = r[1] + 3 + off if t and not list_style else \
                             r[1] + (r[3] - r[1] - il.cy) // 2 + off
                         X, Y = pt.xy(ix, iy)
-                        il.draw(pt.surf, pt.clip, X, Y, b["bitmap"] & 0xFFFF)
-                        if not enabled:
-                            pt.dither(ix, iy, ix + il.cx, iy + il.cy, sysc(COLOR_BTNFACE),
-                                      sysc(COLOR_BTNFACE))
+                        idx = b["bitmap"] & 0xFFFF
+                        dil = IL(s.get("il_dis", 0))
+                        hil = IL(s.get("il_hot", 0))
+                        if not enabled and dil is not None and idx < len(dil.images):
+                            dil.draw(pt.surf, pt.clip, X, Y, idx)
+                        elif not enabled:
+                            # no disabled list: a faded grey rendition of the normal image
+                            face = _cr_pix(sysc(COLOR_BTNFACE))
+                            tmp = _Surf(il.cx, il.cy, face)
+                            il.draw(tmp, [(0, 0, il.cx, il.cy)], 0, 0, idx)
+                            for yy in range(il.cy):
+                                for xx in range(il.cx):
+                                    o = (yy * il.cx + xx) * 4
+                                    lum = (tmp.px[o] + 2 * tmp.px[o + 1] + tmp.px[o + 2]) // 4
+                                    tmp.px[o:o + 3] = bytes(((lum + face[c_] * 2) // 3
+                                                             for c_ in range(3)))
+                            for yy in range(il.cy):
+                                dy_ = Y + yy
+                                if not 0 <= dy_ < pt.surf.h:
+                                    continue
+                                for xx in range(il.cx):
+                                    dx_ = X + xx
+                                    if 0 <= dx_ < pt.surf.w and any(
+                                            cl <= dx_ < cr and ct <= dy_ < cb
+                                            for (cl, ct, cr, cb) in pt.clip):
+                                        o = (yy * il.cx + xx) * 4
+                                        do = (dy_ * pt.surf.w + dx_) * 4
+                                        pt.surf.px[do:do + 3] = tmp.px[o:o + 3]
+                        elif s["hot"] == i and hil is not None and idx < len(hil.images):
+                            hil.draw(pt.surf, pt.clip, X, Y, idx)
+                        else:
+                            il.draw(pt.surf, pt.clip, X, Y, idx)
                     if t:
                         col = sysc(COLOR_BTNTEXT) if enabled else sysc(COLOR_GRAYTEXT)
                         if list_style:
@@ -47386,13 +47499,13 @@ def _cc_install_bars(k, notify, NMHDR_SZ, hfont, gfont, paint, IL, py_class):
             tb_autosize(w)
             return 0
         if msg in (0x430, 0x434, 0x436):                         # TB_SETIMAGELIST / hot / disabled
-            if msg == 0x430:
-                o, s["il"] = s["il"], lp
-                wm.invalidate(w, None, True)
-                return o
-            return 0
-        if msg == 0x431:
-            return s["il"]
+            key = {0x430: "il", 0x434: "il_hot", 0x436: "il_dis"}[msg]
+            o = s.get(key, 0)
+            s[key] = lp
+            wm.invalidate(w, None, True)
+            return o
+        if msg in (0x431, 0x435, 0x437):                         # TB_GET(HOT/DISABLED)IMAGELIST
+            return s.get({0x431: "il", 0x435: "il_hot", 0x437: "il_dis"}[msg], 0)
         if msg == 0x41D:                                         # TB_GETITEMRECT
             rects, _bh = tb_layout(w)
             if not 0 <= wp < len(rects) or rects[wp] is None:
@@ -52460,6 +52573,5291 @@ def _mdi_install(k):
     reg("ArrangeIconicWindows", "p", "u")(lambda c, h: 0)
 
 
+# ==========================================================================================
+# 10s. IStream: memory / HGLOBAL / file streams (ole32 CreateStreamOnHGlobal, shlwapi
+#      SHCreateMemStream / SHCreateStreamOnFile*, IStream_* helpers) and guest-stream access
+# ==========================================================================================
+IID_ISTREAM = _guid_from_str("{0000000C-0000-0000-C000-000000000046}")
+IID_ISEQSTREAM = _guid_from_str("{0C733A30-2A1C-11CE-ADE5-00AA0044773D}")
+CLSID_NOO_STREAM = _guid_from_str("{4e4f4f53-7472-6561-6d00-000000000001}")
+STG_E_INVALIDFUNCTION, STG_E_FILENOTFOUND, STG_E_ACCESSDENIED = 0x80030001, 0x80030002, 0x80030005
+STG_E_INVALIDPOINTER = 0x80030009
+
+
+def _stream_install(k):
+    p = k.p
+    M_ = p.mem
+
+    def P():
+        return 8 if p.cpu_mode == 64 else 4
+
+    def put_ptr(pp, v):
+        if pp:
+            (M_.write64 if P() == 8 else M_.write32)(pp, v & (M64 if P() == 8 else 0xFFFFFFFF))
+
+    def arg64(cpu, i):
+        """(value, next index) of a 64-bit by-value argument (two slots on x86)."""
+        if cpu.mode == 64:
+            return cpu.get_arg(i) & M64, i + 1
+        return (cpu.get_arg(i) & 0xFFFFFFFF) | ((cpu.get_arg(i + 1) & 0xFFFFFFFF) << 32), i + 2
+
+    streams = {}                                   # iface ptr -> entry
+
+    def sync_back(d):
+        """Write-through for file / HGLOBAL backed streams."""
+        if d.get("file") and d.get("writable"):
+            try:
+                with open(d["file"], "wb") as fh:
+                    fh.write(bytes(d["buf"]))
+            except OSError:
+                pass
+        hg = d.get("hglobal")
+        if hg:
+            n = len(d["buf"])
+            if p.heap_size(p.process_heap_handle, hg) < max(n, 1):
+                nh = p.heap_realloc(p.process_heap_handle, hg, max(n, 1))
+                if nh:
+                    d["hglobal"] = hg = nh
+            if n:
+                M_.write(hg, bytes(d["buf"]))
+
+    def s_read(p_, e, cpu):
+        cpu.get_arg(3)
+        pv, cb, pread = cpu.get_arg(1), cpu.get_arg(2) & 0xFFFFFFFF, cpu.get_arg(3)
+        d = e["data"]
+        chunk = bytes(d["buf"][d["pos"]:d["pos"] + cb])
+        if chunk:
+            M_.write(pv, chunk)
+        d["pos"] += len(chunk)
+        if pread:
+            M_.write32(pread, len(chunk))
+        return S_OK if len(chunk) == cb else S_FALSE
+
+    def s_write(p_, e, cpu):
+        cpu.get_arg(3)
+        pv, cb, pw = cpu.get_arg(1), cpu.get_arg(2) & 0xFFFFFFFF, cpu.get_arg(3)
+        d = e["data"]
+        if d.get("readonly"):
+            return STG_E_ACCESSDENIED
+        data = bytes(M_.read(pv, cb)) if cb else b""
+        pos = d["pos"]
+        buf = d["buf"]
+        if pos > len(buf):
+            buf.extend(bytes(pos - len(buf)))
+        buf[pos:pos + len(data)] = data
+        d["pos"] = pos + len(data)
+        d["dirty"] = True
+        sync_back(d)
+        if pw:
+            M_.write32(pw, len(data))
+        return S_OK
+
+    def s_seek(p_, e, cpu):
+        mv, i = arg64(cpu, 1)
+        cpu.get_arg(i + 1)
+        origin, pnew = cpu.get_arg(i) & 0xFFFFFFFF, cpu.get_arg(i + 1)
+        d = e["data"]
+        base = {0: 0, 1: d["pos"], 2: len(d["buf"])}.get(origin)
+        if base is None:
+            return STG_E_INVALIDFUNCTION
+        np_ = base + _s64(mv)
+        if np_ < 0:
+            return STG_E_INVALIDFUNCTION
+        d["pos"] = np_
+        if pnew:
+            M_.write(pnew, struct.pack("<Q", np_))
+        return S_OK
+
+    def s_setsize(p_, e, cpu):
+        n, i = arg64(cpu, 1)
+        d = e["data"]
+        buf = d["buf"]
+        if n < len(buf):
+            del buf[n:]
+        else:
+            buf.extend(bytes(n - len(buf)))
+        sync_back(d)
+        return S_OK
+
+    def s_copyto(p_, e, cpu):
+        dst = cpu.get_arg(1)
+        cb, i = arg64(cpu, 2)
+        cpu.get_arg(i + 1)
+        pread, pwritten = cpu.get_arg(i), cpu.get_arg(i + 1)
+        d = e["data"]
+        chunk = bytes(d["buf"][d["pos"]:d["pos"] + cb])
+        d["pos"] += len(chunk)
+        n = guest_write(dst, chunk) if chunk else 0
+        if pread:
+            M_.write(pread, struct.pack("<Q", len(chunk)))
+        if pwritten:
+            M_.write(pwritten, struct.pack("<Q", n))
+        return S_OK
+
+    def s_stat(p_, e, cpu):
+        cpu.get_arg(2)
+        ps, flag = cpu.get_arg(1), cpu.get_arg(2)
+        d = e["data"]
+        if not ps:
+            return STG_E_INVALIDPOINTER
+        n = 80 if P() == 8 else 72
+        M_.write(ps, bytes(n))
+        name = 0
+        if not flag & 1 and d.get("name"):                    # STATFLAG_NONAME
+            data = d["name"].encode("utf-16-le") + b"\0\0"
+            name = p.heap_alloc(p.process_heap_handle, len(data))
+            M_.write(name, data)
+        put_ptr(ps, name)
+        o = 8 if P() == 8 else 4
+        M_.write32(ps + o, 2)                                  # STGTY_STREAM
+        M_.write(ps + (16 if P() == 8 else 8), struct.pack("<Q", len(d["buf"])))
+        M_.write32(ps + (48 if P() == 8 else 40), d.get("mode", 2))
+        return S_OK
+
+    def s_clone(p_, e, cpu):
+        cpu.get_arg(1)
+        pp = cpu.get_arg(1)
+        d = e["data"]
+        ptr = new_stream(d["buf"], shared=True)
+        streams[ptr]["data"]["pos"] = d["pos"]
+        put_ptr(pp, ptr)
+        return S_OK
+
+    def s_nop(argc, hr=S_OK):
+        def impl(p_, e, cpu):
+            cpu.get_arg(argc - 1)
+            return hr
+        return impl
+
+    def s_lock(p_, e, cpu):
+        _a, i = arg64(cpu, 1)
+        _b, i = arg64(cpu, i)
+        cpu.get_arg(i)
+        return STG_E_INVALIDFUNCTION
+
+    methods = ("QueryInterface", "AddRef", "Release", "Read", "Write", "Seek", "SetSize",
+               "CopyTo", "Commit", "Revert", "LockRegion", "UnlockRegion", "Stat", "Clone")
+    STREAM_CLS = {
+        "name": "NOO Stream",
+        "iids": {IID_ISTREAM: methods},
+        "impl": {"Read": s_read, "Write": s_write, "Seek": s_seek, "SetSize": s_setsize,
+                 "CopyTo": s_copyto, "Commit": s_nop(2), "Revert": s_nop(1),
+                 "LockRegion": s_lock, "UnlockRegion": s_lock, "Stat": s_stat,
+                 "Clone": s_clone},
+    }
+
+    def new_stream(data=b"", shared=False, **extra):
+        entry = p._com_build_object(STREAM_CLS, CLSID_NOO_STREAM)
+        # ISequentialStream shares the IStream vtable prefix
+        entry["ifaces"][IID_ISEQSTREAM] = entry["ifaces"][IID_ISTREAM]
+        buf = data if shared and isinstance(data, bytearray) else bytearray(data)
+        entry["data"].update({"buf": buf, "pos": 0})
+        entry["data"].update(extra)
+        entry["refs"] = 1
+        ptr = entry["ifaces"][IID_ISTREAM]
+        streams[ptr] = entry
+        return ptr
+
+    def stream_entry(ptr):
+        e = streams.get(ptr)
+        if e is not None and e["id"] in p.com_objects:
+            return e
+        return None
+
+    # ---- guest (or our own) IStream access for other modules --------------------------------
+    def vcall(obj, slot, args):
+        vt = M_.read64(obj) if P() == 8 else M_.read32(obj)
+        fn = M_.read64(vt + slot * P()) if P() == 8 else M_.read32(vt + slot * P())
+        return p.call_guest(fn, [obj] + list(args)) & 0xFFFFFFFF
+
+    def guest_read_all(obj, limit=256 << 20):
+        """Read an IStream from its current position to the end."""
+        e = stream_entry(obj)
+        if e is not None:
+            d = e["data"]
+            out = bytes(d["buf"][d["pos"]:])
+            d["pos"] = len(d["buf"])
+            return out
+        tmp = p.heap_alloc(p.process_heap_handle, 0x10000 + 8)
+        out = bytearray()
+        try:
+            while len(out) < limit:
+                M_.write32(tmp + 0x10000, 0)
+                hr = vcall(obj, 3, [tmp, 0x10000, tmp + 0x10000])
+                n = M_.read32(tmp + 0x10000)
+                if n:
+                    out += M_.read(tmp, n)
+                if hr & 0x80000000 or n < 0x10000:
+                    break
+        finally:
+            p.heap_free(p.process_heap_handle, tmp)
+        return bytes(out)
+
+    def guest_write(obj, data):
+        e = stream_entry(obj)
+        if e is not None:
+            d = e["data"]
+            pos = d["pos"]
+            if pos > len(d["buf"]):
+                d["buf"].extend(bytes(pos - len(d["buf"])))
+            d["buf"][pos:pos + len(data)] = data
+            d["pos"] = pos + len(data)
+            sync_back(d)
+            return len(data)
+        tmp = p.heap_alloc(p.process_heap_handle, len(data) + 8)
+        try:
+            M_.write(tmp, data)
+            M_.write32(tmp + len(data), 0)
+            vcall(obj, 4, [tmp, len(data), tmp + len(data)])
+            return M_.read32(tmp + len(data))
+        finally:
+            p.heap_free(p.process_heap_handle, tmp)
+
+    def guest_seek(obj, pos, origin=0):
+        e = stream_entry(obj)
+        if e is not None:
+            d = e["data"]
+            d["pos"] = {0: 0, 1: d["pos"], 2: len(d["buf"])}[origin] + pos
+            return
+        if P() == 8:
+            vcall(obj, 5, [pos & M64, origin, 0])
+        else:
+            vcall(obj, 5, [pos & 0xFFFFFFFF, (pos >> 32) & 0xFFFFFFFF, origin, 0])
+
+    p.stream_new = new_stream
+    p.stream_read_all = guest_read_all
+    p.stream_write = guest_write
+    p.stream_seek = guest_seek
+
+    # ---- constructors -----------------------------------------------------------------------
+    OLE = ("ole32.dll", "combase.dll")
+    SHL = ("shlwapi.dll", "shcore.dll")
+
+    @k.reg("CreateStreamOnHGlobal", "pip", dlls=OLE)
+    def _csohg(c, hg, delete, pps):
+        if not pps:
+            return E_INVALIDARG
+        data = b""
+        if hg:
+            n = p.heap_size(p.process_heap_handle, hg)
+            data = bytes(M_.read(hg, n)) if n and n < (1 << 31) else b""
+        else:
+            hg = p.heap_alloc(p.process_heap_handle, 1)
+        put_ptr(pps, new_stream(data, hglobal=hg, delete=bool(delete)))
+        return S_OK
+
+    @k.reg("GetHGlobalFromStream", "pp", dlls=OLE)
+    def _ghgfs(c, ps, phg):
+        e = stream_entry(ps)
+        if e is None or not e["data"].get("hglobal"):
+            put_ptr(phg, 0)
+            return E_INVALIDARG
+        sync_back(e["data"])
+        put_ptr(phg, e["data"]["hglobal"])
+        return S_OK
+
+    def _mem_stream(c, pv, n):
+        data = bytes(M_.read(pv, n)) if pv and n else b""
+        return new_stream(data)
+
+    k.reg("SHCreateMemStream", "pu", "p", dlls=SHL)(_mem_stream)
+
+    def _open_file_stream(path, mode, create=False):
+        try:
+            host = p.vfs.resolve(path, for_write=bool(mode & 3))
+        except Exception:
+            return 0, STG_E_ACCESSDENIED
+        writable = bool(mode & 3)
+        if mode & 0x1000 or create:                             # STGM_CREATE
+            try:
+                open(host, "wb").close()
+            except OSError:
+                return 0, STG_E_ACCESSDENIED
+        if not os.path.isfile(host):
+            return 0, 0x80070002 if os.path.isdir(os.path.dirname(host)) else 0x80070003
+        try:
+            with open(host, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            return 0, STG_E_ACCESSDENIED
+        return new_stream(data, file=host, writable=writable, readonly=not writable,
+                          name=path.rpartition("\\")[2], mode=mode), S_OK
+
+    for w_ in (False, True):
+        sfx = "W" if w_ else "A"
+
+        def _shcsof(c, path, mode, pps, _w=w_):
+            ptr, hr = _open_file_stream(k.s(path, _w), mode)
+            put_ptr(pps, ptr)
+            return hr
+        k.reg("SHCreateStreamOnFile" + sfx, "pup", dlls=SHL)(_shcsof)
+
+    @k.reg("SHCreateStreamOnFileEx", "puuipp", dlls=SHL)
+    def _shcsofex(c, path, mode, attrs, create, tmpl, pps):
+        ptr, hr = _open_file_stream(k.ws_(path), mode, create=bool(create))
+        put_ptr(pps, ptr)
+        return hr
+
+    @k.reg("IStream_Read", "ppu", dlls=SHL)
+    def _isread(c, ps, pv, cb):
+        e = stream_entry(ps)
+        if e is not None:
+            d = e["data"]
+            chunk = bytes(d["buf"][d["pos"]:d["pos"] + cb])
+            M_.write(pv, chunk)
+            d["pos"] += len(chunk)
+            return S_OK if len(chunk) == cb else S_FALSE
+        tmp = p.heap_alloc(p.process_heap_handle, 8)
+        try:
+            M_.write32(tmp, 0)
+            hr = vcall(ps, 3, [pv, cb, tmp])
+            return hr if hr & 0x80000000 else (S_OK if M_.read32(tmp) == cb else S_FALSE)
+        finally:
+            p.heap_free(p.process_heap_handle, tmp)
+
+    @k.reg("IStream_Write", "ppu", dlls=SHL)
+    def _iswrite(c, ps, pv, cb):
+        n = guest_write(ps, bytes(M_.read(pv, cb)) if cb else b"")
+        return S_OK if n == cb else STG_E_ACCESSDENIED
+
+    @k.reg("IStream_Reset", "p", dlls=SHL)
+    def _isreset(c, ps):
+        guest_seek(ps, 0, 0)
+        return S_OK
+
+    @k.reg("IStream_Size", "pp", dlls=SHL)
+    def _issize(c, ps, pn):
+        e = stream_entry(ps)
+        if e is None:
+            return 0x80004001
+        if pn:
+            M_.write(pn, struct.pack("<Q", len(e["data"]["buf"])))
+        return S_OK
+
+    @k.reg("IStream_Copy", "ppu", dlls=SHL)
+    def _iscopy(c, src, dst, cb):
+        e = stream_entry(src)
+        if e is not None:
+            d = e["data"]
+            chunk = bytes(d["buf"][d["pos"]:d["pos"] + cb])
+            d["pos"] += len(chunk)
+        else:
+            chunk = guest_read_all(src, cb)[:cb]
+        guest_write(dst, chunk)
+        return S_OK if len(chunk) == cb else S_FALSE
+
+    # ---- shlwapi ParseURL (ordinals 1/2) ------------------------------------------------------
+    SCHEMES = {"ftp": 1, "http": 2, "gopher": 3, "mailto": 4, "news": 5, "nntp": 6, "telnet": 7,
+               "wais": 8, "file": 9, "mk": 10, "https": 11, "shell": 12, "snews": 13,
+               "local": 14, "javascript": 15, "vbscript": 16, "about": 17, "res": 18}
+
+    for w_ in (False, True):
+        def _parseurl(c, url, out, _w=w_):
+            if not url or not out or M_.read32(out) != (24 if P() == 4 else 40):
+                return 0x80041001                                # URL_E_INVALID_SYNTAX
+            s = k.s(url, _w)
+            i = s.find(":")
+            proto = s[:i] if i > 1 else ""
+            if not proto or not all(ch.isalnum() or ch in "+-." for ch in proto):
+                return 0x80041001
+            unit = 2 if _w else 1
+            nbytes = len(proto.encode("utf-16-le" if _w else "utf-8"))
+            ps_ = P()
+            put_ptr(out + ps_, url)
+            M_.write32(out + 2 * ps_, len(proto))
+            put_ptr(out + 3 * ps_, url + nbytes + unit)
+            M_.write32(out + 4 * ps_, len(s) - len(proto) - 1)
+            M_.write32(out + 4 * ps_ + 4, SCHEMES.get(proto.lower(), 0xFFFFFFFE))
+            return S_OK
+        k.reg("ParseURL" + ("W" if w_ else "A"), "pp", dlls=SHL)(_parseurl)
+
+    # shared memory helpers (SHAllocShared & co): plain heap blocks in one process
+    k.reg("SHAllocShared", "puu", "p", dlls=SHL)(
+        lambda c, pv, n, pid: _shalloc(pv, n))
+
+    def _shalloc(pv, n):
+        a = p.heap_alloc(p.process_heap_handle, max(n, 1))
+        if a and pv and n:
+            M_.write(a, bytes(M_.read(pv, n)))
+        return a
+
+    k.reg("SHLockShared", "pu", "p", dlls=SHL)(lambda c, h, pid: h)
+    k.reg("SHUnlockShared", "p", dlls=SHL)(lambda c, a: 1)
+    k.reg("SHFreeShared", "pu", dlls=SHL)(
+        lambda c, h, pid: (p.heap_free(p.process_heap_handle, h), 1)[1] if h else 1)
+
+    # ---- more ordinal-only shlwapi helpers ----------------------------------------------------
+    @k.reg("IsOS", "u", dlls=SHL)
+    def _isos(c, what):
+        return 1 if what in (0, 1, 3, 4, 7, 18, 20, 26) else 0
+
+    @k.reg("QISearch", "pppp", dlls=SHL)
+    def _qisearch(c, that, tab, riid, ppv):
+        want = bytes(M_.read(riid, 16)) if riid else b""
+        ent = 2 * P()
+        i = 0
+        first = None
+        while True:
+            piid = M_.read64(tab + i * ent) if P() == 8 else M_.read32(tab + i * ent)
+            if not piid:
+                break
+            off = M_.read32(tab + i * ent + P())
+            if first is None:
+                first = off
+            if bytes(M_.read(piid, 16)) == want:
+                first = off
+                break
+            i += 1
+        else:
+            pass
+        found = piid or (want == IID_IUNKNOWN and first is not None)
+        if not found:
+            put_ptr(ppv, 0)
+            return E_NOINTERFACE
+        obj = that + first
+        put_ptr(ppv, obj)
+        vcall(obj, 1, [])                                        # AddRef
+        return S_OK
+
+    @k.reg("SHCreateThread", "pppp", dlls=SHL)
+    def _shcreatethread(c, proc, data, flags, cb):
+        if cb:
+            p.call_guest(cb, [data])
+        try:
+            t = p.create_thread(proc, data, 0)
+            return 1 if t is not None else 0
+        except Exception:
+            if flags & 1:                                        # CTF_INSIST: run inline
+                p.call_guest(proc, [data])
+                return 1
+            return 0
+
+
+# ==========================================================================================
+# 10t. GDI+ (gdiplus.dll flat API): bitmaps (PNG/BMP/ICO/GIF decode, PNG/BMP encode), lock
+#      bits, HBITMAP/HICON interop, Graphics on an HDC or an image with world transforms and
+#      clipping, solid/gradient/hatch/texture brushes, pens, paths, regions, fonts and text,
+#      image attributes (color matrix / color key), matrices. No anti-aliasing.
+# ==========================================================================================
+GP_OK, GP_GENERIC, GP_INVALID, GP_OOM, GP_BUSY, GP_BUFFER, GP_NOTIMPL, GP_WIN32 = range(8)
+GP_WRONGSTATE, GP_ABORTED, GP_FILENOTFOUND, GP_OVERFLOW, GP_ACCESS, GP_UNKNOWNFMT = range(8, 14)
+GP_FAMILYNOTFOUND, GP_PROPNOTFOUND = 14, 19
+
+PF_1I, PF_4I, PF_8I = 0x30101, 0x30402, 0x30803
+PF_555, PF_565, PF_1555, PF_GRAY16 = 0x21005, 0x21006, 0x61007, 0x101004
+PF_24RGB, PF_32RGB, PF_32ARGB, PF_32PARGB = 0x21808, 0x22009, 0x26200A, 0xE200B
+PF_48RGB, PF_64ARGB, PF_64PARGB = 0x10300C, 0x34400D, 0x1A400E
+
+
+def _gfmt_guid(n):
+    return _guid_from_str("{b96b3c%02x-0728-11d3-9d7b-0000f81ef32e}" % n)
+
+
+IMGFMT_MEMBMP, IMGFMT_BMP, IMGFMT_EMF, IMGFMT_WMF, IMGFMT_JPEG, IMGFMT_PNG, IMGFMT_GIF, \
+    IMGFMT_TIFF, IMGFMT_EXIF, IMGFMT_ICON = [_gfmt_guid(n) for n in
+                                             (0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf, 0xb0, 0xb1,
+                                              0xb2, 0xb5)]
+FRAMEDIM_TIME = _guid_from_str("{6aedbd6d-3fb5-418a-83a6-7f45229dc872}")
+FRAMEDIM_PAGE = _guid_from_str("{7462dc86-6180-4c7e-8e3f-ee7333a7a483}")
+
+
+def _codec_clsid(n):
+    return _guid_from_str("{557cf4%02x-1a04-11d3-9a73-0000f81ef32e}" % n)
+
+
+# (clsid, format guid, name, extensions, mime, can encode)
+_GP_CODECS = [
+    (_codec_clsid(0), IMGFMT_BMP, "Built-in BMP Codec", "*.BMP;*.DIB;*.RLE", "image/bmp", True),
+    (_codec_clsid(1), IMGFMT_JPEG, "Built-in JPEG Codec", "*.JPG;*.JPEG;*.JPE;*.JFIF",
+     "image/jpeg", False),
+    (_codec_clsid(2), IMGFMT_GIF, "Built-in GIF Codec", "*.GIF", "image/gif", False),
+    (_codec_clsid(5), IMGFMT_TIFF, "Built-in TIFF Codec", "*.TIF;*.TIFF", "image/tiff", False),
+    (_codec_clsid(6), IMGFMT_PNG, "Built-in PNG Codec", "*.PNG", "image/png", True),
+    (_codec_clsid(7), IMGFMT_ICON, "Built-in ICO Codec", "*.ICO", "image/x-icon", False),
+]
+
+
+def _gif_decode(data):
+    """GIF87a/89a -> list of frames [(w, h, rgba bytearray, delay_cs)] on the logical screen."""
+    if data[:3] != b"GIF":
+        return None
+    try:
+        sw, sh, flags, bgi, _asp = struct.unpack_from("<HHBBB", data, 6)
+        pos = 13
+        gct = None
+        if flags & 0x80:
+            n = 2 << (flags & 7)
+            gct = data[pos:pos + 3 * n]
+            pos += 3 * n
+        canvas = bytearray(sw * sh * 4)
+        frames = []
+        trans = None
+        delay = 0
+        disposal = 0
+        while pos < len(data):
+            b = data[pos]
+            pos += 1
+            if b == 0x3B:
+                break
+            if b == 0x21:
+                label = data[pos]
+                pos += 1
+                blocks = []
+                while True:
+                    n = data[pos]
+                    pos += 1
+                    if n == 0:
+                        break
+                    blocks.append(data[pos:pos + n])
+                    pos += n
+                if label == 0xF9 and blocks and len(blocks[0]) >= 4:
+                    pk, delay, ti = struct.unpack_from("<BHB", blocks[0], 0)
+                    trans = ti if pk & 1 else None
+                    disposal = (pk >> 2) & 7
+                continue
+            if b != 0x2C:
+                break
+            x0, y0, fw, fh, fl = struct.unpack_from("<HHHHB", data, pos)
+            pos += 9
+            ct = gct
+            if fl & 0x80:
+                n = 2 << (fl & 7)
+                ct = data[pos:pos + 3 * n]
+                pos += 3 * n
+            mcs = data[pos]
+            pos += 1
+            sub = bytearray()
+            while True:
+                n = data[pos]
+                pos += 1
+                if n == 0:
+                    break
+                sub += data[pos:pos + n]
+                pos += n
+            idx = _gif_lzw(sub, mcs, fw * fh)
+            rows = list(range(fh))
+            if fl & 0x40:                                      # interlaced
+                rows = (list(range(0, fh, 8)) + list(range(4, fh, 8)) + list(range(2, fh, 4)) +
+                        list(range(1, fh, 2)))
+            prev = bytes(canvas) if disposal == 3 else None
+            ct = ct or bytes(768)
+            for j, y in enumerate(rows):
+                yy = y0 + y
+                if yy >= sh:
+                    continue
+                for i in range(fw):
+                    xx = x0 + i
+                    if xx >= sw:
+                        continue
+                    k = j * fw + i
+                    if k >= len(idx):
+                        break
+                    v = idx[k]
+                    if v == trans:
+                        continue
+                    o = (yy * sw + xx) * 4
+                    canvas[o:o + 4] = bytes((ct[v * 3 + 2], ct[v * 3 + 1], ct[v * 3], 255)) \
+                        if v * 3 + 2 < len(ct) else b"\0\0\0\xff"
+            frames.append((sw, sh, bytearray(canvas), delay))
+            if disposal == 2:
+                for y in range(y0, min(sh, y0 + fh)):
+                    o = (y * sw + x0) * 4
+                    n = max(0, min(fw, sw - x0))
+                    canvas[o:o + n * 4] = bytes(n * 4)
+            elif disposal == 3 and prev is not None:
+                canvas[:] = prev
+            trans, delay, disposal = None, 0, 0
+        return frames or None
+    except Exception:
+        return None
+
+
+def _gif_lzw(data, mcs, npix):
+    clear = 1 << mcs
+    eoi = clear + 1
+    size = mcs + 1
+    dic = [bytes((i,)) for i in range(clear)] + [b"", b""]
+    out = bytearray()
+    prev = None
+    bitpos = 0
+    nbits = len(data) * 8
+    while bitpos + size <= nbits and len(out) < npix:
+        v = 0
+        for b in range(size):
+            if data[(bitpos + b) >> 3] >> ((bitpos + b) & 7) & 1:
+                v |= 1 << b
+        bitpos += size
+        if v == clear:
+            size = mcs + 1
+            dic = dic[:clear + 2]
+            prev = None
+            continue
+        if v == eoi:
+            break
+        if v < len(dic):
+            ent = dic[v]
+            if prev is not None:
+                dic.append(prev + ent[:1])
+        elif prev is not None:
+            ent = prev + prev[:1]
+            dic.append(ent)
+        else:
+            break
+        out += ent
+        prev = ent
+        if len(dic) >= (1 << size) and size < 12:
+            size += 1
+    return out
+
+
+def _png_encode_rgba(w, h, bgra, alpha=True):
+    rows = bytearray()
+    n = 4 if alpha else 3
+    for y in range(h):
+        rows.append(0)
+        src = bgra[y * w * 4:(y + 1) * w * 4]
+        line = bytearray(w * n)
+        line[0::n] = src[2::4]
+        line[1::n] = src[1::4]
+        line[2::n] = src[0::4]
+        if alpha:
+            line[3::4] = src[3::4]
+        rows += line
+
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", _zlib.crc32(t + d) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8,
+                                                               6 if alpha else 2, 0, 0, 0))
+            + chunk(b"IDAT", _zlib.compress(bytes(rows), 6)) + chunk(b"IEND", b""))
+
+
+def _bmp_encode(w, h, bgra, alpha=False):
+    bpp = 32 if alpha else 24
+    stride = ((w * bpp + 31) // 32) * 4
+    body = bytearray()
+    for y in range(h - 1, -1, -1):
+        src = bgra[y * w * 4:(y + 1) * w * 4]
+        if alpha:
+            line = bytearray(src)
+        else:
+            line = bytearray(w * 3)
+            line[0::3] = src[0::4]
+            line[1::3] = src[1::4]
+            line[2::3] = src[2::4]
+        body += line + bytes(stride - len(line))
+    hdr = struct.pack("<IiiHHIIiiII", 40, w, h, 1, bpp, 0, len(body), 3780, 3780, 0, 0)
+    return b"BM" + struct.pack("<IHHI", 14 + 40 + len(body), 0, 0, 54) + hdr + bytes(body)
+
+
+class _GpImage:
+    """A GDI+ bitmap: top-down BGRA pixels, not premultiplied (surf.px)."""
+
+    def __init__(self, w, h, fmt=PF_32ARGB, raw=IMGFMT_MEMBMP):
+        self.kind = "image"
+        self.surf = _Surf(w, h)
+        self.fmt = fmt
+        self.raw = raw
+        self.dpi = (96.0, 96.0)
+        self.palette = None                      # list of ARGB for indexed formats
+        self.frames = None                       # [(rgba, delay)] for multi-frame images
+        self.frame = 0
+        self.ext = None                          # (scan0, stride) of a caller-owned buffer
+        self.locked = None
+        self.flags_extra = 0
+
+    @property
+    def w(self):
+        return self.surf.w
+
+    @property
+    def h(self):
+        return self.surf.h
+
+
+class _GpGraphics:
+    def __init__(self, hdc=0, img=None, hwnd=0):
+        self.kind = "graphics"
+        self.hdc = hdc
+        self.img = img
+        self.hwnd = hwnd
+        self.own_dc = False
+        self.m = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+        self.unit = 1                            # UnitDisplay
+        self.scale = 1.0
+        self.clip = None                         # device rect list (graphics coords) / None
+        self.smoothing = 1
+        self.interp = 2
+        self.pixoff = 0
+        self.comp_mode = 0
+        self.comp_quality = 1
+        self.text_hint = 0
+        self.contrast = 4
+        self.origin = (0, 0)
+        self.saved = {}
+        self.next_state = 1
+        self.tmp_dc = 0
+
+
+def _gp_mat_mul(a, b):
+    """a then b (row-vector convention: p' = p * a * b)."""
+    a11, a12, a21, a22, adx, ady = a
+    b11, b12, b21, b22, bdx, bdy = b
+    return (a11 * b11 + a12 * b21, a11 * b12 + a12 * b22,
+            a21 * b11 + a22 * b21, a21 * b12 + a22 * b22,
+            adx * b11 + ady * b21 + bdx, adx * b12 + ady * b22 + bdy)
+
+
+def _gp_mat_inv(m):
+    m11, m12, m21, m22, dx, dy = m
+    det = m11 * m22 - m12 * m21
+    if abs(det) < 1e-12:
+        return None
+    i11, i12, i21, i22 = m22 / det, -m12 / det, -m21 / det, m11 / det
+    return (i11, i12, i21, i22, -(dx * i11 + dy * i21), -(dx * i12 + dy * i22))
+
+
+def _gp_apply(m, x, y):
+    return x * m[0] + y * m[2] + m[4], x * m[1] + y * m[3] + m[5]
+
+
+def _gp_arc_pts(x, y, w, h, start, sweep):
+    """Points along an elliptical arc (angles in degrees, clockwise, GDI+ style)."""
+    n = max(4, int(abs(sweep) / 360.0 * max(16, (abs(w) + abs(h)))))
+    cx, cy, rx, ry = x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0
+    out = []
+    for i in range(n + 1):
+        a = math.radians(start + sweep * i / float(n))
+        # GDI+ measures the angle on the ellipse, not the circle
+        t = math.atan2(math.sin(a) * rx, math.cos(a) * ry) if rx and ry else a
+        out.append((cx + rx * math.cos(t), cy + ry * math.sin(t)))
+    return out
+
+
+def _gp_bezier(pts, steps=16):
+    out = [pts[0]]
+    for i in range(0, len(pts) - 3, 3):
+        (x0, y0), (x1, y1), (x2, y2), (x3, y3) = pts[i:i + 4]
+        for s in range(1, steps + 1):
+            t = s / float(steps)
+            u = 1 - t
+            out.append((u * u * u * x0 + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x3,
+                        u * u * u * y0 + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y3))
+    return out
+
+
+def _gp_curve(pts, tension=0.5, closed=False):
+    """Cardinal spline through pts -> polyline."""
+    n = len(pts)
+    if n < 3:
+        return list(pts)
+    t = tension / 3.0
+    seq = list(pts) + ([pts[0]] if closed else [])
+    out = [seq[0]]
+    m = len(seq)
+    for i in range(m - 1):
+        p0 = seq[i - 1] if i > 0 else (seq[-2] if closed else seq[0])
+        p1, p2 = seq[i], seq[i + 1]
+        p3 = seq[i + 2] if i + 2 < m else (seq[1] if closed else seq[-1])
+        c1 = (p1[0] + (p2[0] - p0[0]) * t, p1[1] + (p2[1] - p0[1]) * t)
+        c2 = (p2[0] - (p3[0] - p1[0]) * t, p2[1] - (p3[1] - p1[1]) * t)
+        out.extend(_gp_bezier([p1, c1, c2, p2])[1:])
+    return out
+
+
+def _gp_scan(figs, winding=False):
+    """Scanline fill of closed polygons (device coords, floats) -> {y: [(x0, x1)]}."""
+    edges = []
+    for pts in figs:
+        n = len(pts)
+        if n < 2:
+            continue
+        for i in range(n):
+            (xa, ya), (xb, yb) = pts[i], pts[(i + 1) % n]
+            if ya != yb:
+                edges.append((xa, ya, xb, yb))
+    if not edges:
+        return {}
+    y0 = int(math.floor(min(min(e[1], e[3]) for e in edges)))
+    y1 = int(math.ceil(max(max(e[1], e[3]) for e in edges)))
+    out = {}
+    for y in range(y0, y1):
+        yc = y + 0.5
+        xs = []
+        for (xa, ya, xb, yb) in edges:
+            if (ya <= yc < yb) or (yb <= yc < ya):
+                xs.append((xa + (yc - ya) * (xb - xa) / (yb - ya), 1 if yb > ya else -1))
+        if len(xs) < 2:
+            continue
+        xs.sort()
+        spans = []
+        if winding:
+            wn = 0
+            for i in range(len(xs) - 1):
+                wn += xs[i][1]
+                if wn:
+                    spans.append((int(xs[i][0] + 0.5), int(xs[i + 1][0] + 0.5)))
+        else:
+            for i in range(0, len(xs) - 1, 2):
+                spans.append((int(xs[i][0] + 0.5), int(xs[i + 1][0] + 0.5)))
+        if spans:
+            out[y] = spans
+    return out
+
+
+_GP_HATCH = {                                     # 8x8 patterns for the common HatchStyles
+    0: (0, 0, 0, 0xFF, 0, 0, 0, 0), 1: (8, 8, 8, 8, 8, 8, 8, 8),
+    2: (1, 2, 4, 8, 16, 32, 64, 128), 3: (128, 64, 32, 16, 8, 4, 2, 1),
+    4: (8, 8, 8, 0xFF, 8, 8, 8, 8), 5: (0x81, 0x42, 0x24, 0x18, 0x18, 0x24, 0x42, 0x81),
+}
+
+
+def _gdiplus_install(k):
+    p = k.p
+    M_ = p.mem
+    gdi = p.gdi
+    wm = p.wm
+    objs = {}
+    DLL = ("gdiplus.dll",)
+
+    def reg(names, sig, ret="i"):
+        return k.reg(names, sig, ret, dlls=DLL)
+
+    def P():
+        return 8 if p.cpu_mode == 64 else 4
+
+    def put_ptr(pp, v):
+        if pp:
+            (M_.write64 if P() == 8 else M_.write32)(pp, v & (M64 if P() == 8 else 0xFFFFFFFF))
+
+    def rd_ptr(a):
+        return M_.read64(a) if P() == 8 else M_.read32(a)
+
+    def put_f(a, *vals):
+        if a:
+            M_.write(a, struct.pack("<%df" % len(vals), *vals))
+
+    def put_u(a, v):
+        if a:
+            M_.write32(a, v & 0xFFFFFFFF)
+
+    def rd_f(a, n):
+        return struct.unpack("<%df" % n, M_.read(a, 4 * n))
+
+    def rd_i(a, n):
+        return struct.unpack("<%di" % n, M_.read(a, 4 * n))
+
+    def new_handle(obj):
+        a = p.heap_alloc(p.process_heap_handle, 16)
+        M_.write(a, b"NOOGDIP\0" + struct.pack("<Q", id(obj) & M64))
+        objs[a] = obj
+        return a
+
+    def get(h, kind=None):
+        o = objs.get(h)
+        if o is None:
+            return None
+        if kind is not None:
+            ok = o.kind == kind if isinstance(kind, str) else o.kind in kind
+            if not ok:
+                return None
+        return o
+
+    def free_handle(h):
+        if objs.pop(h, None) is not None:
+            p.heap_free(p.process_heap_handle, h)
+            return GP_OK
+        return GP_INVALID
+
+    class _Obj:
+        def __init__(self, kind, **kw):
+            self.kind = kind
+            self.__dict__.update(kw)
+
+    # ---- startup ----------------------------------------------------------------------------
+    @reg("NooGdipNotificationHook GdiplusNotificationHook", "p")
+    def _hook(c, ptoken):
+        put_ptr(ptoken, 0x4E4F4F)
+        return GP_OK
+
+    reg("NooGdipNotificationUnhook GdiplusNotificationUnhook", "p", "v")(lambda c, t: None)
+
+    @reg("GdiplusStartup", "ppp")
+    def _startup(c, ptoken, inp, out):
+        if not ptoken or not inp:
+            return GP_INVALID
+        ver = M_.read32(inp)
+        if ver not in (1, 2, 3):
+            return 17                                           # UnsupportedGdiplusVersion
+        put_ptr(ptoken, 0x4E4F4F01)
+        if out:
+            put_ptr(out, p.api_thunk("gdiplus.dll", "NooGdipNotificationHook"))
+            put_ptr(out + P(), p.api_thunk("gdiplus.dll", "NooGdipNotificationUnhook"))
+        return GP_OK
+
+    reg("GdiplusShutdown", "p", "v")(lambda c, t: None)
+
+    @reg("GdipAlloc", "z", "p")
+    def _galloc(c, n):
+        return p.heap_alloc(p.process_heap_handle, max(n, 1))
+
+    reg("GdipFree", "p", "v")(lambda c, a: p.heap_free(p.process_heap_handle, a) if a else None)
+
+    # ---- pixel format conversion ------------------------------------------------------------
+    def fmt_bpp(fmt):
+        return (fmt >> 8) & 0xFF
+
+    def ext_pull(im):
+        if im.ext is None:
+            return
+        scan0, stride, fmt = im.ext
+        w, h = im.w, im.h
+        for y in range(h):
+            row = bytes(M_.read(scan0 + y * stride, (w * fmt_bpp(fmt) + 7) // 8))
+            im.surf.px[y * w * 4:(y + 1) * w * 4] = from_fmt(row, w, fmt, im.palette)
+
+    def ext_push(im):
+        if im.ext is None:
+            return
+        scan0, stride, fmt = im.ext
+        w, h = im.w, im.h
+        for y in range(h):
+            M_.write(scan0 + y * stride, to_fmt(im.surf.px[y * w * 4:(y + 1) * w * 4], w, fmt,
+                                                 im.palette))
+
+    def from_fmt(row, w, fmt, palette=None):
+        """One row in `fmt` -> w*4 BGRA (straight alpha)."""
+        out = bytearray(w * 4)
+        if fmt == PF_32ARGB:
+            out[:] = row[:w * 4]
+        elif fmt == PF_32PARGB:
+            out[:] = row[:w * 4]
+            for i in range(w):
+                a = out[i * 4 + 3]
+                if a and a != 255:
+                    for c_ in range(3):
+                        out[i * 4 + c_] = min(255, out[i * 4 + c_] * 255 // a)
+        elif fmt == PF_32RGB:
+            out[:] = row[:w * 4]
+            out[3::4] = b"\xff" * w
+        elif fmt == PF_24RGB:
+            out[0::4] = row[0:w * 3:3]
+            out[1::4] = row[1:w * 3:3]
+            out[2::4] = row[2:w * 3:3]
+            out[3::4] = b"\xff" * w
+        elif fmt in (PF_565, PF_555, PF_1555):
+            for i in range(w):
+                v = row[i * 2] | (row[i * 2 + 1] << 8)
+                if fmt == PF_565:
+                    r, g, b = (v >> 11) & 31, (v >> 5) & 63, v & 31
+                    out[i * 4:i * 4 + 4] = bytes(((b << 3) | (b >> 2), (g << 2) | (g >> 4),
+                                                  (r << 3) | (r >> 2), 255))
+                else:
+                    r, g, b = (v >> 10) & 31, (v >> 5) & 31, v & 31
+                    a = 255 if fmt == PF_555 or v & 0x8000 else 0
+                    out[i * 4:i * 4 + 4] = bytes(((b << 3) | (b >> 2), (g << 3) | (g >> 2),
+                                                  (r << 3) | (r >> 2), a))
+        elif fmt in (PF_1I, PF_4I, PF_8I):
+            bpp = fmt_bpp(fmt)
+            pal = palette or [0xFF000000, 0xFFFFFFFF]
+            mask = (1 << bpp) - 1
+            for i in range(w):
+                bit = i * bpp
+                v = (row[bit >> 3] >> (8 - bpp - (bit & 7))) & mask
+                c_ = pal[v] if v < len(pal) else 0xFF000000
+                out[i * 4:i * 4 + 4] = struct.pack("<I", c_)
+        elif fmt in (PF_64ARGB, PF_64PARGB):
+            out[:] = row[1:w * 8:2]
+        elif fmt == PF_48RGB:
+            for i in range(w):
+                out[i * 4:i * 4 + 4] = bytes((row[i * 6 + 1], row[i * 6 + 3], row[i * 6 + 5], 255))
+        else:
+            out[:] = row[:w * 4]
+        return out
+
+    def to_fmt(px, w, fmt, palette=None):
+        """w*4 BGRA -> one row in `fmt`."""
+        if fmt == PF_32ARGB:
+            return bytes(px)
+        if fmt == PF_32PARGB:
+            out = bytearray(px)
+            for i in range(w):
+                a = out[i * 4 + 3]
+                if a != 255:
+                    for c_ in range(3):
+                        out[i * 4 + c_] = out[i * 4 + c_] * a // 255
+            return bytes(out)
+        if fmt == PF_32RGB:
+            out = bytearray(px)
+            out[3::4] = b"\xff" * w
+            return bytes(out)
+        if fmt == PF_24RGB:
+            out = bytearray(w * 3)
+            out[0::3] = px[0::4]
+            out[1::3] = px[1::4]
+            out[2::3] = px[2::4]
+            return bytes(out)
+        if fmt in (PF_565, PF_555, PF_1555):
+            out = bytearray(w * 2)
+            for i in range(w):
+                b, g, r, a = px[i * 4:i * 4 + 4]
+                if fmt == PF_565:
+                    v = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+                else:
+                    v = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3) | \
+                        (0x8000 if fmt == PF_1555 and a >= 128 else 0)
+                out[i * 2:i * 2 + 2] = struct.pack("<H", v)
+            return bytes(out)
+        if fmt in (PF_1I, PF_4I, PF_8I):
+            bpp = fmt_bpp(fmt)
+            pal = palette or [0xFF000000, 0xFFFFFFFF]
+            out = bytearray((w * bpp + 7) // 8)
+            cache = {}
+            for i in range(w):
+                c_ = struct.unpack_from("<I", px, i * 4)[0]
+                v = cache.get(c_)
+                if v is None:
+                    v = min(range(len(pal)), key=lambda j: sum(
+                        abs(((pal[j] >> s) & 255) - ((c_ >> s) & 255)) for s in (0, 8, 16)))
+                    cache[c_] = v
+                bit = i * bpp
+                out[bit >> 3] |= v << (8 - bpp - (bit & 7))
+            return bytes(out)
+        if fmt in (PF_64ARGB, PF_64PARGB):
+            out = bytearray(w * 8)
+            out[1::2] = px[:w * 4]
+            out[0::2] = px[:w * 4]
+            return bytes(out)
+        if fmt == PF_48RGB:
+            out = bytearray(w * 6)
+            for i in range(w):
+                for c_ in range(3):
+                    out[i * 6 + c_ * 2] = out[i * 6 + c_ * 2 + 1] = px[i * 4 + c_]
+            return bytes(out)
+        return bytes(px)
+
+    def has_alpha(im):
+        a = im.surf.px[3::4]
+        return a.count(255) != len(a)
+
+    # ---- decoding ---------------------------------------------------------------------------
+    def decode(data):
+        """Encoded file bytes -> _GpImage or None."""
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            r = _png_decode(data)
+            if r is None:
+                return None
+            w, h, rgba = r
+            im = _GpImage(w, h, PF_32ARGB, IMGFMT_PNG)
+            px = im.surf.px
+            px[0::4] = rgba[2::4]
+            px[1::4] = rgba[1::4]
+            px[2::4] = rgba[0::4]
+            px[3::4] = rgba[3::4]
+            if not has_alpha(im):
+                im.fmt = PF_24RGB if data[25:26] in (b"\x02", b"\x00") else PF_32ARGB
+            if data[25:26] == b"\x03":
+                im.fmt = PF_32ARGB if has_alpha(im) else PF_8I
+                if im.fmt == PF_8I:
+                    im.fmt = PF_32ARGB                      # keep pixels exact
+            return im
+        if data[:2] == b"BM" and len(data) > 54:
+            bm = _bitmap_from_packed(p, data[14:])
+            if bm is None:
+                return None
+            im = _GpImage(bm.surf.w, bm.surf.h, PF_24RGB, IMGFMT_BMP)
+            im.surf.px[:] = bm.surf.px
+            if getattr(bm, "has_alpha", False):
+                im.fmt = PF_32ARGB
+            else:
+                im.surf.px[3::4] = b"\xff" * (im.w * im.h)
+                bpp = getattr(bm, "src_bpp", 24)
+                im.fmt = {1: PF_32RGB, 4: PF_32RGB, 8: PF_32RGB, 16: PF_32RGB,
+                          32: PF_32RGB}.get(bpp, PF_24RGB)
+            return im
+        if data[:4] in (b"\0\0\1\0", b"\0\0\2\0"):
+            ic = _read_icon_file(data, 256)
+            if ic is None:
+                return None
+            im = icon_image(ic)
+            im.raw = IMGFMT_ICON
+            return im
+        if data[:3] == b"GIF":
+            frames = _gif_decode(data)
+            if not frames:
+                return None
+            w, h, rgba, _d = frames[0]
+            im = _GpImage(w, h, PF_8I, IMGFMT_GIF)
+            im.fmt = PF_32ARGB
+            im.surf.px[:] = rgba
+            if len(frames) > 1:
+                im.frames = [(f[2], f[3]) for f in frames]
+            return im
+        return None
+
+    def icon_image(ic):
+        im = _GpImage(ic.w, ic.ht, PF_32ARGB)
+        px = im.surf.px
+        px[:] = ic.color.px[:ic.w * ic.ht * 4]
+        if ic.alpha is not None:
+            px[3::4] = ic.alpha
+        else:
+            m = ic.mask
+            px[3::4] = bytes(0 if (m is not None and m[i]) else 255 for i in range(ic.w * ic.ht))
+        return im
+
+    def encode(im, clsid):
+        for (cl, fmtg, _n, _e, _m, can) in _GP_CODECS:
+            if cl == clsid and can:
+                if fmtg == IMGFMT_PNG:
+                    return _png_encode_rgba(im.w, im.h, im.surf.px, True)
+                return _bmp_encode(im.w, im.h, im.surf.px, has_alpha(im))
+        return None
+
+    def out_image(pp, im):
+        if im is None:
+            put_ptr(pp, 0)
+            return GP_OOM
+        put_ptr(pp, new_handle(im))
+        return GP_OK
+
+    def load_file(path):
+        try:
+            host = p.vfs.resolve(path)
+            with open(host, "rb") as fh:
+                return fh.read()
+        except Exception:
+            return None
+
+    for nm in ("GdipLoadImageFromFile", "GdipLoadImageFromFileICM", "GdipCreateBitmapFromFile",
+               "GdipCreateBitmapFromFileICM"):
+        def _lif(c, path, pp):
+            if not path or not pp:
+                return GP_INVALID
+            data = load_file(k.ws_(path))
+            if data is None:
+                put_ptr(pp, 0)
+                return GP_FILENOTFOUND if data is None else GP_UNKNOWNFMT
+            im = decode(data)
+            if im is None:
+                put_ptr(pp, 0)
+                return GP_OOM                                  # GDI+ reports OutOfMemory
+            return out_image(pp, im)
+        reg(nm, "pp")(_lif)
+
+    for nm in ("GdipLoadImageFromStream", "GdipLoadImageFromStreamICM",
+               "GdipCreateBitmapFromStream", "GdipCreateBitmapFromStreamICM"):
+        def _lis(c, stream, pp):
+            if not stream or not pp:
+                return GP_INVALID
+            data = p.stream_read_all(stream)
+            im = decode(data)
+            if im is None:
+                put_ptr(pp, 0)
+                return GP_OOM
+            return out_image(pp, im)
+        reg(nm, "pp")(_lis)
+
+    @reg("GdipCreateBitmapFromScan0", "iiiupp")
+    def _cbs0(c, w, h, stride, fmt, scan0, pp):
+        if w <= 0 or h <= 0 or not pp:
+            return GP_INVALID
+        im = _GpImage(w, h, fmt)
+        if fmt in (PF_1I, PF_4I, PF_8I):
+            n = 1 << fmt_bpp(fmt)
+            if n == 2:
+                im.palette = [0xFF000000, 0xFFFFFFFF]
+            else:
+                im.palette = [0xFF000000 | ((i * 255 // (n - 1)) * 0x10101) for i in range(n)]
+        if scan0:
+            im.ext = (scan0, _s32(stride & 0xFFFFFFFF), fmt)
+            ext_pull(im)
+        elif fmt in (PF_32RGB, PF_24RGB, PF_565, PF_555, PF_48RGB, PF_1I, PF_4I, PF_8I):
+            im.surf.px[3::4] = b"\xff" * (w * h)
+        return out_image(pp, im)
+
+    @reg("GdipCreateBitmapFromGraphics", "iipp")
+    def _cbfg(c, w, h, g, pp):
+        if w <= 0 or h <= 0:
+            return GP_INVALID
+        return out_image(pp, _GpImage(w, h, PF_32PARGB))
+
+    @reg("GdipCreateBitmapFromHBITMAP", "ppp")
+    def _cbfhbm(c, hbm, hpal, pp):
+        bm = gdi.get(hbm, "bitmap")
+        if bm is None:
+            return GP_INVALID
+        if bm.dib is not None:
+            _dib_pull(M_, bm)
+        im = _GpImage(bm.surf.w, bm.surf.h, PF_32RGB if bm.bpp == 32 else PF_24RGB)
+        im.surf.px[:] = bm.surf.px
+        im.surf.px[3::4] = b"\xff" * (im.w * im.h)            # GDI+ ignores DIB alpha here
+        return out_image(pp, im)
+
+    @reg("GdipCreateBitmapFromHICON", "pp")
+    def _cbfhicon(c, hicon, pp):
+        ic = gdi.get(hicon)
+        if ic is None or ic.kind not in ("icon", "cursor"):
+            return GP_INVALID
+        return out_image(pp, icon_image(ic))
+
+    @reg("GdipCreateBitmapFromResource", "ppp")
+    def _cbfres(c, inst, name, pp):
+        key = name if name < 0x10000 else k.ws_(name)
+        data = _res_bytes(p, inst, 2, key)
+        if data is None:
+            return GP_INVALID
+        bm = _bitmap_from_packed(p, data)
+        if bm is None:
+            return GP_INVALID
+        im = _GpImage(bm.surf.w, bm.surf.h, PF_32RGB)
+        im.surf.px[:] = bm.surf.px
+        im.surf.px[3::4] = b"\xff" * (im.w * im.h)
+        return out_image(pp, im)
+
+    @reg("GdipCreateBitmapFromGdiDib", "ppp")
+    def _cbfdib(c, bmi, bits, pp):
+        w, h, bpp, top, colors, masks, comp, hs = _read_bmi(M_, bmi, 0)
+        im = _GpImage(w, h, PF_32RGB if bpp == 32 else PF_24RGB)
+        _dib_rows_to_surf(M_, bits, w, h, bpp, top, colors, masks, im.surf, comp=comp)
+        im.surf.px[3::4] = b"\xff" * (w * h)
+        return out_image(pp, im)
+
+    def make_hbitmap(im, bg=None):
+        """32-bpp top-down DIB section, premultiplied, composited over bg (ARGB) if given."""
+        w, h = im.w, im.h
+        px = bytearray(im.surf.px)
+        ba = (bg >> 24) & 255 if bg is not None else 0
+        bb, bgc, br = (bg & 255, (bg >> 8) & 255, (bg >> 16) & 255) if bg is not None else (0, 0, 0)
+        for i in range(0, len(px), 4):
+            a = px[i + 3]
+            if a == 255:
+                continue
+            if ba:
+                inv = 255 - a
+                px[i] = (px[i] * a + bb * inv) // 255
+                px[i + 1] = (px[i + 1] * a + bgc * inv) // 255
+                px[i + 2] = (px[i + 2] * a + br * inv) // 255
+                px[i + 3] = (a * 255 + ba * inv) // 255
+            else:
+                px[i] = px[i] * a // 255
+                px[i + 1] = px[i + 1] * a // 255
+                px[i + 2] = px[i + 2] * a // 255
+        size = w * h * 4
+        addr = M_.alloc(max(size, 1), MEM_READ | MEM_WRITE, tag="dibsection")
+        bm = _GBitmap(w, h, 32)
+        bm.dib = _DibSec(addr, w, h, 32, True, [], None, True)
+        bm.dib.hdr = struct.pack("<IiiHHIIiiII", 40, w, -h, 1, 32, 0, size, 0, 0, 0, 0)
+        bm.surf.px[:] = px
+        bm.has_alpha = True
+        M_.write(addr, bytes(px))
+        bm.dib.last = bytes(px)
+        return gdi.add(bm)
+
+    @reg("GdipCreateHBITMAPFromBitmap", "ppu")
+    def _chbfb(c, h, phbm, bg):
+        im = get(h, "image")
+        if im is None or not phbm:
+            return GP_INVALID
+        ext_pull(im)
+        put_ptr(phbm, make_hbitmap(im, bg))
+        return GP_OK
+
+    @reg("GdipCreateHICONFromBitmap", "pp")
+    def _chifb(c, h, phicon):
+        im = get(h, "image")
+        if im is None or not phicon:
+            return GP_INVALID
+        ext_pull(im)
+        ic = _GIcon(im.w, im.h)
+        ic.color.px[:] = im.surf.px
+        ic.color.px[3::4] = bytes(im.w * im.h)
+        ic.alpha = bytearray(im.surf.px[3::4])
+        ic.mask = bytearray(1 if a == 0 else 0 for a in ic.alpha)
+        put_ptr(phicon, gdi.add(ic))
+        return GP_OK
+
+    def clone_image(im, x=0, y=0, w=None, h=None, fmt=None):
+        ext_pull(im)
+        w = im.w if w is None else w
+        h = im.h if h is None else h
+        n = _GpImage(w, h, fmt or im.fmt, im.raw)
+        n.dpi = im.dpi
+        n.palette = list(im.palette) if im.palette else None
+        sw = im.w
+        for j in range(h):
+            yy = y + j
+            if 0 <= yy < im.h:
+                x0, x1 = max(0, x), min(sw, x + w)
+                if x1 > x0:
+                    n.surf.px[(j * w + x0 - x) * 4:(j * w + x1 - x) * 4] = \
+                        im.surf.px[(yy * sw + x0) * 4:(yy * sw + x1) * 4]
+        if (x, y, w, h) == (0, 0, im.w, im.h) and im.frames:
+            n.frames = list(im.frames)
+            n.frame = im.frame
+        return n
+
+    @reg("GdipCloneImage", "pp")
+    def _cloneimg(c, h, pp):
+        im = get(h, "image")
+        if im is None:
+            return GP_INVALID
+        return out_image(pp, clone_image(im))
+
+    @reg("GdipCloneBitmapArea", "ffffupp")
+    def _cba(c, x, y, w, h, fmt, src, pp):
+        im = get(src, "image")
+        if im is None:
+            return GP_INVALID
+        return out_image(pp, clone_image(im, int(x), int(y), int(w), int(h), fmt))
+
+    @reg("GdipCloneBitmapAreaI", "iiiiupp")
+    def _cbai(c, x, y, w, h, fmt, src, pp):
+        im = get(src, "image")
+        if im is None or w <= 0 or h <= 0:
+            return GP_INVALID
+        return out_image(pp, clone_image(im, x, y, w, h, fmt))
+
+    @reg("GdipDisposeImage", "p")
+    def _dispose(c, h):
+        return free_handle(h) if get(h, "image") is not None else GP_INVALID
+
+    @reg("GdipGetImageWidth", "pp")
+    def _giw(c, h, pw):
+        im = get(h, "image")
+        if im is None or not pw:
+            return GP_INVALID
+        put_u(pw, im.w)
+        return GP_OK
+
+    @reg("GdipGetImageHeight", "pp")
+    def _gih(c, h, ph):
+        im = get(h, "image")
+        if im is None or not ph:
+            return GP_INVALID
+        put_u(ph, im.h)
+        return GP_OK
+
+    @reg("GdipGetImageDimension", "ppp")
+    def _gidim(c, h, pw, ph):
+        im = get(h, "image")
+        if im is None:
+            return GP_INVALID
+        put_f(pw, float(im.w))
+        put_f(ph, float(im.h))
+        return GP_OK
+
+    @reg("GdipGetImageBounds", "ppp")
+    def _gib(c, h, prect, punit):
+        im = get(h, "image")
+        if im is None:
+            return GP_INVALID
+        put_f(prect, 0.0, 0.0, float(im.w), float(im.h))
+        put_u(punit, 2)                                         # UnitPixel
+        return GP_OK
+
+    @reg("GdipGetImagePixelFormat", "pp")
+    def _gipf(c, h, pf):
+        im = get(h, "image")
+        if im is None:
+            return GP_INVALID
+        put_u(pf, im.fmt)
+        return GP_OK
+
+    @reg("GdipGetImageType", "pp")
+    def _git(c, h, pt):
+        im = get(h, "image")
+        if im is None:
+            return GP_INVALID
+        put_u(pt, 1)                                            # ImageTypeBitmap
+        return GP_OK
+
+    @reg("GdipGetImageFlags", "pp")
+    def _gif(c, h, pf):
+        im = get(h, "image")
+        if im is None:
+            return GP_INVALID
+        f = 0x10 | 0x1000                                       # ColorSpaceRGB | HasRealDPI
+        if im.fmt & 0x40000:                                    # PixelFormatAlpha
+            f |= 2
+        if im.raw != IMGFMT_MEMBMP:
+            f |= 0x10000 | 0x2000                               # ReadOnly | HasRealPixelSize
+        put_u(pf, f | im.flags_extra)
+        return GP_OK
+
+    @reg("GdipGetImageRawFormat", "pp")
+    def _girf(c, h, pg):
+        im = get(h, "image")
+        if im is None or not pg:
+            return GP_INVALID
+        M_.write(pg, im.raw)
+        return GP_OK
+
+    reg("GdipGetImageHorizontalResolution", "pp")(
+        lambda c, h, pr: (put_f(pr, get(h, "image").dpi[0]), GP_OK)[1]
+        if get(h, "image") is not None else GP_INVALID)
+    reg("GdipGetImageVerticalResolution", "pp")(
+        lambda c, h, pr: (put_f(pr, get(h, "image").dpi[1]), GP_OK)[1]
+        if get(h, "image") is not None else GP_INVALID)
+
+    @reg("GdipBitmapSetResolution", "pff")
+    def _bsr(c, h, dx, dy):
+        im = get(h, "image")
+        if im is None or dx <= 0 or dy <= 0:
+            return GP_INVALID
+        im.dpi = (dx, dy)
+        return GP_OK
+
+    @reg("GdipGetImagePaletteSize", "pp")
+    def _gips(c, h, pn):
+        im = get(h, "image")
+        if im is None:
+            return GP_INVALID
+        put_u(pn, 8 + 4 * len(im.palette or []))
+        return GP_OK
+
+    @reg("GdipGetImagePalette", "ppi")
+    def _gipal(c, h, buf, n):
+        im = get(h, "image")
+        if im is None:
+            return GP_INVALID
+        pal = im.palette or []
+        if n < 8 + 4 * len(pal):
+            return GP_INVALID
+        M_.write(buf, struct.pack("<II", 0, len(pal)) + b"".join(struct.pack("<I", v)
+                                                                  for v in pal))
+        return GP_OK
+
+    @reg("GdipSetImagePalette", "pp")
+    def _sipal(c, h, buf):
+        im = get(h, "image")
+        if im is None or not buf:
+            return GP_INVALID
+        _fl, n = struct.unpack("<II", M_.read(buf, 8))
+        im.palette = list(struct.unpack("<%dI" % n, M_.read(buf + 8, 4 * n))) if n else []
+        ext_pull(im)
+        return GP_OK
+
+    @reg("GdipBitmapGetPixel", "piip")
+    def _bgp(c, h, x, y, pc):
+        im = get(h, "image")
+        if im is None or not (0 <= x < im.w and 0 <= y < im.h):
+            return GP_INVALID
+        ext_pull(im)
+        o = (y * im.w + x) * 4
+        put_u(pc, struct.unpack_from("<I", im.surf.px, o)[0])
+        return GP_OK
+
+    @reg("GdipBitmapSetPixel", "piiu")
+    def _bsp(c, h, x, y, col):
+        im = get(h, "image")
+        if im is None or not (0 <= x < im.w and 0 <= y < im.h):
+            return GP_INVALID
+        ext_pull(im)
+        o = (y * im.w + x) * 4
+        if not im.fmt & 0x40000:
+            col |= 0xFF000000
+        im.surf.px[o:o + 4] = struct.pack("<I", col & 0xFFFFFFFF)
+        im.surf.rev += 1
+        ext_push(im)
+        return GP_OK
+
+    @reg("GdipBitmapLockBits", "ppuup")
+    def _blb(c, h, prect, mode, fmt, bd):
+        im = get(h, "image")
+        if im is None or not bd:
+            return GP_INVALID
+        if im.locked is not None:
+            return GP_WRONGSTATE
+        ext_pull(im)
+        if prect:
+            x, y, w, hh = rd_i(prect, 4)
+        else:
+            x, y, w, hh = 0, 0, im.w, im.h
+        if w <= 0 or hh <= 0 or x < 0 or y < 0 or x + w > im.w or y + hh > im.h:
+            return GP_INVALID
+        if fmt == 0:
+            fmt = im.fmt
+        rowb = (w * fmt_bpp(fmt) + 7) // 8
+        if mode & 4:                                            # ImageLockModeUserInputBuf
+            stride = _s32(M_.read32(bd + 8))
+            buf = rd_ptr(bd + 16)
+            own = False
+        else:
+            stride = (rowb + 3) & ~3
+            buf = p.heap_alloc(p.process_heap_handle, stride * hh + 4)
+            own = True
+        if mode & 1 or not mode & 2:                            # read (or read/write)
+            for j in range(hh):
+                src = im.surf.px[((y + j) * im.w + x) * 4:((y + j) * im.w + x + w) * 4]
+                M_.write(buf + j * stride, to_fmt(src, w, fmt, im.palette))
+        M_.write(bd, struct.pack("<IIiI", w, hh, stride, fmt))
+        put_ptr(bd + 16, buf)
+        im.locked = (x, y, w, hh, mode, fmt, buf, stride, own)
+        return GP_OK
+
+    @reg("GdipBitmapUnlockBits", "pp")
+    def _bub(c, h, bd):
+        im = get(h, "image")
+        if im is None or im.locked is None:
+            return GP_WRONGSTATE if im is not None else GP_INVALID
+        x, y, w, hh, mode, fmt, buf, stride, own = im.locked
+        im.locked = None
+        if mode & 2:
+            rowb = (w * fmt_bpp(fmt) + 7) // 8
+            for j in range(hh):
+                row = bytes(M_.read(buf + j * stride, rowb))
+                o = ((y + j) * im.w + x) * 4
+                im.surf.px[o:o + w * 4] = from_fmt(row, w, fmt, im.palette)
+            im.surf.rev += 1
+            ext_push(im)
+        if own:
+            p.heap_free(p.process_heap_handle, buf)
+        return GP_OK
+
+    @reg("GdipImageRotateFlip", "pu")
+    def _irf(c, h, how):
+        im = get(h, "image")
+        if im is None:
+            return GP_INVALID
+        ext_pull(im)
+        w, hh = im.w, im.h
+        src = bytes(im.surf.px)
+        rot = how & 3
+        flipx = bool(how & 4)
+        nw, nh = (hh, w) if rot in (1, 3) else (w, hh)
+        out = bytearray(nw * nh * 4)
+        for y in range(hh):
+            for x in range(w):
+                if rot == 0:
+                    nx, ny = x, y
+                elif rot == 1:
+                    nx, ny = hh - 1 - y, x
+                elif rot == 2:
+                    nx, ny = w - 1 - x, hh - 1 - y
+                else:
+                    nx, ny = y, w - 1 - x
+                if flipx:
+                    nx = nw - 1 - nx
+                o = (y * w + x) * 4
+                d = (ny * nw + nx) * 4
+                out[d:d + 4] = src[o:o + 4]
+        im.surf.w, im.surf.h, im.surf.px = nw, nh, out
+        im.surf.rev += 1
+        ext_push(im)
+        return GP_OK
+
+    @reg("GdipGetImageThumbnail", "puuppp")
+    def _gith(c, h, tw, th, pp, cb, cbdata):
+        im = get(h, "image")
+        if im is None:
+            return GP_INVALID
+        tw, th = tw or 120, th or 120
+        n = _GpImage(tw, th, PF_32PARGB)
+        scale_into(im, n, 0, 0, tw, th)
+        return out_image(pp, n)
+
+    def scale_into(src, dst, dx, dy, dw, dh):
+        sw, sh = src.w, src.h
+        for j in range(dh):
+            sy = min(sh - 1, j * sh // dh)
+            for i in range(dw):
+                sx = min(sw - 1, i * sw // dw)
+                o = (sy * sw + sx) * 4
+                d = ((dy + j) * dst.w + dx + i) * 4
+                dst.surf.px[d:d + 4] = src.surf.px[o:o + 4]
+
+    # frames (animated GIF) and properties
+    @reg("GdipImageGetFrameDimensionsCount", "pp")
+    def _igfdc(c, h, pn):
+        if get(h, "image") is None:
+            return GP_INVALID
+        put_u(pn, 1)
+        return GP_OK
+
+    @reg("GdipImageGetFrameDimensionsList", "ppu")
+    def _igfdl(c, h, buf, n):
+        im = get(h, "image")
+        if im is None or n < 1:
+            return GP_INVALID
+        M_.write(buf, FRAMEDIM_TIME if im.raw == IMGFMT_GIF else FRAMEDIM_PAGE)
+        return GP_OK
+
+    @reg("GdipImageGetFrameCount", "ppp")
+    def _igfc(c, h, dim, pn):
+        im = get(h, "image")
+        if im is None:
+            return GP_INVALID
+        put_u(pn, len(im.frames) if im.frames else 1)
+        return GP_OK
+
+    @reg("GdipImageSelectActiveFrame", "ppu")
+    def _isaf(c, h, dim, idx):
+        im = get(h, "image")
+        if im is None:
+            return GP_INVALID
+        n = len(im.frames) if im.frames else 1
+        if idx >= n:
+            return GP_INVALID
+        if im.frames:
+            im.frame = idx
+            im.surf.px[:] = im.frames[idx][0]
+            im.surf.rev += 1
+        return GP_OK
+
+    def prop_item(im, pid):
+        """-> (type, value bytes) or None."""
+        if im.frames and pid == 0x5100:                          # PropertyTagFrameDelay
+            return 4, b"".join(struct.pack("<I", d) for (_px, d) in im.frames)
+        if im.frames and pid == 0x5101:                          # PropertyTagLoopCount
+            return 3, struct.pack("<H", 0)
+        return None
+
+    @reg("GdipGetPropertyCount", "pp")
+    def _gpc(c, h, pn):
+        im = get(h, "image")
+        if im is None:
+            return GP_INVALID
+        put_u(pn, 2 if im.frames else 0)
+        return GP_OK
+
+    @reg("GdipGetPropertyIdList", "pup")
+    def _gpil(c, h, n, buf):
+        im = get(h, "image")
+        if im is None:
+            return GP_INVALID
+        ids = [0x5100, 0x5101] if im.frames else []
+        if n != len(ids):
+            return GP_INVALID
+        if ids:
+            M_.write(buf, struct.pack("<%dI" % len(ids), *ids))
+        return GP_OK
+
+    @reg("GdipGetPropertyItemSize", "pup")
+    def _gpis(c, h, pid, pn):
+        im = get(h, "image")
+        if im is None:
+            return GP_INVALID
+        it = prop_item(im, pid)
+        if it is None:
+            return GP_PROPNOTFOUND
+        put_u(pn, (24 if P() == 8 else 16) + len(it[1]))
+        return GP_OK
+
+    @reg("GdipGetPropertyItem", "puup")
+    def _gpi(c, h, pid, size, buf):
+        im = get(h, "image")
+        if im is None:
+            return GP_INVALID
+        it = prop_item(im, pid)
+        if it is None:
+            return GP_PROPNOTFOUND
+        hs = 24 if P() == 8 else 16
+        if size < hs + len(it[1]):
+            return GP_INVALID
+        M_.write(buf, struct.pack("<IIH", pid, len(it[1]), it[0]))
+        put_ptr(buf + hs - P(), buf + hs)
+        M_.write(buf + hs, it[1])
+        return GP_OK
+
+    @reg("GdipGetPropertySize", "ppp")
+    def _gps(c, h, ptotal, pn):
+        put_u(ptotal, 0)
+        put_u(pn, 0)
+        return GP_OK if get(h, "image") is not None else GP_INVALID
+
+    reg("GdipRemovePropertyItem GdipSetPropertyItem", "pp")(lambda c, h, x: GP_OK)
+
+    # ---- encoders ---------------------------------------------------------------------------
+    def codec_list(enc):
+        return [cd for cd in _GP_CODECS if cd[5] or not enc]
+
+    def codec_blob(enc):
+        lst = codec_list(enc)
+        ps_ = P()
+        ssize = 104 if ps_ == 8 else 76
+        strs = []
+        for (cl, fg, name, ext, mime, _can) in lst:
+            strs.append([s.encode("utf-16-le") + b"\0\0" for s in
+                         (name, "gdiplus.dll", name.split()[1], ext, mime)])
+        total = ssize * len(lst) + sum(len(b) for s in strs for b in s)
+        return lst, strs, ssize, total
+
+    for enc in (True, False):
+        tag = "Encoders" if enc else "Decoders"
+
+        def _gies(c, pn, psize, _e=enc):
+            lst, _s, _ss, total = codec_blob(_e)
+            put_u(pn, len(lst))
+            put_u(psize, total)
+            return GP_OK
+        reg("GdipGetImage%sSize" % tag, "pp")(_gies)
+
+        def _gie(c, n, size, buf, _e=enc):
+            lst, strs, ssize, total = codec_blob(_e)
+            if n != len(lst) or size < total or not buf:
+                return GP_GENERIC
+            ps_ = P()
+            sp = buf + ssize * len(lst)
+            for i, (cl, fg, name, ext, mime, can) in enumerate(lst):
+                base = buf + i * ssize
+                M_.write(base, cl + fg)
+                ptrs = []
+                for b in strs[i]:
+                    M_.write(sp, b)
+                    ptrs.append(sp)
+                    sp += len(b)
+                for j, a in enumerate(ptrs):
+                    put_ptr(base + 32 + j * ps_, a)
+                o = base + 32 + 5 * ps_
+                M_.write(o, struct.pack("<IIII", (1 if can else 0) | 2 | 0x10000, 1, 0, 0))
+                put_ptr(o + 16, 0)
+                put_ptr(o + 16 + ps_, 0)
+            return GP_OK
+        reg("GdipGetImage%s" % tag, "uup")(_gie)
+
+    @reg("GdipGetEncoderParameterListSize", "ppp")
+    def _geps(c, h, clsid, pn):
+        put_u(pn, 0)
+        return GP_NOTIMPL
+
+    reg("GdipGetEncoderParameterList", "ppup")(lambda c, h, cl, n, buf: GP_NOTIMPL)
+
+    @reg("GdipSaveImageToFile", "pppp")
+    def _sitf(c, h, path, clsid, params):
+        im = get(h, "image")
+        if im is None or not path or not clsid:
+            return GP_INVALID
+        ext_pull(im)
+        data = encode(im, bytes(M_.read(clsid, 16)))
+        if data is None:
+            return GP_UNKNOWNFMT
+        try:
+            with open(p.vfs.resolve(k.ws_(path), for_write=True), "wb") as fh:
+                fh.write(data)
+        except Exception:
+            return GP_WIN32
+        return GP_OK
+
+    @reg("GdipSaveImageToStream", "pppp")
+    def _sits(c, h, stream, clsid, params):
+        im = get(h, "image")
+        if im is None or not stream or not clsid:
+            return GP_INVALID
+        ext_pull(im)
+        data = encode(im, bytes(M_.read(clsid, 16)))
+        if data is None:
+            return GP_UNKNOWNFMT
+        p.stream_write(stream, data)
+        return GP_OK
+
+    reg("GdipSaveAdd GdipSaveAddImage", "pp")(lambda c, h, x: GP_NOTIMPL)
+
+    # ---- matrices ---------------------------------------------------------------------------
+    def mat(h):
+        o = get(h, "matrix")
+        return o
+
+    def new_mat(m):
+        return new_handle(_Obj("matrix", m=tuple(float(v) for v in m)))
+
+    @reg("GdipCreateMatrix", "p")
+    def _cm(c, pp):
+        put_ptr(pp, new_mat((1, 0, 0, 1, 0, 0)))
+        return GP_OK
+
+    @reg("GdipCreateMatrix2", "ffffffp")
+    def _cm2(c, a, b, cc, d, e, f, pp):
+        put_ptr(pp, new_mat((a, b, cc, d, e, f)))
+        return GP_OK
+
+    def _rect_to_pts(r, pts):
+        x, y, w, h = r
+        (x1, y1), (x2, y2), (x3, y3) = pts
+        if not w or not h:
+            return None
+        m11, m12 = (x2 - x1) / w, (y2 - y1) / w
+        m21, m22 = (x3 - x1) / h, (y3 - y1) / h
+        return (m11, m12, m21, m22, x1 - x * m11 - y * m21, y1 - x * m12 - y * m22)
+
+    @reg("GdipCreateMatrix3", "ppp")
+    def _cm3(c, prect, ppts, pp):
+        m = _rect_to_pts(rd_f(prect, 4), [rd_f(ppts + 8 * i, 2) for i in range(3)])
+        if m is None:
+            return GP_INVALID
+        put_ptr(pp, new_mat(m))
+        return GP_OK
+
+    @reg("GdipCreateMatrix3I", "ppp")
+    def _cm3i(c, prect, ppts, pp):
+        m = _rect_to_pts(rd_i(prect, 4), [rd_i(ppts + 8 * i, 2) for i in range(3)])
+        if m is None:
+            return GP_INVALID
+        put_ptr(pp, new_mat(m))
+        return GP_OK
+
+    @reg("GdipCloneMatrix", "pp")
+    def _clm(c, h, pp):
+        o = mat(h)
+        if o is None:
+            return GP_INVALID
+        put_ptr(pp, new_mat(o.m))
+        return GP_OK
+
+    reg("GdipDeleteMatrix", "p")(lambda c, h: free_handle(h) if mat(h) else GP_INVALID)
+
+    @reg("GdipSetMatrixElements", "pffffff")
+    def _sme(c, h, a, b, cc, d, e, f):
+        o = mat(h)
+        if o is None:
+            return GP_INVALID
+        o.m = (a, b, cc, d, e, f)
+        return GP_OK
+
+    @reg("GdipGetMatrixElements", "pp")
+    def _gme(c, h, buf):
+        o = mat(h)
+        if o is None or not buf:
+            return GP_INVALID
+        put_f(buf, *o.m)
+        return GP_OK
+
+    def _compose(cur, op, order):
+        return _gp_mat_mul(op, cur) if order == 0 else _gp_mat_mul(cur, op)   # 0 = Prepend
+
+    def _tr_op(dx, dy):
+        return (1.0, 0.0, 0.0, 1.0, dx, dy)
+
+    def _sc_op(sx, sy):
+        return (sx, 0.0, 0.0, sy, 0.0, 0.0)
+
+    def _rot_op(deg):
+        a = math.radians(deg)
+        cs, sn = math.cos(a), math.sin(a)
+        return (cs, sn, -sn, cs, 0.0, 0.0)
+
+    @reg("GdipTranslateMatrix", "pffi")
+    def _tm(c, h, dx, dy, order):
+        o = mat(h)
+        if o is None:
+            return GP_INVALID
+        o.m = _compose(o.m, _tr_op(dx, dy), order)
+        return GP_OK
+
+    @reg("GdipScaleMatrix", "pffi")
+    def _smx(c, h, sx, sy, order):
+        o = mat(h)
+        if o is None:
+            return GP_INVALID
+        o.m = _compose(o.m, _sc_op(sx, sy), order)
+        return GP_OK
+
+    @reg("GdipRotateMatrix", "pfi")
+    def _rm(c, h, deg, order):
+        o = mat(h)
+        if o is None:
+            return GP_INVALID
+        o.m = _compose(o.m, _rot_op(deg), order)
+        return GP_OK
+
+    @reg("GdipShearMatrix", "pffi")
+    def _shm(c, h, sx, sy, order):
+        o = mat(h)
+        if o is None:
+            return GP_INVALID
+        o.m = _compose(o.m, (1.0, sy, sx, 1.0, 0.0, 0.0), order)
+        return GP_OK
+
+    @reg("GdipMultiplyMatrix", "ppi")
+    def _mm(c, h, h2, order):
+        o, o2 = mat(h), mat(h2)
+        if o is None or o2 is None:
+            return GP_INVALID
+        o.m = _compose(o.m, o2.m, order)
+        return GP_OK
+
+    @reg("GdipInvertMatrix", "p")
+    def _im(c, h):
+        o = mat(h)
+        if o is None:
+            return GP_INVALID
+        inv = _gp_mat_inv(o.m)
+        if inv is None:
+            return GP_INVALID
+        o.m = inv
+        return GP_OK
+
+    for nm, fl in (("GdipTransformMatrixPoints", True), ("GdipTransformMatrixPointsI", False),
+                   ("GdipVectorTransformMatrixPoints", True),
+                   ("GdipVectorTransformMatrixPointsI", False)):
+        def _tmp(c, h, pts, n, _f=fl, _vec=nm.startswith("GdipVector")):
+            o = mat(h)
+            if o is None or not pts or n <= 0:
+                return GP_INVALID
+            m = o.m if not _vec else (o.m[0], o.m[1], o.m[2], o.m[3], 0.0, 0.0)
+            for i in range(n):
+                if _f:
+                    x, y = rd_f(pts + 8 * i, 2)
+                    put_f(pts + 8 * i, *_gp_apply(m, x, y))
+                else:
+                    x, y = rd_i(pts + 8 * i, 2)
+                    nx, ny = _gp_apply(m, x, y)
+                    M_.write(pts + 8 * i, struct.pack("<ii", int(round(nx)), int(round(ny))))
+            return GP_OK
+        reg(nm, "ppi")(_tmp)
+
+    @reg("GdipIsMatrixIdentity", "pp")
+    def _imi(c, h, pb):
+        o = mat(h)
+        if o is None:
+            return GP_INVALID
+        put_u(pb, 1 if o.m == (1.0, 0.0, 0.0, 1.0, 0.0, 0.0) else 0)
+        return GP_OK
+
+    @reg("GdipIsMatrixInvertible", "pp")
+    def _imiv(c, h, pb):
+        o = mat(h)
+        if o is None:
+            return GP_INVALID
+        put_u(pb, 1 if _gp_mat_inv(o.m) is not None else 0)
+        return GP_OK
+
+    @reg("GdipIsMatrixEqual", "ppp")
+    def _ime(c, h, h2, pb):
+        o, o2 = mat(h), mat(h2)
+        if o is None or o2 is None:
+            return GP_INVALID
+        put_u(pb, 1 if all(abs(a - b) < 1e-5 for a, b in zip(o.m, o2.m)) else 0)
+        return GP_OK
+
+    p._gdip = {"objs": objs, "get": get, "new_handle": new_handle, "decode": decode,
+               "ext_pull": ext_pull, "ext_push": ext_push, "_Obj": _Obj, "reg": reg,
+               "put_ptr": put_ptr, "put_f": put_f, "put_u": put_u, "rd_f": rd_f, "rd_i": rd_i,
+               "rd_ptr": rd_ptr, "free_handle": free_handle, "new_mat": new_mat, "mat": mat,
+               "compose": _compose, "tr_op": _tr_op, "sc_op": _sc_op, "rot_op": _rot_op,
+               "out_image": out_image, "clone_image": clone_image, "make_hbitmap": make_hbitmap,
+               "has_alpha": has_alpha, "icon_image": icon_image}
+    _gdiplus_draw_install(k)
+
+
+# ==========================================================================================
+# 10u. GDI+ drawing: Graphics objects, brushes, pens, paths, regions, fonts / text, image
+#      attributes and DrawImage
+# ==========================================================================================
+_GP_INF = [(-(1 << 22), -(1 << 22), 1 << 22, 1 << 22)]
+_GP_UNIT = {0: 1.0, 1: 1.0, 2: 1.0, 3: 96.0 / 72, 4: 96.0, 5: 96.0 / 300, 6: 96.0 / 25.4}
+_GP_FAMILIES = {"sans": "Microsoft Sans Serif", "serif": "Times New Roman",
+                "mono": "Courier New"}
+
+
+def _gp_rect_ops(a, b, mode):
+    """Combine two rect lists (None = infinite)."""
+    if mode == 0:
+        return None if b is None else list(b)
+    A = _GP_INF if a is None else a
+    B = _GP_INF if b is None else b
+    if mode == 1:
+        return _rects_and(A, B)
+    if mode == 2:
+        return None if a is None or b is None else _rects_or(A, B)
+    if mode == 4:
+        out = list(A)
+        for r in B:
+            out = _rects_sub(out, r)
+        return out
+    if mode == 5:
+        out = list(B)
+        for r in A:
+            out = _rects_sub(out, r)
+        return out
+    if mode == 3:
+        x = list(A)
+        for r in B:
+            x = _rects_sub(x, r)
+        y = list(B)
+        for r in A:
+            y = _rects_sub(y, r)
+        return x + y
+    return a
+
+
+def _gdiplus_draw_install(k):
+    p = k.p
+    M_ = p.mem
+    gdi = p.gdi
+    wm = p.wm
+    G = p._gdip
+    get, new_handle, reg = G["get"], G["new_handle"], G["reg"]
+    put_ptr, put_f, put_u, rd_f, rd_i, rd_ptr = (G["put_ptr"], G["put_f"], G["put_u"], G["rd_f"],
+                                                 G["rd_i"], G["rd_ptr"])
+    free_handle, _Obj, ext_pull, ext_push = G["free_handle"], G["_Obj"], G["ext_pull"], \
+        G["ext_push"]
+    mat, compose, tr_op, sc_op, rot_op = G["mat"], G["compose"], G["tr_op"], G["sc_op"], \
+        G["rot_op"]
+
+    def P():
+        return 8 if p.cpu_mode == 64 else 4
+
+    def argb(v):
+        v &= 0xFFFFFFFF
+        return (v & 255, (v >> 8) & 255, (v >> 16) & 255, (v >> 24) & 255)
+
+    def G_(h):
+        return get(h, "graphics")
+
+    # ---- targets ------------------------------------------------------------------------------
+    class _T:
+        pass
+
+    def page_factor(g):
+        return _GP_UNIT.get(g.unit, 1.0) * (g.scale or 1.0)
+
+    def dev_matrix(g, T=None):
+        f = page_factor(g)
+        m = _gp_mat_mul(g.m, (f, 0.0, 0.0, f, 0.0, 0.0))
+        if T is not None:
+            m = (m[0], m[1], m[2], m[3], m[4] + T.ox, m[5] + T.oy)
+        return m
+
+    def begin(g):
+        T = _T()
+        if g.img is not None:
+            im = g.img
+            ext_pull(im)
+            T.surf = im.surf
+            T.ox = T.oy = 0
+            T.clip = [(0, 0, im.w, im.h)]
+            T.mode = "img"
+            T.im = im
+
+            def fin():
+                im.surf.rev += 1
+                ext_push(im)
+            T.fin = fin
+        else:
+            dc = gdi.get(g.hdc, "dc")
+            if dc is None:
+                return None
+            t = gdi.begin(dc)
+            surf, ox, oy, vis, bm = t
+            dx, dy = dc.lp2dp(0, 0)
+            T.surf = surf
+            T.ox, T.oy = ox + dx, oy + dy
+            T.clip = list(vis)
+            T.mode = "dib" if bm is not None and bm.bpp == 32 and \
+                (bm.dib is not None or getattr(bm, "has_alpha", False)) else "plain"
+            T.fin = lambda: gdi.end(dc, t)
+        if g.clip is not None:
+            T.clip = _rects_and(T.clip, [(l + T.ox, t_ + T.oy, r + T.ox, b + T.oy)
+                                         for (l, t_, r, b) in g.clip])
+        T.copy = g.comp_mode == 1
+        return T
+
+    def run_solid(T, y, a0, a1, col):
+        px = T.surf.px
+        b, g_, r, a = col
+        o = (y * T.surf.w + a0) * 4
+        n = a1 - a0
+        if a == 255 or T.copy:
+            A = a if T.mode == "img" else (255 if T.mode == "dib" else 0)
+            px[o:o + n * 4] = bytes((b, g_, r, A)) * n
+            return
+        if a == 0:
+            return
+        inv = 255 - a
+        if T.mode == "img":
+            for i in range(o, o + n * 4, 4):
+                da = px[i + 3]
+                if da == 0:
+                    px[i:i + 4] = bytes((b, g_, r, a))
+                    continue
+                dw = da * inv // 255
+                oa = a + dw
+                px[i] = (b * a + px[i] * dw) // oa
+                px[i + 1] = (g_ * a + px[i + 1] * dw) // oa
+                px[i + 2] = (r * a + px[i + 2] * dw) // oa
+                px[i + 3] = oa
+        else:
+            ba, ga, ra = b * a, g_ * a, r * a
+            for i in range(o, o + n * 4, 4):
+                px[i] = (ba + px[i] * inv) // 255
+                px[i + 1] = (ga + px[i + 1] * inv) // 255
+                px[i + 2] = (ra + px[i + 2] * inv) // 255
+                if T.mode == "dib":
+                    px[i + 3] = a + px[i + 3] * inv // 255
+
+    def blend1(T, i, col):
+        px = T.surf.px
+        b, g_, r, a = col
+        if a == 255 or T.copy:
+            px[i:i + 4] = bytes((b, g_, r, a if T.mode == "img" else
+                                 (255 if T.mode == "dib" else 0)))
+            return
+        if a == 0:
+            return
+        inv = 255 - a
+        if T.mode == "img":
+            da = px[i + 3]
+            if da == 0:
+                px[i:i + 4] = bytes((b, g_, r, a))
+                return
+            dw = da * inv // 255
+            oa = a + dw
+            px[i] = (b * a + px[i] * dw) // oa
+            px[i + 1] = (g_ * a + px[i + 1] * dw) // oa
+            px[i + 2] = (r * a + px[i + 2] * dw) // oa
+            px[i + 3] = oa
+        else:
+            px[i] = (b * a + px[i] * inv) // 255
+            px[i + 1] = (g_ * a + px[i + 1] * inv) // 255
+            px[i + 2] = (r * a + px[i + 2] * inv) // 255
+            if T.mode == "dib":
+                px[i + 3] = a + px[i + 3] * inv // 255
+
+    def fill_spans(T, spans, paint):
+        W_, H_ = T.surf.w, T.surf.h
+        solid = paint if isinstance(paint, tuple) else None
+        if solid is not None and solid[3] == 0 and not T.copy:
+            return
+        for y, lst in spans.items():
+            if y < 0 or y >= H_:
+                continue
+            rows = [(cl, cr) for (cl, ct, cr, cb) in T.clip if ct <= y < cb]
+            if not rows:
+                continue
+            for (x0, x1) in lst:
+                for (cl, cr) in rows:
+                    a0, a1 = max(x0, cl, 0), min(x1, cr, W_)
+                    if a0 >= a1:
+                        continue
+                    if solid is not None:
+                        run_solid(T, y, a0, a1, solid)
+                    else:
+                        base = y * W_ * 4
+                        yc = y + 0.5
+                        for x in range(a0, a1):
+                            blend1(T, base + x * 4, paint(x + 0.5, yc))
+
+    # ---- brushes ------------------------------------------------------------------------------
+    def lerp_col(c1, c2, t):
+        return tuple(int(c1[i] + (c2[i] - c1[i]) * t + 0.5) for i in range(4))
+
+    def wrap_t(t, mode):
+        if mode == 4:                                            # WrapModeClamp
+            return min(1.0, max(0.0, t))
+        if mode in (1, 3):                                       # flip
+            t = t % 2.0
+            return 2.0 - t if t > 1.0 else t
+        return t % 1.0
+
+    def blend_color(br, t):
+        pre = getattr(br, "preset", None)
+        if pre:
+            if t <= pre[0][0]:
+                return pre[0][1]
+            for i in range(1, len(pre)):
+                if t <= pre[i][0]:
+                    p0, c0 = pre[i - 1]
+                    p1, c1 = pre[i]
+                    return lerp_col(c0, c1, (t - p0) / (p1 - p0) if p1 > p0 else 0)
+            return pre[-1][1]
+        bl = getattr(br, "blend", None)
+        f = t
+        if bl:
+            f = bl[-1][1]
+            for i in range(1, len(bl)):
+                if t <= bl[i][0]:
+                    p0, f0 = bl[i - 1]
+                    p1, f1 = bl[i]
+                    f = f0 + (f1 - f0) * ((t - p0) / (p1 - p0) if p1 > p0 else 0)
+                    break
+        return lerp_col(br.c1, br.c2, f)
+
+    def brush_paint(br, inv, T):
+        """-> tuple (solid) or sampler(sx, sy) in surface coordinates."""
+        if br.kind == "brush_solid":
+            return br.col
+        if br.kind == "brush_hatch":
+            pat = _GP_HATCH.get(br.style)
+            fore, back = br.fore, br.back
+            if pat is None:
+                dens = max(1, min(15, (br.style - 5))) if 6 <= br.style <= 17 else 8
+                pat = [sum(1 << (7 - x) for x in range(8) if ((x * 5 + y * 3) % 16) < dens)
+                       for y in range(8)]
+
+            def hs(sx, sy, _p=pat, _o=(T.ox, T.oy)):
+                x, y = int(sx - _o[0]) & 7, int(sy - _o[1]) & 7
+                return fore if (_p[y] >> (7 - x)) & 1 else back
+            return hs
+        if br.kind == "brush_linear":
+            (x1, y1), (x2, y2) = br.p1, br.p2
+            dx, dy = x2 - x1, y2 - y1
+            dd = dx * dx + dy * dy or 1.0
+            bm = _gp_mat_inv(br.m) if getattr(br, "m", None) else None
+
+            def ls(sx, sy):
+                wx, wy = _gp_apply(inv, sx, sy) if inv else (sx, sy)
+                if bm is not None:
+                    wx, wy = _gp_apply(bm, wx, wy)
+                t = ((wx - x1) * dx + (wy - y1) * dy) / dd
+                return blend_color(br, wrap_t(t, br.wrap))
+            if br.c1 == br.c2 and not getattr(br, "preset", None):
+                return br.c1
+            return ls
+        if br.kind == "brush_texture":
+            im = br.img
+            ext_pull(im)
+            sw, sh = im.w, im.h
+            px = im.surf.px
+            bm = _gp_mat_inv(br.m) if br.m != (1.0, 0.0, 0.0, 1.0, 0.0, 0.0) else None
+
+            def ts(sx, sy):
+                wx, wy = _gp_apply(inv, sx, sy) if inv else (sx, sy)
+                if bm is not None:
+                    wx, wy = _gp_apply(bm, wx, wy)
+                ix, iy = int(math.floor(wx)), int(math.floor(wy))
+                if br.wrap == 4 and not (0 <= ix < sw and 0 <= iy < sh):
+                    return (0, 0, 0, 0)
+                tx, ty = ix % sw, iy % sh
+                if br.wrap in (1, 3) and (ix // sw) & 1:
+                    tx = sw - 1 - tx
+                if br.wrap in (2, 3) and (iy // sh) & 1:
+                    ty = sh - 1 - ty
+                o = (ty * sw + tx) * 4
+                return (px[o], px[o + 1], px[o + 2], px[o + 3])
+            return ts
+        if br.kind == "brush_path":
+            cx, cy = br.center
+            pts = br.pts
+            n = len(pts)
+            surround = br.surround or [br.cc]
+
+            def ps_(sx, sy):
+                wx, wy = _gp_apply(inv, sx, sy) if inv else (sx, sy)
+                vx, vy = wx - cx, wy - cy
+                best = None
+                for i in range(n):
+                    (ax, ay), (bx, by) = pts[i], pts[(i + 1) % n]
+                    ex, ey = bx - ax, by - ay
+                    den = vx * ey - vy * ex
+                    if abs(den) < 1e-9:
+                        continue
+                    t = ((ax - cx) * ey - (ay - cy) * ex) / den
+                    u = ((ax - cx) * vy - (ay - cy) * vx) / den
+                    if t > 0 and -1e-9 <= u <= 1 + 1e-9 and (best is None or t < best[0]):
+                        best = (t, i, u)
+                if best is None:
+                    return br.cc
+                t, i, u = best
+                f = min(1.0, 1.0 / t) if t else 0.0
+                c_edge = surround[min(i, len(surround) - 1)]
+                if len(surround) > 1:
+                    c_edge = lerp_col(c_edge, surround[min(i + 1, len(surround) - 1)
+                                                       if i + 1 < n else 0], u)
+                return lerp_col(br.cc, c_edge, f)
+            return ps_
+        return (0, 0, 0, 255)
+
+    BRUSHES = ("brush_solid", "brush_hatch", "brush_linear", "brush_texture", "brush_path")
+
+    def B(h):
+        return get(h, BRUSHES)
+
+    @reg("GdipCreateSolidFill", "up")
+    def _csf(c, col, pp):
+        if not pp:
+            return GP_INVALID
+        put_ptr(pp, new_handle(_Obj("brush_solid", col=argb(col))))
+        return GP_OK
+
+    @reg("GdipSetSolidFillColor", "pu")
+    def _ssfc(c, h, col):
+        br = get(h, "brush_solid")
+        if br is None:
+            return GP_INVALID
+        br.col = argb(col)
+        return GP_OK
+
+    @reg("GdipGetSolidFillColor", "pp")
+    def _gsfc(c, h, pc):
+        br = get(h, "brush_solid")
+        if br is None:
+            return GP_INVALID
+        b, g_, r, a = br.col
+        put_u(pc, (a << 24) | (r << 16) | (g_ << 8) | b)
+        return GP_OK
+
+    @reg("GdipCreateHatchBrush", "iuup")
+    def _chb(c, style, fore, back, pp):
+        put_ptr(pp, new_handle(_Obj("brush_hatch", style=style, fore=argb(fore),
+                                    back=argb(back))))
+        return GP_OK
+
+    for nm, getc in (("GdipGetHatchForegroundColor", "fore"),
+                     ("GdipGetHatchBackgroundColor", "back")):
+        def _ghc(c, h, pc, _k=getc):
+            br = get(h, "brush_hatch")
+            if br is None:
+                return GP_INVALID
+            b, g_, r, a = getattr(br, _k)
+            put_u(pc, (a << 24) | (r << 16) | (g_ << 8) | b)
+            return GP_OK
+        reg(nm, "pp")(_ghc)
+
+    reg("GdipGetHatchStyle", "pp")(lambda c, h, ps: (put_u(ps, get(h, "brush_hatch").style),
+                                                      GP_OK)[1] if get(h, "brush_hatch")
+                                   else GP_INVALID)
+
+    def new_linear(p1, p2, c1, c2, wrap, rect=None):
+        if rect is None:
+            x0, y0 = min(p1[0], p2[0]), min(p1[1], p2[1])
+            rect = (x0, y0, abs(p2[0] - p1[0]) or 1.0, abs(p2[1] - p1[1]) or 1.0)
+        return new_handle(_Obj("brush_linear", p1=p1, p2=p2, c1=argb(c1), c2=argb(c2),
+                               wrap=wrap, rect=rect, blend=None, preset=None, m=None,
+                               gamma=False))
+
+    @reg("GdipCreateLineBrush", "ppuuip")
+    def _clb(c, pp1, pp2, c1, c2, wrap, pp):
+        if not pp1 or not pp2 or not pp:
+            return GP_INVALID
+        p1, p2 = rd_f(pp1, 2), rd_f(pp2, 2)
+        if p1 == p2:
+            return 3
+        put_ptr(pp, new_linear(p1, p2, c1, c2, wrap))
+        return GP_OK
+
+    @reg("GdipCreateLineBrushI", "ppuuip")
+    def _clbi(c, pp1, pp2, c1, c2, wrap, pp):
+        if not pp1 or not pp2 or not pp:
+            return GP_INVALID
+        p1 = tuple(float(v) for v in rd_i(pp1, 2))
+        p2 = tuple(float(v) for v in rd_i(pp2, 2))
+        if p1 == p2:
+            return 3
+        put_ptr(pp, new_linear(p1, p2, c1, c2, wrap))
+        return GP_OK
+
+    def rect_linear(r, c1, c2, mode_or_angle, wrap, angle=False):
+        x, y, w, h = r
+        if w <= 0 or h <= 0:
+            return 0
+        if angle:
+            a = math.radians(mode_or_angle)
+            dx, dy = math.cos(a), math.sin(a)
+            ext = abs(w * dx) + abs(h * dy)
+            cx, cy = x + w / 2.0, y + h / 2.0
+            p1 = (cx - dx * ext / 2, cy - dy * ext / 2)
+            p2 = (cx + dx * ext / 2, cy + dy * ext / 2)
+        else:
+            mode = mode_or_angle
+            if mode == 1:
+                p1, p2 = (x, y), (x, y + h)
+            elif mode == 2:
+                p1, p2 = (x, y), (x + w, y + h)
+            elif mode == 3:
+                p1, p2 = (x + w, y), (x, y + h)
+            else:
+                p1, p2 = (x, y), (x + w, y)
+        return new_linear(p1, p2, c1, c2, wrap, rect=(x, y, w, h))
+
+    @reg("GdipCreateLineBrushFromRect", "puuiip")
+    def _clbfr(c, pr, c1, c2, mode, wrap, pp):
+        h = rect_linear(rd_f(pr, 4), c1, c2, mode, wrap) if pr else 0
+        put_ptr(pp, h)
+        return GP_OK if h else GP_INVALID
+
+    @reg("GdipCreateLineBrushFromRectI", "puuiip")
+    def _clbfri(c, pr, c1, c2, mode, wrap, pp):
+        h = rect_linear(tuple(float(v) for v in rd_i(pr, 4)), c1, c2, mode, wrap) if pr else 0
+        put_ptr(pp, h)
+        return GP_OK if h else GP_INVALID
+
+    @reg("GdipCreateLineBrushFromRectWithAngle", "puufiip")
+    def _clbfra(c, pr, c1, c2, ang, scal, wrap, pp):
+        h = rect_linear(rd_f(pr, 4), c1, c2, ang, wrap, True) if pr else 0
+        put_ptr(pp, h)
+        return GP_OK if h else GP_INVALID
+
+    @reg("GdipCreateLineBrushFromRectWithAngleI", "puufiip")
+    def _clbfrai(c, pr, c1, c2, ang, scal, wrap, pp):
+        h = rect_linear(tuple(float(v) for v in rd_i(pr, 4)), c1, c2, ang, wrap, True) \
+            if pr else 0
+        put_ptr(pp, h)
+        return GP_OK if h else GP_INVALID
+
+    def LB(h):
+        return get(h, "brush_linear")
+
+    @reg("GdipSetLineColors", "puu")
+    def _slc(c, h, c1, c2):
+        br = LB(h)
+        if br is None:
+            return GP_INVALID
+        br.c1, br.c2 = argb(c1), argb(c2)
+        return GP_OK
+
+    @reg("GdipGetLineColors", "pp")
+    def _glc(c, h, buf):
+        br = LB(h)
+        if br is None or not buf:
+            return GP_INVALID
+        for i, col in enumerate((br.c1, br.c2)):
+            b, g_, r, a = col
+            put_u(buf + 4 * i, (a << 24) | (r << 16) | (g_ << 8) | b)
+        return GP_OK
+
+    @reg("GdipGetLineRect", "pp")
+    def _glr(c, h, pr):
+        br = LB(h)
+        if br is None:
+            return GP_INVALID
+        put_f(pr, *br.rect)
+        return GP_OK
+
+    @reg("GdipGetLineRectI", "pp")
+    def _glri(c, h, pr):
+        br = LB(h)
+        if br is None:
+            return GP_INVALID
+        M_.write(pr, struct.pack("<4i", *[int(round(v)) for v in br.rect]))
+        return GP_OK
+
+    @reg("GdipSetLineBlend", "pppi")
+    def _slb(c, h, facs, poss, n):
+        br = LB(h)
+        if br is None or n < 1:
+            return GP_INVALID
+        f = rd_f(facs, n)
+        pz = rd_f(poss, n)
+        br.blend = sorted(zip(pz, f))
+        br.preset = None
+        return GP_OK
+
+    @reg("GdipSetLinePresetBlend", "pppi")
+    def _slpb(c, h, cols, poss, n):
+        br = LB(h)
+        if br is None or n < 2:
+            return GP_INVALID
+        pz = rd_f(poss, n)
+        cl = [argb(M_.read32(cols + 4 * i)) for i in range(n)]
+        br.preset = sorted(zip(pz, cl))
+        return GP_OK
+
+    @reg("GdipSetLineSigmaBlend GdipSetLineLinearBlend", "pff")
+    def _slsb(c, h, focus, scale):
+        br = LB(h)
+        if br is None:
+            return GP_INVALID
+        if focus <= 0:
+            br.blend = [(0.0, scale), (1.0, 0.0)]
+        elif focus >= 1:
+            br.blend = [(0.0, 0.0), (1.0, scale)]
+        else:
+            br.blend = [(0.0, 0.0), (focus, scale), (1.0, 0.0)]
+        return GP_OK
+
+    reg("GdipSetLineGammaCorrection", "pi")(lambda c, h, v: GP_OK if LB(h) else GP_INVALID)
+    reg("GdipGetLineGammaCorrection", "pp")(lambda c, h, pv: (put_u(pv, 0), GP_OK)[1])
+
+    @reg("GdipSetLineWrapMode", "pi")
+    def _slwm(c, h, mode):
+        br = LB(h)
+        if br is None:
+            return GP_INVALID
+        br.wrap = mode
+        return GP_OK
+
+    @reg("GdipGetLineWrapMode", "pp")
+    def _glwm(c, h, pm):
+        br = LB(h)
+        if br is None:
+            return GP_INVALID
+        put_u(pm, br.wrap)
+        return GP_OK
+
+    @reg("GdipSetLineTransform", "pp")
+    def _sltf(c, h, hm):
+        br, m = LB(h), mat(hm)
+        if br is None or m is None:
+            return GP_INVALID
+        br.m = m.m
+        return GP_OK
+
+    reg("GdipResetLineTransform", "p")(lambda c, h: (setattr(LB(h), "m", None), GP_OK)[1]
+                                       if LB(h) else GP_INVALID)
+
+    def new_texture(im, wrap, rect=None, attrs=None):
+        src = im
+        if rect is not None:
+            x, y, w, h = [int(round(v)) for v in rect]
+            if w > 0 and h > 0:
+                src = G["clone_image"](im, x, y, w, h)
+        else:
+            src = G["clone_image"](im)
+        if attrs is not None:
+            src = apply_attrs(src, attrs)
+        return new_handle(_Obj("brush_texture", img=src, wrap=wrap,
+                               m=(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)))
+
+    @reg("GdipCreateTexture", "pip")
+    def _ct(c, hi, wrap, pp):
+        im = get(hi, "image")
+        if im is None:
+            return GP_INVALID
+        put_ptr(pp, new_texture(im, wrap))
+        return GP_OK
+
+    @reg("GdipCreateTexture2", "piffffp")
+    def _ct2(c, hi, wrap, x, y, w, h, pp):
+        im = get(hi, "image")
+        if im is None:
+            return GP_INVALID
+        put_ptr(pp, new_texture(im, wrap, (x, y, w, h)))
+        return GP_OK
+
+    @reg("GdipCreateTexture2I", "piiiiip")
+    def _ct2i(c, hi, wrap, x, y, w, h, pp):
+        im = get(hi, "image")
+        if im is None:
+            return GP_INVALID
+        put_ptr(pp, new_texture(im, wrap, (x, y, w, h)))
+        return GP_OK
+
+    @reg("GdipCreateTextureIA", "ppffffp")
+    def _ctia(c, hi, hia, x, y, w, h, pp):
+        im = get(hi, "image")
+        if im is None:
+            return GP_INVALID
+        put_ptr(pp, new_texture(im, 0, (x, y, w, h), get(hia, "imageattr")))
+        return GP_OK
+
+    @reg("GdipCreateTextureIAI", "ppiiiip")
+    def _ctiai(c, hi, hia, x, y, w, h, pp):
+        im = get(hi, "image")
+        if im is None:
+            return GP_INVALID
+        put_ptr(pp, new_texture(im, 0, (x, y, w, h), get(hia, "imageattr")))
+        return GP_OK
+
+    def TB(h):
+        return get(h, "brush_texture")
+
+    @reg("GdipSetTextureTransform", "pp")
+    def _stt(c, h, hm):
+        br, m = TB(h), mat(hm)
+        if br is None or m is None:
+            return GP_INVALID
+        br.m = m.m
+        return GP_OK
+
+    @reg("GdipGetTextureTransform", "pp")
+    def _gtt(c, h, hm):
+        br, m = TB(h), mat(hm)
+        if br is None or m is None:
+            return GP_INVALID
+        m.m = br.m
+        return GP_OK
+
+    reg("GdipResetTextureTransform", "p")(
+        lambda c, h: (setattr(TB(h), "m", (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)), GP_OK)[1]
+        if TB(h) else GP_INVALID)
+
+    @reg("GdipTranslateTextureTransform", "pffi")
+    def _ttt(c, h, dx, dy, order):
+        br = TB(h)
+        if br is None:
+            return GP_INVALID
+        br.m = compose(br.m, tr_op(dx, dy), order)
+        return GP_OK
+
+    @reg("GdipScaleTextureTransform", "pffi")
+    def _stt2(c, h, sx, sy, order):
+        br = TB(h)
+        if br is None:
+            return GP_INVALID
+        br.m = compose(br.m, sc_op(sx, sy), order)
+        return GP_OK
+
+    @reg("GdipSetTextureWrapMode", "pi")
+    def _stwm(c, h, mode):
+        br = TB(h)
+        if br is None:
+            return GP_INVALID
+        br.wrap = mode
+        return GP_OK
+
+    @reg("GdipGetTextureImage", "pp")
+    def _gti(c, h, pp):
+        br = TB(h)
+        if br is None:
+            return GP_INVALID
+        put_ptr(pp, new_handle(G["clone_image"](br.img)))
+        return GP_OK
+
+    def new_pathgrad(pts, wrap):
+        n = len(pts)
+        cx = sum(x for x, _y in pts) / n
+        cy = sum(y for _x, y in pts) / n
+        return new_handle(_Obj("brush_path", pts=list(pts), center=(cx, cy),
+                               cc=(0, 0, 0, 255), surround=[(255, 255, 255, 255)], wrap=wrap))
+
+    @reg("GdipCreatePathGradient", "pip")
+    def _cpg(c, pts, n, pp):
+        if not pts or n < 2:
+            return GP_INVALID
+        put_ptr(pp, new_pathgrad([rd_f(pts + 8 * i, 2) for i in range(n)], 0))
+        return GP_OK
+
+    @reg("GdipCreatePathGradientI", "pip")
+    def _cpgi(c, pts, n, pp):
+        if not pts or n < 2:
+            return GP_INVALID
+        put_ptr(pp, new_pathgrad([tuple(float(v) for v in rd_i(pts + 8 * i, 2))
+                                  for i in range(n)], 0))
+        return GP_OK
+
+    @reg("GdipCreatePathGradientFromPath", "pp")
+    def _cpgfp(c, hp, pp):
+        path = get(hp, "path")
+        if path is None:
+            return GP_INVALID
+        pts = [pt for f in path.figs for pt in f["pts"]]
+        if len(pts) < 2:
+            return 3
+        put_ptr(pp, new_pathgrad(pts, 0))
+        return GP_OK
+
+    def PG(h):
+        return get(h, "brush_path")
+
+    @reg("GdipSetPathGradientCenterColor", "pu")
+    def _spgcc(c, h, col):
+        br = PG(h)
+        if br is None:
+            return GP_INVALID
+        br.cc = argb(col)
+        return GP_OK
+
+    @reg("GdipGetPathGradientCenterColor", "pp")
+    def _gpgcc(c, h, pc):
+        br = PG(h)
+        if br is None:
+            return GP_INVALID
+        b, g_, r, a = br.cc
+        put_u(pc, (a << 24) | (r << 16) | (g_ << 8) | b)
+        return GP_OK
+
+    @reg("GdipSetPathGradientSurroundColorsWithCount", "ppp")
+    def _spgsc(c, h, cols, pn):
+        br = PG(h)
+        if br is None or not pn:
+            return GP_INVALID
+        n = M_.read32(pn)
+        if n < 1 or n > len(br.pts):
+            return GP_INVALID
+        br.surround = [argb(M_.read32(cols + 4 * i)) for i in range(n)]
+        return GP_OK
+
+    @reg("GdipGetPathGradientSurroundColorCount", "pp")
+    def _gpgscc(c, h, pn):
+        br = PG(h)
+        if br is None:
+            return GP_INVALID
+        put_u(pn, len(br.pts))
+        return GP_OK
+
+    @reg("GdipSetPathGradientCenterPoint", "pp")
+    def _spgcp(c, h, pt):
+        br = PG(h)
+        if br is None:
+            return GP_INVALID
+        br.center = rd_f(pt, 2)
+        return GP_OK
+
+    @reg("GdipSetPathGradientCenterPointI", "pp")
+    def _spgcpi(c, h, pt):
+        br = PG(h)
+        if br is None:
+            return GP_INVALID
+        br.center = tuple(float(v) for v in rd_i(pt, 2))
+        return GP_OK
+
+    @reg("GdipGetPathGradientCenterPoint", "pp")
+    def _gpgcp(c, h, pt):
+        br = PG(h)
+        if br is None:
+            return GP_INVALID
+        put_f(pt, *br.center)
+        return GP_OK
+
+    @reg("GdipGetPathGradientRect", "pp")
+    def _gpgr(c, h, pr):
+        br = PG(h)
+        if br is None:
+            return GP_INVALID
+        xs = [x for x, _y in br.pts]
+        ys = [y for _x, y in br.pts]
+        put_f(pr, min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+        return GP_OK
+
+    for nm in ("GdipSetPathGradientBlend", "GdipSetPathGradientPresetBlend"):
+        reg(nm, "pppi")(lambda c, h, a, b, n: GP_OK if PG(h) else GP_INVALID)
+    for nm in ("GdipSetPathGradientSigmaBlend", "GdipSetPathGradientLinearBlend",
+               "GdipSetPathGradientFocusScales"):
+        reg(nm, "pff")(lambda c, h, a, b: GP_OK if PG(h) else GP_INVALID)
+    reg("GdipSetPathGradientGammaCorrection GdipSetPathGradientWrapMode", "pi")(
+        lambda c, h, v: GP_OK if PG(h) else GP_INVALID)
+    reg("GdipSetPathGradientTransform", "pp")(lambda c, h, m: GP_OK if PG(h) else GP_INVALID)
+
+    @reg("GdipCloneBrush", "pp")
+    def _cb(c, h, pp):
+        br = B(h)
+        if br is None:
+            return GP_INVALID
+        n = _Obj(br.kind)
+        n.__dict__.update(br.__dict__)
+        put_ptr(pp, new_handle(n))
+        return GP_OK
+
+    reg("GdipDeleteBrush", "p")(lambda c, h: free_handle(h) if B(h) else GP_INVALID)
+
+    @reg("GdipGetBrushType", "pp")
+    def _gbt(c, h, pt):
+        br = B(h)
+        if br is None:
+            return GP_INVALID
+        put_u(pt, BRUSHES.index(br.kind) if br.kind != "brush_path" else 3)
+        return GP_OK
+
+    # ---- pens ---------------------------------------------------------------------------------
+    def PN(h):
+        return get(h, "pen")
+
+    def new_pen(width, unit, col=None, brush=None):
+        return new_handle(_Obj("pen", width=width, unit=unit, col=col, brush=brush, dash=0,
+                               dashes=None, dash_off=0.0, start_cap=0, end_cap=0, dash_cap=0,
+                               join=0, miter=10.0, align=0, m=None, compound=None))
+
+    @reg("GdipCreatePen1", "ufip")
+    def _cp1(c, col, width, unit, pp):
+        if not pp:
+            return GP_INVALID
+        put_ptr(pp, new_pen(width, unit, col=argb(col)))
+        return GP_OK
+
+    @reg("GdipCreatePen2", "pfip")
+    def _cp2(c, hb, width, unit, pp):
+        br = B(hb)
+        if br is None or not pp:
+            return GP_INVALID
+        n = _Obj(br.kind)
+        n.__dict__.update(br.__dict__)
+        put_ptr(pp, new_pen(width, unit, col=br.col if br.kind == "brush_solid" else None,
+                            brush=n))
+        return GP_OK
+
+    @reg("GdipClonePen", "pp")
+    def _clp(c, h, pp):
+        pn = PN(h)
+        if pn is None:
+            return GP_INVALID
+        n = _Obj("pen")
+        n.__dict__.update(pn.__dict__)
+        put_ptr(pp, new_handle(n))
+        return GP_OK
+
+    reg("GdipDeletePen", "p")(lambda c, h: free_handle(h) if PN(h) else GP_INVALID)
+
+    @reg("GdipSetPenColor", "pu")
+    def _spc(c, h, col):
+        pn = PN(h)
+        if pn is None:
+            return GP_INVALID
+        pn.col = argb(col)
+        pn.brush = None
+        return GP_OK
+
+    @reg("GdipGetPenColor", "pp")
+    def _gpc2(c, h, pc):
+        pn = PN(h)
+        if pn is None:
+            return GP_INVALID
+        b, g_, r, a = pn.col or (0, 0, 0, 255)
+        put_u(pc, (a << 24) | (r << 16) | (g_ << 8) | b)
+        return GP_OK
+
+    @reg("GdipSetPenWidth", "pf")
+    def _spw(c, h, w):
+        pn = PN(h)
+        if pn is None:
+            return GP_INVALID
+        pn.width = w
+        return GP_OK
+
+    @reg("GdipGetPenWidth", "pp")
+    def _gpw(c, h, pw):
+        pn = PN(h)
+        if pn is None:
+            return GP_INVALID
+        put_f(pw, pn.width)
+        return GP_OK
+
+    @reg("GdipSetPenBrushFill", "pp")
+    def _spbf(c, h, hb):
+        pn, br = PN(h), B(hb)
+        if pn is None or br is None:
+            return GP_INVALID
+        n = _Obj(br.kind)
+        n.__dict__.update(br.__dict__)
+        pn.brush = n
+        pn.col = br.col if br.kind == "brush_solid" else None
+        return GP_OK
+
+    @reg("GdipGetPenBrushFill", "pp")
+    def _gpbf(c, h, pp):
+        pn = PN(h)
+        if pn is None:
+            return GP_INVALID
+        if pn.brush is not None:
+            n = _Obj(pn.brush.kind)
+            n.__dict__.update(pn.brush.__dict__)
+        else:
+            n = _Obj("brush_solid", col=pn.col or (0, 0, 0, 255))
+        put_ptr(pp, new_handle(n))
+        return GP_OK
+
+    @reg("GdipGetPenFillType", "pp")
+    def _gpft(c, h, pt):
+        pn = PN(h)
+        if pn is None:
+            return GP_INVALID
+        put_u(pt, 0 if pn.brush is None else BRUSHES.index(pn.brush.kind))
+        return GP_OK
+
+    for attr, setn, getn in (("dash", "GdipSetPenDashStyle", "GdipGetPenDashStyle"),
+                             ("start_cap", "GdipSetPenStartCap", "GdipGetPenStartCap"),
+                             ("end_cap", "GdipSetPenEndCap", "GdipGetPenEndCap"),
+                             ("dash_cap", "GdipSetPenDashCap197819", "GdipGetPenDashCap197819"),
+                             ("join", "GdipSetPenLineJoin", "GdipGetPenLineJoin"),
+                             ("align", "GdipSetPenMode", "GdipGetPenMode"),
+                             ("unit", "GdipSetPenUnit", "GdipGetPenUnit")):
+        def _sattr(c, h, v, _a=attr):
+            pn = PN(h)
+            if pn is None:
+                return GP_INVALID
+            setattr(pn, _a, v)
+            return GP_OK
+
+        def _gattr(c, h, pv, _a=attr):
+            pn = PN(h)
+            if pn is None:
+                return GP_INVALID
+            put_u(pv, getattr(pn, _a))
+            return GP_OK
+        reg(setn, "pi")(_sattr)
+        reg(getn, "pp")(_gattr)
+
+    @reg("GdipSetPenLineCap197819", "piii")
+    def _splc(c, h, s, e, d):
+        pn = PN(h)
+        if pn is None:
+            return GP_INVALID
+        pn.start_cap, pn.end_cap, pn.dash_cap = s, e, d
+        return GP_OK
+
+    reg("GdipSetPenMiterLimit GdipSetPenDashOffset", "pf")(
+        lambda c, h, v: GP_OK if PN(h) else GP_INVALID)
+
+    @reg("GdipSetPenDashArray", "ppi")
+    def _spda(c, h, arr, n):
+        pn = PN(h)
+        if pn is None or n <= 0 or not arr:
+            return GP_INVALID
+        vals = rd_f(arr, n)
+        if any(v <= 0 for v in vals):
+            return GP_INVALID
+        pn.dashes = list(vals)
+        pn.dash = 5
+        return GP_OK
+
+    @reg("GdipGetPenDashCount", "pp")
+    def _gpdc(c, h, pn_):
+        pn = PN(h)
+        if pn is None:
+            return GP_INVALID
+        put_u(pn_, len(pn.dashes or []))
+        return GP_OK
+
+    for nm in ("GdipSetPenCustomStartCap", "GdipSetPenCustomEndCap", "GdipSetPenTransform",
+               "GdipSetPenCompoundArray"):
+        reg(nm, "pp")(lambda c, h, x: GP_OK if PN(h) else GP_INVALID)
+    reg("GdipResetPenTransform", "p")(lambda c, h: GP_OK if PN(h) else GP_INVALID)
+    for nm in ("GdipScalePenTransform", "GdipTranslatePenTransform"):
+        reg(nm, "pffi")(lambda c, h, a, b, o: GP_OK if PN(h) else GP_INVALID)
+    reg("GdipRotatePenTransform", "pfi")(lambda c, h, a, o: GP_OK if PN(h) else GP_INVALID)
+
+    DASHES = {1: [3, 1], 2: [1, 1], 3: [3, 1, 1, 1], 4: [3, 1, 1, 1, 1, 1]}
+
+    def dash_split(pts, pattern):
+        """Split a polyline into dash sub-polylines (pattern lengths in device px)."""
+        out = []
+        idx = 0
+        left = pattern[0]
+        on = True
+        cur = [pts[0]]
+        for i in range(1, len(pts)):
+            (x0, y0), (x1, y1) = pts[i - 1], pts[i]
+            seg = math.hypot(x1 - x0, y1 - y0)
+            pos = 0.0
+            while seg - pos > left:
+                pos += left
+                t = pos / seg
+                q = (x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)
+                if on:
+                    cur.append(q)
+                    out.append(cur)
+                cur = [q]
+                on = not on
+                idx = (idx + 1) % len(pattern)
+                left = pattern[idx]
+            left -= seg - pos
+            if on:
+                cur.append((x1, y1))
+            else:
+                cur = [(x1, y1)]
+        if on and len(cur) > 1:
+            out.append(cur)
+        return out
+
+    def poly_ccw(pts):
+        a = 0.0
+        n = len(pts)
+        for i in range(n):
+            (x0, y0), (x1, y1) = pts[i], pts[(i + 1) % n]
+            a += x0 * y1 - x1 * y0
+        return pts if a >= 0 else pts[::-1]
+
+    def stroke(g, T, pts_dev, pen, closed, M):
+        """Stroke a polyline given in device (surface) coordinates."""
+        if len(pts_dev) < 2:
+            if len(pts_dev) == 1:
+                pts_dev = pts_dev * 2
+            else:
+                return
+        if closed and pts_dev[0] != pts_dev[-1]:
+            pts_dev = list(pts_dev) + [pts_dev[0]]
+        sc = math.sqrt(abs(M[0] * M[3] - M[1] * M[2])) or 1.0
+        wdev = pen.width * (sc if pen.unit in (0, 1) else _GP_UNIT.get(pen.unit, 1.0))
+        paint = pen.col if pen.brush is None or pen.brush.kind == "brush_solid" else \
+            brush_paint(pen.brush, _gp_mat_inv(M), T)
+        if pen.brush is not None and pen.brush.kind == "brush_solid":
+            paint = pen.brush.col
+        if paint is None:
+            paint = (0, 0, 0, 255)
+        runs = [pts_dev]
+        if pen.dash:
+            pat = pen.dashes if pen.dash == 5 and pen.dashes else DASHES.get(pen.dash)
+            if pat:
+                runs = dash_split(pts_dev, [max(1.0, v * max(1.0, wdev)) for v in pat])
+        if wdev <= 1.5:
+            spans = {}
+            for run in runs:
+                for i in range(1, len(run)):
+                    line_spans(spans, run[i - 1], run[i])
+            fill_spans(T, merge_spans(spans), paint)
+            return
+        hw = wdev / 2.0
+        figs = []
+        for run in runs:
+            for i in range(1, len(run)):
+                (x0, y0), (x1, y1) = run[i - 1], run[i]
+                dx, dy = x1 - x0, y1 - y0
+                ln = math.hypot(dx, dy)
+                if ln < 1e-9:
+                    continue
+                nx, ny = -dy / ln * hw, dx / ln * hw
+                figs.append(poly_ccw([(x0 + nx, y0 + ny), (x1 + nx, y1 + ny),
+                                      (x1 - nx, y1 - ny), (x0 - nx, y0 - ny)]))
+            joints = run[1:-1] if not closed else run
+            if pen.join != 1 or True:                            # round-ish joins fill gaps
+                for (x, y) in joints:
+                    k_ = max(8, int(hw * 2))
+                    figs.append(poly_ccw([(x + hw * math.cos(2 * math.pi * j / k_),
+                                           y + hw * math.sin(2 * math.pi * j / k_))
+                                          for j in range(k_)]))
+        fill_spans(T, _gp_scan(figs, winding=True), paint)
+
+    def line_spans(spans, a, b):
+        x0, y0 = int(math.floor(a[0])), int(math.floor(a[1]))
+        x1, y1 = int(math.floor(b[0])), int(math.floor(b[1]))
+        dx, dy = abs(x1 - x0), -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        n = 0
+        while n < 100000:
+            spans.setdefault(y0, []).append((x0, x0 + 1))
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x0 += sx
+            if e2 <= dx:
+                err += dx
+                y0 += sy
+            n += 1
+
+    def merge_spans(spans):
+        out = {}
+        for y, lst in spans.items():
+            lst = sorted(set(lst))
+            m = []
+            for (a, b) in lst:
+                if m and a <= m[-1][1]:
+                    m[-1] = (m[-1][0], max(m[-1][1], b))
+                else:
+                    m.append((a, b))
+            out[y] = m
+        return out
+
+    # ---- graphics -----------------------------------------------------------------------------
+    def new_graphics(gr):
+        return new_handle(gr)
+
+    @reg("GdipCreateFromHDC", "pp")
+    def _cfhdc(c, hdc, pp):
+        if gdi.get(hdc, "dc") is None or not pp:
+            return GP_INVALID if not hdc else 7
+        put_ptr(pp, new_graphics(_GpGraphics(hdc=hdc)))
+        return GP_OK
+
+    reg("GdipCreateFromHDC2", "ppp")(lambda c, hdc, dev, pp: _cfhdc(c, hdc, pp))
+
+    @reg("GdipCreateFromHWND GdipCreateFromHWNDICM", "pp")
+    def _cfhwnd(c, hwnd, pp):
+        w = wm.wnd(hwnd & 0xFFFFFFFF) if hwnd else None
+        if w is None and hwnd:
+            return GP_INVALID
+        dc = gdi.new_dc("client", hwnd & 0xFFFFFFFF) if hwnd else gdi.new_dc("screen")
+        gr = _GpGraphics(hdc=dc.h, hwnd=hwnd)
+        gr.own_dc = True
+        put_ptr(pp, new_graphics(gr))
+        return GP_OK
+
+    @reg("GdipGetImageGraphicsContext", "pp")
+    def _gigc(c, hi, pp):
+        im = get(hi, "image")
+        if im is None or not pp:
+            return GP_INVALID
+        if im.fmt in (PF_1I, PF_4I, PF_8I):
+            return GP_OOM
+        put_ptr(pp, new_graphics(_GpGraphics(img=im)))
+        return GP_OK
+
+    @reg("GdipDeleteGraphics", "p")
+    def _dg(c, h):
+        g = G_(h)
+        if g is None:
+            return GP_INVALID
+        if g.own_dc:
+            gdi.delete(g.hdc)
+        return free_handle(h)
+
+    reg("GdipFlush", "pi")(lambda c, h, how: GP_OK if G_(h) else GP_INVALID)
+
+    @reg("GdipGetDC", "pp")
+    def _ggdc(c, h, phdc):
+        g = G_(h)
+        if g is None or not phdc:
+            return GP_INVALID
+        if g.img is None:
+            put_ptr(phdc, g.hdc)
+            return GP_OK
+        im = g.img
+        ext_pull(im)
+        dc = gdi.new_dc("mem")
+        bm = _GBitmap(im.w, im.h, 32)
+        bm.surf.px[:] = im.surf.px
+        bm.surf.px[3::4] = bytes(im.w * im.h)
+        hb = gdi.add(bm)
+        dc.bitmap_h = hb
+        bm.dc = dc.h
+        dc.changed()
+        g.tmp_dc = (dc.h, hb, bytes(bm.surf.px))
+        put_ptr(phdc, dc.h)
+        return GP_OK
+
+    @reg("GdipReleaseDC", "pp")
+    def _grdc(c, h, hdc):
+        g = G_(h)
+        if g is None:
+            return GP_INVALID
+        if g.img is None or not g.tmp_dc:
+            return GP_OK
+        dch, hb, before = g.tmp_dc
+        g.tmp_dc = 0
+        bm = gdi.get(hb, "bitmap")
+        im = g.img
+        if bm is not None:
+            after = bm.surf.px
+            px = im.surf.px
+            for i in range(0, min(len(after), len(px)), 4):
+                if after[i:i + 3] != before[i:i + 3]:
+                    px[i:i + 3] = after[i:i + 3]
+                    px[i + 3] = 255
+            im.surf.rev += 1
+            ext_push(im)
+        gdi.delete(dch)
+        gdi.delete(hb)
+        return GP_OK
+
+    def g_attr(name, setn, getn, conv="u"):
+        def _s(c, h, v, _n=name):
+            g = G_(h)
+            if g is None:
+                return GP_INVALID
+            setattr(g, _n, v)
+            return GP_OK
+
+        def _g(c, h, pv, _n=name, _c=conv):
+            g = G_(h)
+            if g is None:
+                return GP_INVALID
+            if _c == "f":
+                put_f(pv, getattr(g, _n))
+            else:
+                put_u(pv, getattr(g, _n))
+            return GP_OK
+        reg(setn, "pf" if conv == "f" else "pi")(_s)
+        reg(getn, "pp")(_g)
+
+    g_attr("smoothing", "GdipSetSmoothingMode", "GdipGetSmoothingMode")
+    g_attr("interp", "GdipSetInterpolationMode", "GdipGetInterpolationMode")
+    g_attr("pixoff", "GdipSetPixelOffsetMode", "GdipGetPixelOffsetMode")
+    g_attr("comp_mode", "GdipSetCompositingMode", "GdipGetCompositingMode")
+    g_attr("comp_quality", "GdipSetCompositingQuality", "GdipGetCompositingQuality")
+    g_attr("text_hint", "GdipSetTextRenderingHint", "GdipGetTextRenderingHint")
+    g_attr("contrast", "GdipSetTextContrast", "GdipGetTextContrast")
+    g_attr("unit", "GdipSetPageUnit", "GdipGetPageUnit")
+    g_attr("scale", "GdipSetPageScale", "GdipGetPageScale", "f")
+
+    reg("GdipGetDpiX GdipGetDpiY", "pp")(lambda c, h, pv: (put_f(pv, 96.0), GP_OK)[1]
+                                         if G_(h) else GP_INVALID)
+
+    @reg("GdipSetRenderingOrigin", "pii")
+    def _sro(c, h, x, y):
+        g = G_(h)
+        if g is None:
+            return GP_INVALID
+        g.origin = (x, y)
+        return GP_OK
+
+    @reg("GdipGetRenderingOrigin", "ppp")
+    def _gro(c, h, px_, py_):
+        g = G_(h)
+        if g is None:
+            return GP_INVALID
+        put_u(px_, g.origin[0])
+        put_u(py_, g.origin[1])
+        return GP_OK
+
+    # world transform
+    @reg("GdipSetWorldTransform", "pp")
+    def _swt(c, h, hm):
+        g, m = G_(h), mat(hm)
+        if g is None or m is None:
+            return GP_INVALID
+        g.m = m.m
+        return GP_OK
+
+    @reg("GdipGetWorldTransform", "pp")
+    def _gwt(c, h, hm):
+        g, m = G_(h), mat(hm)
+        if g is None or m is None:
+            return GP_INVALID
+        m.m = g.m
+        return GP_OK
+
+    reg("GdipResetWorldTransform", "p")(
+        lambda c, h: (setattr(G_(h), "m", (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)), GP_OK)[1]
+        if G_(h) else GP_INVALID)
+
+    @reg("GdipTranslateWorldTransform", "pffi")
+    def _twt(c, h, dx, dy, order):
+        g = G_(h)
+        if g is None:
+            return GP_INVALID
+        g.m = compose(g.m, tr_op(dx, dy), order)
+        return GP_OK
+
+    @reg("GdipScaleWorldTransform", "pffi")
+    def _scwt(c, h, sx, sy, order):
+        g = G_(h)
+        if g is None:
+            return GP_INVALID
+        g.m = compose(g.m, sc_op(sx, sy), order)
+        return GP_OK
+
+    @reg("GdipRotateWorldTransform", "pfi")
+    def _rwt(c, h, deg, order):
+        g = G_(h)
+        if g is None:
+            return GP_INVALID
+        g.m = compose(g.m, rot_op(deg), order)
+        return GP_OK
+
+    @reg("GdipMultiplyWorldTransform", "ppi")
+    def _mwt(c, h, hm, order):
+        g, m = G_(h), mat(hm)
+        if g is None or m is None:
+            return GP_INVALID
+        g.m = compose(g.m, m.m, order)
+        return GP_OK
+
+    @reg("GdipTransformPoints GdipTransformPointsI", "piipi")
+    def _tp(c, h, dst_space, src_space, pts, n):
+        g = G_(h)
+        if g is None or not pts:
+            return GP_INVALID
+        # CoordinateSpaceWorld 0, Page 1, Device 2
+        f = page_factor(g)
+        fwd = [g.m, (f, 0.0, 0.0, f, 0.0, 0.0)]
+        m = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+        if src_space < dst_space:
+            for i in range(src_space, dst_space):
+                m = _gp_mat_mul(m, fwd[i])
+        elif src_space > dst_space:
+            for i in range(src_space - 1, dst_space - 1, -1):
+                inv = _gp_mat_inv(fwd[i]) or (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+                m = _gp_mat_mul(m, inv)
+        for i in range(n):
+            x, y = rd_f(pts + 8 * i, 2)
+            put_f(pts + 8 * i, *_gp_apply(m, x, y))
+        return GP_OK
+
+    # clipping (stored in graphics device coordinates)
+    def world_rect_dev(g, x, y, w, h):
+        m = dev_matrix(g)
+        pts = [_gp_apply(m, px_, py_) for (px_, py_) in ((x, y), (x + w, y), (x, y + h),
+                                                          (x + w, y + h))]
+        xs = [q[0] for q in pts]
+        ys = [q[1] for q in pts]
+        return (int(math.floor(min(xs) + 0.5)), int(math.floor(min(ys) + 0.5)),
+                int(math.floor(max(xs) + 0.5)), int(math.floor(max(ys) + 0.5)))
+
+    def set_clip(g, rects, mode):
+        g.clip = _gp_rect_ops(g.clip, rects, mode)
+
+    @reg("GdipSetClipRect", "pffffi")
+    def _scr(c, h, x, y, w, hh, mode):
+        g = G_(h)
+        if g is None:
+            return GP_INVALID
+        set_clip(g, [world_rect_dev(g, x, y, w, hh)], mode)
+        return GP_OK
+
+    @reg("GdipSetClipRectI", "piiiii")
+    def _scri(c, h, x, y, w, hh, mode):
+        return _scr(c, h, float(x), float(y), float(w), float(hh), mode)
+
+    @reg("GdipIntersectClipRect", "pffff")
+    def _icr(c, h, x, y, w, hh):
+        return _scr(c, h, x, y, w, hh, 1)
+
+    @reg("GdipIntersectClipRectI", "piiii")
+    def _icri(c, h, x, y, w, hh):
+        return _scr(c, h, float(x), float(y), float(w), float(hh), 1)
+
+    @reg("GdipResetClip", "p")
+    def _rc(c, h):
+        g = G_(h)
+        if g is None:
+            return GP_INVALID
+        g.clip = None
+        return GP_OK
+
+    def region_dev(g, rg):
+        if rg.rects is None:
+            return None
+        return [world_rect_dev(g, l, t, r - l, b - t) for (l, t, r, b) in rg.rects]
+
+    @reg("GdipSetClipRegion", "ppi")
+    def _scrg(c, h, hr, mode):
+        g, rg = G_(h), get(hr, "region")
+        if g is None or rg is None:
+            return GP_INVALID
+        set_clip(g, region_dev(g, rg), mode)
+        return GP_OK
+
+    @reg("GdipSetClipHrgn", "ppi")
+    def _schr(c, h, hrgn, mode):
+        g = G_(h)
+        if g is None:
+            return GP_INVALID
+        r = gdi.get(hrgn, "region") if hrgn else None
+        set_clip(g, None if r is None else list(r.rects), mode)
+        return GP_OK
+
+    @reg("GdipSetClipGraphics", "ppi")
+    def _scg(c, h, h2, mode):
+        g, g2 = G_(h), G_(h2)
+        if g is None or g2 is None:
+            return GP_INVALID
+        set_clip(g, None if g2.clip is None else list(g2.clip), mode)
+        return GP_OK
+
+    @reg("GdipSetClipPath", "ppi")
+    def _scp(c, h, hp, mode):
+        g, path = G_(h), get(hp, "path")
+        if g is None or path is None:
+            return GP_INVALID
+        m = dev_matrix(g)
+        figs = [[_gp_apply(m, x, y) for (x, y) in f["pts"]] for f in path.figs]
+        set_clip(g, _spans_to_rects(_gp_scan(figs, path.fill == 1)), mode)
+        return GP_OK
+
+    @reg("GdipTranslateClip", "pff")
+    def _tc(c, h, dx, dy):
+        g = G_(h)
+        if g is None:
+            return GP_INVALID
+        if g.clip is not None:
+            f = page_factor(g)
+            ix, iy = int(round(dx * f)), int(round(dy * f))
+            g.clip = [(l + ix, t + iy, r + ix, b + iy) for (l, t, r, b) in g.clip]
+        return GP_OK
+
+    reg("GdipTranslateClipI", "pii")(lambda c, h, dx, dy: _tc(c, h, float(dx), float(dy)))
+
+    def dev_to_world_rect(g, r):
+        inv = _gp_mat_inv(dev_matrix(g))
+        if inv is None:
+            return (0.0, 0.0, 0.0, 0.0)
+        l, t, rr, b = r
+        pts = [_gp_apply(inv, x, y) for (x, y) in ((l, t), (rr, t), (l, b), (rr, b))]
+        xs = [q[0] for q in pts]
+        ys = [q[1] for q in pts]
+        return (min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+
+    def bounds_rect(rects):
+        if rects is None:
+            return (-4194304, -4194304, 8388608, 8388608)
+        if not rects:
+            return (0, 0, 0, 0)
+        return (min(r[0] for r in rects), min(r[1] for r in rects),
+                max(r[2] for r in rects), max(r[3] for r in rects))
+
+    def target_size(g):
+        if g.img is not None:
+            return (0, 0, g.img.w, g.img.h)
+        dc = gdi.get(g.hdc, "dc")
+        if dc is None:
+            return (0, 0, 0, 0)
+        surf, ox, oy, vis, bm = dc.target()
+        dx, dy = dc.lp2dp(0, 0)
+        b = bounds_rect(vis)
+        return (b[0] - ox - dx, b[1] - oy - dy, b[2] - ox - dx, b[3] - oy - dy)
+
+    def put_rect(pr, r, ints=False):
+        if ints:
+            M_.write(pr, struct.pack("<4i", *[int(round(v)) for v in r]))
+        else:
+            put_f(pr, *r)
+
+    for nm, vis, ints in (("GdipGetClipBounds", False, False),
+                          ("GdipGetClipBoundsI", False, True),
+                          ("GdipGetVisibleClipBounds", True, False),
+                          ("GdipGetVisibleClipBoundsI", True, True)):
+        def _gcb(c, h, pr, _v=vis, _i=ints):
+            g = G_(h)
+            if g is None or not pr:
+                return GP_INVALID
+            if g.clip is None and not _v:
+                b = bounds_rect(None)
+                put_rect(pr, (b[0], b[1], b[2] - b[0], b[3] - b[1]), _i)
+                return GP_OK
+            rects = g.clip
+            if _v:
+                rects = _rects_and(_GP_INF if rects is None else rects, [target_size(g)])
+            put_rect(pr, dev_to_world_rect(g, bounds_rect(rects)), _i)
+            return GP_OK
+        reg(nm, "pp")(_gcb)
+
+    @reg("GdipGetClip", "pp")
+    def _gc(c, h, hr):
+        g, rg = G_(h), get(hr, "region")
+        if g is None or rg is None:
+            return GP_INVALID
+        if g.clip is None:
+            rg.rects = None
+        else:
+            rg.rects = [tuple(int(round(v)) for v in (lambda r: (r[0], r[1], r[0] + r[2],
+                                                                 r[1] + r[3]))(
+                dev_to_world_rect(g, rc))) for rc in g.clip]
+        return GP_OK
+
+    @reg("GdipIsClipEmpty GdipIsVisibleClipEmpty", "pp")
+    def _ice(c, h, pb):
+        g = G_(h)
+        if g is None:
+            return GP_INVALID
+        put_u(pb, 1 if g.clip is not None and not g.clip else 0)
+        return GP_OK
+
+    @reg("GdipIsVisiblePoint", "pffp")
+    def _ivp(c, h, x, y, pb):
+        g = G_(h)
+        if g is None:
+            return GP_INVALID
+        dx, dy = _gp_apply(dev_matrix(g), x, y)
+        rects = _rects_and(_GP_INF if g.clip is None else g.clip, [target_size(g)])
+        put_u(pb, 1 if any(l <= dx < r and t <= dy < b for (l, t, r, b) in rects) else 0)
+        return GP_OK
+
+    reg("GdipIsVisiblePointI", "piip")(lambda c, h, x, y, pb: _ivp(c, h, float(x), float(y), pb))
+
+    @reg("GdipIsVisibleRect", "pffffp")
+    def _ivr(c, h, x, y, w, hh, pb):
+        g = G_(h)
+        if g is None:
+            return GP_INVALID
+        r = world_rect_dev(g, x, y, w, hh)
+        rects = _rects_and(_GP_INF if g.clip is None else g.clip, [target_size(g)])
+        put_u(pb, 1 if _rects_and(rects, [r]) else 0)
+        return GP_OK
+
+    reg("GdipIsVisibleRectI", "piiiip")(
+        lambda c, h, x, y, w, hh, pb: _ivr(c, h, float(x), float(y), float(w), float(hh), pb))
+
+    # save / restore / containers
+    STATE = ("m", "unit", "scale", "clip", "smoothing", "interp", "pixoff", "comp_mode",
+             "comp_quality", "text_hint", "contrast")
+
+    @reg("GdipSaveGraphics GdipBeginContainer2", "pp")
+    def _sg(c, h, ps):
+        g = G_(h)
+        if g is None or not ps:
+            return GP_INVALID
+        sid = g.next_state
+        g.next_state += 1
+        g.saved[sid] = {n: getattr(g, n) for n in STATE}
+        put_u(ps, sid)
+        return GP_OK
+
+    @reg("GdipRestoreGraphics GdipEndContainer", "pu")
+    def _rg(c, h, sid):
+        g = G_(h)
+        if g is None:
+            return GP_INVALID
+        st = g.saved.get(sid)
+        if st is not None:
+            for n, v in st.items():
+                setattr(g, n, v)
+            for k_ in [k2 for k2 in g.saved if k2 >= sid]:
+                g.saved.pop(k_, None)
+        return GP_OK
+
+    @reg("GdipBeginContainer", "pppip")
+    def _bc(c, h, dst, src, unit, ps):
+        r = _sg(c, h, ps)
+        g = G_(h)
+        if r == GP_OK and dst and src:
+            dx, dy, dw, dh = rd_f(dst, 4)
+            sx, sy, sw, sh = rd_f(src, 4)
+            f = _GP_UNIT.get(unit, 1.0)
+            if sw and sh:
+                op = _gp_mat_mul(_gp_mat_mul(tr_op(-sx * f, -sy * f),
+                                             sc_op(dw / (sw * f), dh / (sh * f))), tr_op(dx, dy))
+                g.m = _gp_mat_mul(op, g.m)
+        return r
+
+    @reg("GdipBeginContainerI", "pppip")
+    def _bci(c, h, dst, src, unit, ps):
+        return _sg(c, h, ps)
+
+    # ---- drawing ------------------------------------------------------------------------------
+    def with_target(h, fn):
+        g = G_(h)
+        if g is None:
+            return GP_INVALID
+        T = begin(g)
+        if T is None:
+            return GP_INVALID
+        try:
+            fn(g, T, dev_matrix(g, T))
+        finally:
+            T.fin()
+        return GP_OK
+
+    def fill_figs(h, hb, figs_world, winding=False):
+        br = B(hb)
+        if br is None:
+            return GP_INVALID
+
+        def go(g, T, M):
+            figs = [[_gp_apply(M, x, y) for (x, y) in f] for f in figs_world if len(f) >= 3]
+            if not figs:
+                return
+            fill_spans(T, _gp_scan(figs, winding), brush_paint(br, _gp_mat_inv(M), T))
+        return with_target(h, go)
+
+    def rect_pts(x, y, w, h):
+        return [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+
+    def ellipse_pts(x, y, w, h):
+        return _gp_arc_pts(x, y, w, h, 0.0, 360.0)[:-1]
+
+    def pie_pts(x, y, w, h, start, sweep):
+        return [(x + w / 2.0, y + h / 2.0)] + _gp_arc_pts(x, y, w, h, start, sweep)
+
+    @reg("GdipGraphicsClear", "pu")
+    def _gcl(c, h, col):
+        cc = argb(col)
+
+        def go(g, T, M):
+            save = T.copy
+            T.copy = True
+            fill_spans(T, {y: [(l, r)] for (l, t, r, b) in T.clip for y in range(t, b)}, cc)
+            T.copy = save
+        return with_target(h, go)
+
+    reg("GdipFillRectangle", "ppffff")(
+        lambda c, h, hb, x, y, w, hh: fill_figs(h, hb, [rect_pts(x, y, w, hh)]))
+    reg("GdipFillRectangleI", "ppiiii")(
+        lambda c, h, hb, x, y, w, hh: fill_figs(h, hb, [rect_pts(x, y, w, hh)]))
+
+    @reg("GdipFillRectangles", "pppi")
+    def _frs(c, h, hb, rects, n):
+        if not rects or n <= 0:
+            return GP_INVALID
+        return fill_figs(h, hb, [rect_pts(*rd_f(rects + 16 * i, 4)) for i in range(n)])
+
+    @reg("GdipFillRectanglesI", "pppi")
+    def _frsi(c, h, hb, rects, n):
+        if not rects or n <= 0:
+            return GP_INVALID
+        return fill_figs(h, hb, [rect_pts(*rd_i(rects + 16 * i, 4)) for i in range(n)])
+
+    reg("GdipFillEllipse", "ppffff")(
+        lambda c, h, hb, x, y, w, hh: fill_figs(h, hb, [ellipse_pts(x, y, w, hh)]))
+    reg("GdipFillEllipseI", "ppiiii")(
+        lambda c, h, hb, x, y, w, hh: fill_figs(h, hb, [ellipse_pts(x, y, w, hh)]))
+    reg("GdipFillPie", "ppffffff")(
+        lambda c, h, hb, x, y, w, hh, s, sw: fill_figs(h, hb, [pie_pts(x, y, w, hh, s, sw)]))
+    reg("GdipFillPieI", "ppiiiiff")(
+        lambda c, h, hb, x, y, w, hh, s, sw: fill_figs(h, hb, [pie_pts(x, y, w, hh, s, sw)]))
+
+    def read_ptsf(pts, n):
+        return [rd_f(pts + 8 * i, 2) for i in range(n)]
+
+    def read_ptsi(pts, n):
+        return [tuple(float(v) for v in rd_i(pts + 8 * i, 2)) for i in range(n)]
+
+    reg("GdipFillPolygon", "pppii")(
+        lambda c, h, hb, pts, n, fm: fill_figs(h, hb, [read_ptsf(pts, n)], fm == 1)
+        if pts and n > 0 else GP_INVALID)
+    reg("GdipFillPolygonI", "pppii")(
+        lambda c, h, hb, pts, n, fm: fill_figs(h, hb, [read_ptsi(pts, n)], fm == 1)
+        if pts and n > 0 else GP_INVALID)
+    reg("GdipFillPolygon2", "pppi")(
+        lambda c, h, hb, pts, n: fill_figs(h, hb, [read_ptsf(pts, n)])
+        if pts and n > 0 else GP_INVALID)
+    reg("GdipFillPolygon2I", "pppi")(
+        lambda c, h, hb, pts, n: fill_figs(h, hb, [read_ptsi(pts, n)])
+        if pts and n > 0 else GP_INVALID)
+    reg("GdipFillClosedCurve", "pppi")(
+        lambda c, h, hb, pts, n: fill_figs(h, hb, [_gp_curve(read_ptsf(pts, n), 0.5, True)])
+        if pts and n > 0 else GP_INVALID)
+    reg("GdipFillClosedCurveI", "pppi")(
+        lambda c, h, hb, pts, n: fill_figs(h, hb, [_gp_curve(read_ptsi(pts, n), 0.5, True)])
+        if pts and n > 0 else GP_INVALID)
+    reg("GdipFillClosedCurve2", "pppifi")(
+        lambda c, h, hb, pts, n, t, fm: fill_figs(h, hb, [_gp_curve(read_ptsf(pts, n), t, True)],
+                                                  fm == 1) if pts and n > 0 else GP_INVALID)
+    reg("GdipFillClosedCurve2I", "pppifi")(
+        lambda c, h, hb, pts, n, t, fm: fill_figs(h, hb, [_gp_curve(read_ptsi(pts, n), t, True)],
+                                                  fm == 1) if pts and n > 0 else GP_INVALID)
+
+    @reg("GdipFillPath", "ppp")
+    def _fp(c, h, hb, hp):
+        path = get(hp, "path")
+        if path is None:
+            return GP_INVALID
+        return fill_figs(h, hb, [f["pts"] for f in path.figs], path.fill == 1)
+
+    @reg("GdipFillRegion", "ppp")
+    def _frg(c, h, hb, hr):
+        rg = get(hr, "region")
+        if rg is None:
+            return GP_INVALID
+        rects = rg.rects if rg.rects is not None else [(-(1 << 20), -(1 << 20), 1 << 20, 1 << 20)]
+        return fill_figs(h, hb, [rect_pts(l, t, r - l, b - t) for (l, t, r, b) in rects])
+
+    def draw_polys(h, hpen, polys, closed=False):
+        pen = PN(hpen)
+        if pen is None:
+            return GP_INVALID
+
+        def go(g, T, M):
+            for pts, cl in polys:
+                stroke(g, T, [_gp_apply(M, x, y) for (x, y) in pts], pen, cl, M)
+        return with_target(h, go)
+
+    reg("GdipDrawLine", "ppffff")(
+        lambda c, h, hp, x1, y1, x2, y2: draw_polys(h, hp, [([(x1, y1), (x2, y2)], False)]))
+    reg("GdipDrawLineI", "ppiiii")(
+        lambda c, h, hp, x1, y1, x2, y2: draw_polys(h, hp, [([(x1, y1), (x2, y2)], False)]))
+    reg("GdipDrawLines", "pppi")(
+        lambda c, h, hp, pts, n: draw_polys(h, hp, [(read_ptsf(pts, n), False)])
+        if pts and n > 1 else GP_INVALID)
+    reg("GdipDrawLinesI", "pppi")(
+        lambda c, h, hp, pts, n: draw_polys(h, hp, [(read_ptsi(pts, n), False)])
+        if pts and n > 1 else GP_INVALID)
+    reg("GdipDrawRectangle", "ppffff")(
+        lambda c, h, hp, x, y, w, hh: draw_polys(h, hp, [(rect_pts(x, y, w, hh), True)]))
+    reg("GdipDrawRectangleI", "ppiiii")(
+        lambda c, h, hp, x, y, w, hh: draw_polys(h, hp, [(rect_pts(x, y, w, hh), True)]))
+
+    @reg("GdipDrawRectangles", "pppi")
+    def _drs(c, h, hp, rects, n):
+        if not rects or n <= 0:
+            return GP_INVALID
+        return draw_polys(h, hp, [(rect_pts(*rd_f(rects + 16 * i, 4)), True) for i in range(n)])
+
+    @reg("GdipDrawRectanglesI", "pppi")
+    def _drsi(c, h, hp, rects, n):
+        if not rects or n <= 0:
+            return GP_INVALID
+        return draw_polys(h, hp, [(rect_pts(*rd_i(rects + 16 * i, 4)), True) for i in range(n)])
+
+    reg("GdipDrawEllipse", "ppffff")(
+        lambda c, h, hp, x, y, w, hh: draw_polys(h, hp, [(ellipse_pts(x, y, w, hh), True)]))
+    reg("GdipDrawEllipseI", "ppiiii")(
+        lambda c, h, hp, x, y, w, hh: draw_polys(h, hp, [(ellipse_pts(x, y, w, hh), True)]))
+    reg("GdipDrawArc", "ppffffff")(
+        lambda c, h, hp, x, y, w, hh, s, sw: draw_polys(
+            h, hp, [(_gp_arc_pts(x, y, w, hh, s, sw), False)]))
+    reg("GdipDrawArcI", "ppiiiiff")(
+        lambda c, h, hp, x, y, w, hh, s, sw: draw_polys(
+            h, hp, [(_gp_arc_pts(x, y, w, hh, s, sw), False)]))
+    reg("GdipDrawPie", "ppffffff")(
+        lambda c, h, hp, x, y, w, hh, s, sw: draw_polys(
+            h, hp, [(pie_pts(x, y, w, hh, s, sw), True)]))
+    reg("GdipDrawPieI", "ppiiiiff")(
+        lambda c, h, hp, x, y, w, hh, s, sw: draw_polys(
+            h, hp, [(pie_pts(x, y, w, hh, s, sw), True)]))
+    reg("GdipDrawPolygon", "pppi")(
+        lambda c, h, hp, pts, n: draw_polys(h, hp, [(read_ptsf(pts, n), True)])
+        if pts and n > 1 else GP_INVALID)
+    reg("GdipDrawPolygonI", "pppi")(
+        lambda c, h, hp, pts, n: draw_polys(h, hp, [(read_ptsi(pts, n), True)])
+        if pts and n > 1 else GP_INVALID)
+    reg("GdipDrawBezier", "ppffffffff")(
+        lambda c, h, hp, a, b, c2, d, e, f, g_, hh: draw_polys(
+            h, hp, [(_gp_bezier([(a, b), (c2, d), (e, f), (g_, hh)]), False)]))
+    reg("GdipDrawBezierI", "ppiiiiiiii")(
+        lambda c, h, hp, a, b, c2, d, e, f, g_, hh: draw_polys(
+            h, hp, [(_gp_bezier([(a, b), (c2, d), (e, f), (g_, hh)]), False)]))
+    reg("GdipDrawBeziers", "pppi")(
+        lambda c, h, hp, pts, n: draw_polys(h, hp, [(_gp_bezier(read_ptsf(pts, n)), False)])
+        if pts and n >= 4 else GP_INVALID)
+    reg("GdipDrawBeziersI", "pppi")(
+        lambda c, h, hp, pts, n: draw_polys(h, hp, [(_gp_bezier(read_ptsi(pts, n)), False)])
+        if pts and n >= 4 else GP_INVALID)
+    reg("GdipDrawCurve", "pppi")(
+        lambda c, h, hp, pts, n: draw_polys(h, hp, [(_gp_curve(read_ptsf(pts, n)), False)])
+        if pts and n > 1 else GP_INVALID)
+    reg("GdipDrawCurveI", "pppi")(
+        lambda c, h, hp, pts, n: draw_polys(h, hp, [(_gp_curve(read_ptsi(pts, n)), False)])
+        if pts and n > 1 else GP_INVALID)
+    reg("GdipDrawCurve2", "pppif")(
+        lambda c, h, hp, pts, n, t: draw_polys(h, hp, [(_gp_curve(read_ptsf(pts, n), t), False)])
+        if pts and n > 1 else GP_INVALID)
+    reg("GdipDrawCurve2I", "pppif")(
+        lambda c, h, hp, pts, n, t: draw_polys(h, hp, [(_gp_curve(read_ptsi(pts, n), t), False)])
+        if pts and n > 1 else GP_INVALID)
+    reg("GdipDrawClosedCurve", "pppi")(
+        lambda c, h, hp, pts, n: draw_polys(
+            h, hp, [(_gp_curve(read_ptsf(pts, n), 0.5, True), True)])
+        if pts and n > 2 else GP_INVALID)
+    reg("GdipDrawClosedCurveI", "pppi")(
+        lambda c, h, hp, pts, n: draw_polys(
+            h, hp, [(_gp_curve(read_ptsi(pts, n), 0.5, True), True)])
+        if pts and n > 2 else GP_INVALID)
+
+    @reg("GdipDrawPath", "ppp")
+    def _dp(c, h, hp, hpath):
+        path = get(hpath, "path")
+        if path is None:
+            return GP_INVALID
+        return draw_polys(h, hp, [(f["pts"], f["closed"]) for f in path.figs])
+
+    # ---- image attributes / DrawImage ---------------------------------------------------------
+    def IA(h):
+        return get(h, "imageattr")
+
+    @reg("GdipCreateImageAttributes", "p")
+    def _cia(c, pp):
+        put_ptr(pp, new_handle(_Obj("imageattr", cm=None, key=None, wrap=0, gamma=None,
+                                    remap=None, threshold=None)))
+        return GP_OK
+
+    @reg("GdipCloneImageAttributes", "pp")
+    def _clia(c, h, pp):
+        a = IA(h)
+        if a is None:
+            return GP_INVALID
+        n = _Obj("imageattr")
+        n.__dict__.update(a.__dict__)
+        put_ptr(pp, new_handle(n))
+        return GP_OK
+
+    reg("GdipDisposeImageAttributes", "p")(lambda c, h: free_handle(h) if IA(h) else GP_INVALID)
+
+    @reg("GdipSetImageAttributesColorMatrix", "piippi")
+    def _siacm(c, h, typ, enable, pcm, pgray, flags):
+        a = IA(h)
+        if a is None:
+            return GP_INVALID
+        if typ not in (0, 1):                                   # Default / Bitmap only
+            return GP_OK
+        if not enable or not pcm:
+            a.cm = None
+            return GP_OK
+        v = rd_f(pcm, 25)
+        a.cm = [v[i * 5:(i + 1) * 5] for i in range(5)]
+        return GP_OK
+
+    @reg("GdipSetImageAttributesColorKeys", "piiuu")
+    def _siack(c, h, typ, enable, lo, hi):
+        a = IA(h)
+        if a is None:
+            return GP_INVALID
+        a.key = (argb(lo), argb(hi)) if enable else None
+        return GP_OK
+
+    @reg("GdipSetImageAttributesWrapMode", "piui")
+    def _siawm(c, h, wrap, col, clamp):
+        a = IA(h)
+        if a is None:
+            return GP_INVALID
+        a.wrap = wrap
+        return GP_OK
+
+    @reg("GdipSetImageAttributesRemapTable", "piiup")
+    def _siart(c, h, typ, enable, n, tab):
+        a = IA(h)
+        if a is None:
+            return GP_INVALID
+        if enable and tab and n:
+            a.remap = {M_.read32(tab + 8 * i) & 0xFFFFFFFF: M_.read32(tab + 8 * i + 4)
+                       & 0xFFFFFFFF for i in range(n)}
+        else:
+            a.remap = None
+        return GP_OK
+
+    for nm in ("GdipSetImageAttributesGamma", "GdipSetImageAttributesThreshold"):
+        reg(nm, "piif")(lambda c, h, t, e, v: GP_OK if IA(h) else GP_INVALID)
+    for nm in ("GdipSetImageAttributesNoOp", "GdipSetImageAttributesToIdentity"):
+        reg(nm, "pii" if "NoOp" in nm else "pi")(lambda c, h, *a: GP_OK if IA(h) else GP_INVALID)
+    reg("GdipResetImageAttributes", "pi")(
+        lambda c, h, t: (IA(h).__dict__.update(cm=None, key=None, remap=None), GP_OK)[1]
+        if IA(h) else GP_INVALID)
+    reg("GdipSetImageAttributesOutputChannel", "piiu")(lambda c, h, t, e, ch: GP_OK)
+    reg("GdipSetImageAttributesCachedBackground", "pi")(lambda c, h, e: GP_OK)
+
+    def apply_attrs(im, a):
+        """Copy of an image with color matrix / key / remap applied."""
+        n = G["clone_image"](im)
+        px = n.surf.px
+        cm = a.cm
+        key = a.key
+        remap = a.remap
+        for i in range(0, len(px), 4):
+            b, g_, r, al = px[i], px[i + 1], px[i + 2], px[i + 3]
+            if remap is not None:
+                v = remap.get((al << 24) | (r << 16) | (g_ << 8) | b)
+                if v is not None:
+                    b, g_, r, al = v & 255, (v >> 8) & 255, (v >> 16) & 255, (v >> 24) & 255
+            if key is not None:
+                lo, hi = key
+                if lo[0] <= b <= hi[0] and lo[1] <= g_ <= hi[1] and lo[2] <= r <= hi[2]:
+                    px[i:i + 4] = b"\0\0\0\0"
+                    continue
+            if cm is not None:
+                vec = (r / 255.0, g_ / 255.0, b / 255.0, al / 255.0, 1.0)
+                out = [sum(vec[j] * cm[j][c_] for j in range(5)) for c_ in range(4)]
+                r, g_, b, al = [max(0, min(255, int(v * 255 + 0.5))) for v in out]
+            px[i:i + 4] = bytes((b, g_, r, al))
+        return n
+
+    def draw_image(h, hi, dst_pts, src, hia=0):
+        """dst_pts = device-space-world (x,y) of src top-left, top-right, bottom-left."""
+        im = get(hi, "image")
+        if im is None:
+            return GP_INVALID
+        a = IA(hia) if hia else None
+
+        def go(g, T, M):
+            src_im = im
+            ext_pull(src_im)
+            if a is not None and (a.cm is not None or a.key is not None or a.remap is not None):
+                src_im = apply_attrs(src_im, a)
+            sx, sy, sw, sh = src
+            if sw == 0 or sh == 0:
+                return
+            p0, p1, p2 = [_gp_apply(M, x, y) for (x, y) in dst_pts]
+            spx = src_im.surf.px
+            SW, SH = src_im.w, src_im.h
+            W_, H_ = T.surf.w, T.surf.h
+            dpx = T.surf.px
+            opaque = not G["has_alpha"](src_im)
+            axis = abs(p1[1] - p0[1]) < 1e-6 and abs(p2[0] - p0[0]) < 1e-6
+            if axis:
+                x0, x1 = sorted((p0[0], p1[0]))
+                y0, y1 = sorted((p0[1], p2[1]))
+                X0, X1 = int(math.floor(x0 + 0.5)), int(math.floor(x1 + 0.5))
+                Y0, Y1 = int(math.floor(y0 + 0.5)), int(math.floor(y1 + 0.5))
+                if X1 <= X0 or Y1 <= Y0:
+                    return
+                flipx = p1[0] < p0[0]
+                flipy = p2[1] < p0[1]
+                dw, dh = X1 - X0, Y1 - Y0
+                cols = []
+                for i in range(dw):
+                    u = (i + 0.5) / dw
+                    if flipx:
+                        u = 1 - u
+                    cols.append(min(SW - 1, max(0, int(math.floor(sx + u * sw)))))
+                same = cols == list(range(cols[0], cols[0] + dw)) if cols else False
+                for j in range(dh):
+                    y = Y0 + j
+                    if not 0 <= y < H_:
+                        continue
+                    rows = [(cl, cr) for (cl, ct, cr, cb) in T.clip if ct <= y < cb]
+                    if not rows:
+                        continue
+                    v = (j + 0.5) / dh
+                    if flipy:
+                        v = 1 - v
+                    syy = int(math.floor(sy + v * sh))
+                    if not 0 <= syy < SH:
+                        continue
+                    sbase = syy * SW * 4
+                    if same:
+                        srow = spx[sbase + cols[0] * 4:sbase + (cols[0] + dw) * 4]
+                    else:
+                        srow = b"".join(spx[sbase + cx * 4:sbase + cx * 4 + 4] for cx in cols)
+                    for (cl, cr) in rows:
+                        a0, a1 = max(X0, cl, 0), min(X1, cr, W_)
+                        if a0 >= a1:
+                            continue
+                        so = (a0 - X0) * 4
+                        do = (y * W_ + a0) * 4
+                        n = a1 - a0
+                        if opaque or T.copy:
+                            seg = bytearray(srow[so:so + n * 4])
+                            if T.mode == "plain":
+                                seg[3::4] = bytes(n)
+                            elif T.mode == "dib" and not opaque:
+                                pass
+                            dpx[do:do + n * 4] = seg
+                            continue
+                        for q in range(n):
+                            s4 = srow[so + q * 4:so + q * 4 + 4]
+                            al = s4[3]
+                            if al == 0:
+                                continue
+                            blend1(T, do + q * 4, (s4[0], s4[1], s4[2], al))
+                return
+            # general affine: map device pixels back into the source
+            ux, uy = p1[0] - p0[0], p1[1] - p0[1]
+            vx, vy = p2[0] - p0[0], p2[1] - p0[1]
+            det = ux * vy - uy * vx
+            if abs(det) < 1e-9:
+                return
+            xs = [p0[0], p1[0], p2[0], p1[0] + vx]
+            ys = [p0[1], p1[1], p2[1], p1[1] + vy]
+            for y in range(max(0, int(min(ys))), min(H_, int(math.ceil(max(ys))))):
+                rows = [(cl, cr) for (cl, ct, cr, cb) in T.clip if ct <= y < cb]
+                for x in range(max(0, int(min(xs))), min(W_, int(math.ceil(max(xs))))):
+                    if not any(cl <= x < cr for (cl, cr) in rows):
+                        continue
+                    qx, qy = x + 0.5 - p0[0], y + 0.5 - p0[1]
+                    u = (qx * vy - qy * vx) / det
+                    v = (ux * qy - uy * qx) / det
+                    if not (0 <= u < 1 and 0 <= v < 1):
+                        continue
+                    cx = int(sx + u * sw)
+                    cy = int(sy + v * sh)
+                    if 0 <= cx < SW and 0 <= cy < SH:
+                        o = (cy * SW + cx) * 4
+                        blend1(T, (y * W_ + x) * 4, (spx[o], spx[o + 1], spx[o + 2], spx[o + 3]))
+        return with_target(h, go)
+
+    def rect_dst(x, y, w, h):
+        return [(x, y), (x + w, y), (x, y + h)]
+
+    def img_size(hi):
+        im = get(hi, "image")
+        return (im.w, im.h) if im is not None else (0, 0)
+
+    def natural(hi, g_h):
+        """Image size in world units at the image's resolution (GDI+ honors DPI)."""
+        im = get(hi, "image")
+        if im is None:
+            return 0.0, 0.0
+        g = G_(g_h)
+        f = page_factor(g) if g is not None else 1.0
+        return im.w * 96.0 / im.dpi[0] / f, im.h * 96.0 / im.dpi[1] / f
+
+    @reg("GdipDrawImage", "ppff")
+    def _di(c, h, hi, x, y):
+        w, hh = natural(hi, h)
+        sw, sh = img_size(hi)
+        return draw_image(h, hi, rect_dst(x, y, w, hh), (0, 0, sw, sh))
+
+    reg("GdipDrawImageI", "ppii")(lambda c, h, hi, x, y: _di(c, h, hi, float(x), float(y)))
+
+    @reg("GdipDrawImageRect", "ppffff")
+    def _dir(c, h, hi, x, y, w, hh):
+        sw, sh = img_size(hi)
+        return draw_image(h, hi, rect_dst(x, y, w, hh), (0, 0, sw, sh))
+
+    reg("GdipDrawImageRectI", "ppiiii")(
+        lambda c, h, hi, x, y, w, hh: _dir(c, h, hi, float(x), float(y), float(w), float(hh)))
+
+    @reg("GdipDrawImageRectRect", "ppffffffffippp")
+    def _dirr(c, h, hi, dx, dy, dw, dh, sx, sy, sw, sh, unit, hia, cb, cbd):
+        f = _GP_UNIT.get(unit, 1.0)
+        return draw_image(h, hi, rect_dst(dx, dy, dw, dh), (sx * f, sy * f, sw * f, sh * f), hia)
+
+    @reg("GdipDrawImageRectRectI", "ppiiiiiiiiippp")
+    def _dirri(c, h, hi, dx, dy, dw, dh, sx, sy, sw, sh, unit, hia, cb, cbd):
+        f = _GP_UNIT.get(unit, 1.0)
+        return draw_image(h, hi, rect_dst(dx, dy, dw, dh), (sx * f, sy * f, sw * f, sh * f), hia)
+
+    @reg("GdipDrawImagePointRect", "ppffffffi")
+    def _dipr(c, h, hi, x, y, sx, sy, sw, sh, unit):
+        f = _GP_UNIT.get(unit, 1.0)
+        return draw_image(h, hi, rect_dst(x, y, sw * f, sh * f), (sx * f, sy * f, sw * f,
+                                                                  sh * f))
+
+    @reg("GdipDrawImagePointRectI", "ppiiiiiii")
+    def _dipri(c, h, hi, x, y, sx, sy, sw, sh, unit):
+        return _dipr(c, h, hi, float(x), float(y), float(sx), float(sy), float(sw), float(sh),
+                     unit)
+
+    @reg("GdipDrawImagePoints", "pppi")
+    def _dip(c, h, hi, pts, n):
+        if n != 3 or not pts:
+            return GP_INVALID
+        sw, sh = img_size(hi)
+        return draw_image(h, hi, read_ptsf(pts, 3), (0, 0, sw, sh))
+
+    @reg("GdipDrawImagePointsI", "pppi")
+    def _dipi(c, h, hi, pts, n):
+        if n != 3 or not pts:
+            return GP_INVALID
+        sw, sh = img_size(hi)
+        return draw_image(h, hi, read_ptsi(pts, 3), (0, 0, sw, sh))
+
+    @reg("GdipDrawImagePointsRect", "pppiffffippp")
+    def _diprr(c, h, hi, pts, n, sx, sy, sw, sh, unit, hia, cb, cbd):
+        if n != 3 or not pts:
+            return GP_INVALID
+        f = _GP_UNIT.get(unit, 1.0)
+        return draw_image(h, hi, read_ptsf(pts, 3), (sx * f, sy * f, sw * f, sh * f), hia)
+
+    @reg("GdipDrawImagePointsRectI", "pppiiiiiippp")
+    def _diprri(c, h, hi, pts, n, sx, sy, sw, sh, unit, hia, cb, cbd):
+        if n != 3 or not pts:
+            return GP_INVALID
+        f = _GP_UNIT.get(unit, 1.0)
+        return draw_image(h, hi, read_ptsi(pts, 3), (sx * f, sy * f, sw * f, sh * f), hia)
+
+    @reg("GdipCreateCachedBitmap", "ppp")
+    def _ccb(c, hi, h, pp):
+        im = get(hi, "image")
+        if im is None or G_(h) is None:
+            return GP_INVALID
+        n = G["clone_image"](im)
+        n.kind = "image"
+        put_ptr(pp, new_handle(_Obj("cachedbmp", img=new_handle(n))))
+        return GP_OK
+
+    @reg("GdipDrawCachedBitmap", "ppii")
+    def _dcb(c, h, hc, x, y):
+        cb = get(hc, "cachedbmp")
+        g = G_(h)
+        if cb is None or g is None:
+            return GP_INVALID
+        saved = g.m
+        g.m = (1.0, 0.0, 0.0, 1.0, saved[4], saved[5])
+        try:
+            sw, sh = img_size(cb.img)
+            return draw_image(h, cb.img, rect_dst(x, y, sw, sh), (0, 0, sw, sh))
+        finally:
+            g.m = saved
+
+    @reg("GdipDeleteCachedBitmap", "p")
+    def _dcbm(c, hc):
+        cb = get(hc, "cachedbmp")
+        if cb is None:
+            return GP_INVALID
+        free_handle(cb.img)
+        return free_handle(hc)
+
+    _gdiplus_text_install(k, locals())
+
+
+# ==========================================================================================
+# 10v. GDI+ paths, regions, font families / fonts, string formats and text
+# ==========================================================================================
+def _gdiplus_text_install(k, env):
+    p = k.p
+    M_ = p.mem
+    gdi = p.gdi
+    G = p._gdip
+    get, new_handle, reg = G["get"], G["new_handle"], G["reg"]
+    put_ptr, put_f, put_u, rd_f, rd_i, rd_ptr = (G["put_ptr"], G["put_f"], G["put_u"], G["rd_f"],
+                                                 G["rd_i"], G["rd_ptr"])
+    free_handle, _Obj, mat = G["free_handle"], G["_Obj"], G["mat"]
+    G_, B, PN = env["G_"], env["B"], env["PN"]
+    with_target, fill_spans, brush_paint = env["with_target"], env["fill_spans"], \
+        env["brush_paint"]
+    dev_matrix, page_factor = env["dev_matrix"], env["page_factor"]
+    read_ptsf, read_ptsi = env["read_ptsf"], env["read_ptsi"]
+    rect_pts, ellipse_pts, pie_pts = env["rect_pts"], env["ellipse_pts"], env["pie_pts"]
+
+    def P():
+        return 8 if p.cpu_mode == 64 else 4
+
+    # ---- paths --------------------------------------------------------------------------------
+    def PT(h):
+        return get(h, "path")
+
+    def new_path(fill=0):
+        return _Obj("path", figs=[], fill=fill, new_fig=True)
+
+    def cur_fig(path):
+        if path.new_fig or not path.figs or path.figs[-1]["closed"]:
+            path.figs.append({"pts": [], "closed": False})
+            path.new_fig = False
+        return path.figs[-1]
+
+    def add_open(path, pts):
+        if not pts:
+            return
+        f = cur_fig(path)
+        if f["pts"] and f["pts"][-1] == tuple(pts[0]):
+            pts = pts[1:]
+        f["pts"].extend(tuple(q) for q in pts)
+
+    def add_closed(path, pts):
+        path.figs.append({"pts": [tuple(q) for q in pts], "closed": True})
+        path.new_fig = True
+
+    @reg("GdipCreatePath", "ip")
+    def _cpath(c, fill, pp):
+        if not pp:
+            return GP_INVALID
+        put_ptr(pp, new_handle(new_path(fill)))
+        return GP_OK
+
+    def path_from_types(pts, types, fill):
+        path = new_path(fill)
+        i = 0
+        n = len(pts)
+        while i < n:
+            t = types[i] & 7
+            if t == 0:
+                path.new_fig = True
+                add_open(path, [pts[i]])
+                i += 1
+            elif t == 3 and i + 2 < n:
+                f = cur_fig(path)
+                start = f["pts"][-1] if f["pts"] else pts[i]
+                add_open(path, _gp_bezier([start, pts[i], pts[i + 1], pts[i + 2]])[1:])
+                close = types[i + 2] & 0x80
+                i += 3
+                if close:
+                    path.figs[-1]["closed"] = True
+                    path.new_fig = True
+                continue
+            else:
+                add_open(path, [pts[i]])
+                i += 1
+            if types[i - 1] & 0x80:
+                path.figs[-1]["closed"] = True
+                path.new_fig = True
+        return path
+
+    @reg("GdipCreatePath2", "ppiip")
+    def _cpath2(c, pts, types, n, fill, pp):
+        if not pts or not types or n < 0:
+            return GP_INVALID
+        put_ptr(pp, new_handle(path_from_types(read_ptsf(pts, n), M_.read(types, n), fill)))
+        return GP_OK
+
+    @reg("GdipCreatePath2I", "ppiip")
+    def _cpath2i(c, pts, types, n, fill, pp):
+        if not pts or not types or n < 0:
+            return GP_INVALID
+        put_ptr(pp, new_handle(path_from_types(read_ptsi(pts, n), M_.read(types, n), fill)))
+        return GP_OK
+
+    @reg("GdipClonePath", "pp")
+    def _clpath(c, h, pp):
+        path = PT(h)
+        if path is None:
+            return GP_INVALID
+        n = new_path(path.fill)
+        n.figs = [{"pts": list(f["pts"]), "closed": f["closed"]} for f in path.figs]
+        n.new_fig = path.new_fig
+        put_ptr(pp, new_handle(n))
+        return GP_OK
+
+    reg("GdipDeletePath", "p")(lambda c, h: free_handle(h) if PT(h) else GP_INVALID)
+
+    @reg("GdipResetPath", "p")
+    def _rpath(c, h):
+        path = PT(h)
+        if path is None:
+            return GP_INVALID
+        path.figs = []
+        path.new_fig = True
+        path.fill = 0
+        return GP_OK
+
+    @reg("GdipStartPathFigure", "p")
+    def _spf(c, h):
+        path = PT(h)
+        if path is None:
+            return GP_INVALID
+        path.new_fig = True
+        return GP_OK
+
+    @reg("GdipClosePathFigure", "p")
+    def _cpf(c, h):
+        path = PT(h)
+        if path is None:
+            return GP_INVALID
+        if path.figs:
+            path.figs[-1]["closed"] = True
+        path.new_fig = True
+        return GP_OK
+
+    @reg("GdipClosePathFigures", "p")
+    def _cpfs(c, h):
+        path = PT(h)
+        if path is None:
+            return GP_INVALID
+        for f in path.figs:
+            f["closed"] = True
+        path.new_fig = True
+        return GP_OK
+
+    @reg("GdipSetPathFillMode", "pi")
+    def _spfm(c, h, fm):
+        path = PT(h)
+        if path is None:
+            return GP_INVALID
+        path.fill = fm
+        return GP_OK
+
+    @reg("GdipGetPathFillMode", "pp")
+    def _gpfm(c, h, pfm):
+        path = PT(h)
+        if path is None:
+            return GP_INVALID
+        put_u(pfm, path.fill)
+        return GP_OK
+
+    def P_(fn):
+        """Wrap an adder: fn(path, *args) -> GP status."""
+        def w(c, h, *a):
+            path = PT(h)
+            if path is None:
+                return GP_INVALID
+            r = fn(path, *a)
+            return GP_OK if r is None else r
+        return w
+
+    reg("GdipAddPathLine", "pffff")(P_(lambda pa, x1, y1, x2, y2: add_open(pa, [(x1, y1),
+                                                                                  (x2, y2)])))
+    reg("GdipAddPathLineI", "piiii")(P_(lambda pa, x1, y1, x2, y2: add_open(
+        pa, [(float(x1), float(y1)), (float(x2), float(y2))])))
+    reg("GdipAddPathLine2", "ppi")(P_(lambda pa, pts, n: add_open(pa, read_ptsf(pts, n))
+                                      if pts and n > 0 else GP_INVALID))
+    reg("GdipAddPathLine2I", "ppi")(P_(lambda pa, pts, n: add_open(pa, read_ptsi(pts, n))
+                                       if pts and n > 0 else GP_INVALID))
+    reg("GdipAddPathArc", "pffffff")(P_(lambda pa, x, y, w, h, s, sw: add_open(
+        pa, _gp_arc_pts(x, y, w, h, s, sw))))
+    reg("GdipAddPathArcI", "piiiiff")(P_(lambda pa, x, y, w, h, s, sw: add_open(
+        pa, _gp_arc_pts(x, y, w, h, s, sw))))
+    reg("GdipAddPathBezier", "pffffffff")(P_(lambda pa, a, b, c2, d, e, f, g_, h: add_open(
+        pa, _gp_bezier([(a, b), (c2, d), (e, f), (g_, h)]))))
+    reg("GdipAddPathBezierI", "piiiiiiii")(P_(lambda pa, a, b, c2, d, e, f, g_, h: add_open(
+        pa, _gp_bezier([(a, b), (c2, d), (e, f), (g_, h)]))))
+    reg("GdipAddPathBeziers", "ppi")(P_(lambda pa, pts, n: add_open(
+        pa, _gp_bezier(read_ptsf(pts, n))) if pts and n >= 4 else GP_INVALID))
+    reg("GdipAddPathBeziersI", "ppi")(P_(lambda pa, pts, n: add_open(
+        pa, _gp_bezier(read_ptsi(pts, n))) if pts and n >= 4 else GP_INVALID))
+    reg("GdipAddPathCurve", "ppi")(P_(lambda pa, pts, n: add_open(
+        pa, _gp_curve(read_ptsf(pts, n))) if pts and n > 1 else GP_INVALID))
+    reg("GdipAddPathCurveI", "ppi")(P_(lambda pa, pts, n: add_open(
+        pa, _gp_curve(read_ptsi(pts, n))) if pts and n > 1 else GP_INVALID))
+    reg("GdipAddPathCurve2", "ppif")(P_(lambda pa, pts, n, t: add_open(
+        pa, _gp_curve(read_ptsf(pts, n), t)) if pts and n > 1 else GP_INVALID))
+    reg("GdipAddPathCurve2I", "ppif")(P_(lambda pa, pts, n, t: add_open(
+        pa, _gp_curve(read_ptsi(pts, n), t)) if pts and n > 1 else GP_INVALID))
+    reg("GdipAddPathClosedCurve", "ppi")(P_(lambda pa, pts, n: add_closed(
+        pa, _gp_curve(read_ptsf(pts, n), 0.5, True)) if pts and n > 2 else GP_INVALID))
+    reg("GdipAddPathClosedCurveI", "ppi")(P_(lambda pa, pts, n: add_closed(
+        pa, _gp_curve(read_ptsi(pts, n), 0.5, True)) if pts and n > 2 else GP_INVALID))
+    reg("GdipAddPathRectangle", "pffff")(P_(lambda pa, x, y, w, h: add_closed(
+        pa, rect_pts(x, y, w, h))))
+    reg("GdipAddPathRectangleI", "piiii")(P_(lambda pa, x, y, w, h: add_closed(
+        pa, rect_pts(float(x), float(y), float(w), float(h)))))
+
+    def _add_rects(pa, rects, n, ints):
+        if not rects or n <= 0:
+            return GP_INVALID
+        for i in range(n):
+            r = rd_i(rects + 16 * i, 4) if ints else rd_f(rects + 16 * i, 4)
+            add_closed(pa, rect_pts(*[float(v) for v in r]))
+    reg("GdipAddPathRectangles", "ppi")(P_(lambda pa, r, n: _add_rects(pa, r, n, False)))
+    reg("GdipAddPathRectanglesI", "ppi")(P_(lambda pa, r, n: _add_rects(pa, r, n, True)))
+    reg("GdipAddPathEllipse", "pffff")(P_(lambda pa, x, y, w, h: add_closed(
+        pa, ellipse_pts(x, y, w, h))))
+    reg("GdipAddPathEllipseI", "piiii")(P_(lambda pa, x, y, w, h: add_closed(
+        pa, ellipse_pts(x, y, w, h))))
+    reg("GdipAddPathPie", "pffffff")(P_(lambda pa, x, y, w, h, s, sw: add_closed(
+        pa, pie_pts(x, y, w, h, s, sw))))
+    reg("GdipAddPathPieI", "piiiiff")(P_(lambda pa, x, y, w, h, s, sw: add_closed(
+        pa, pie_pts(x, y, w, h, s, sw))))
+    reg("GdipAddPathPolygon", "ppi")(P_(lambda pa, pts, n: add_closed(pa, read_ptsf(pts, n))
+                                        if pts and n > 2 else GP_INVALID))
+    reg("GdipAddPathPolygonI", "ppi")(P_(lambda pa, pts, n: add_closed(pa, read_ptsi(pts, n))
+                                         if pts and n > 2 else GP_INVALID))
+
+    @reg("GdipAddPathPath", "ppi")
+    def _app(c, h, h2, connect):
+        path, other = PT(h), PT(h2)
+        if path is None or other is None:
+            return GP_INVALID
+        for i, f in enumerate(other.figs):
+            if i == 0 and connect and not f["closed"]:
+                add_open(path, f["pts"])
+            else:
+                path.figs.append({"pts": list(f["pts"]), "closed": f["closed"]})
+                path.new_fig = f["closed"]
+        return GP_OK
+
+    def all_pts(path):
+        return [q for f in path.figs for q in f["pts"]]
+
+    def path_types(path):
+        t = []
+        for f in path.figs:
+            n = len(f["pts"])
+            for i in range(n):
+                v = 0 if i == 0 else 1
+                if i == n - 1 and f["closed"]:
+                    v |= 0x80
+                t.append(v)
+        return bytes(t)
+
+    @reg("GdipGetPointCount", "pp")
+    def _gpcnt(c, h, pn):
+        path = PT(h)
+        if path is None:
+            return GP_INVALID
+        put_u(pn, len(all_pts(path)))
+        return GP_OK
+
+    @reg("GdipGetPathPoints", "ppi")
+    def _gpp(c, h, buf, n):
+        path = PT(h)
+        if path is None or not buf:
+            return GP_INVALID
+        pts = all_pts(path)
+        if n < len(pts):
+            return GP_INVALID
+        for i, (x, y) in enumerate(pts):
+            put_f(buf + 8 * i, x, y)
+        return GP_OK
+
+    @reg("GdipGetPathPointsI", "ppi")
+    def _gppi(c, h, buf, n):
+        path = PT(h)
+        if path is None or not buf:
+            return GP_INVALID
+        pts = all_pts(path)
+        if n < len(pts):
+            return GP_INVALID
+        for i, (x, y) in enumerate(pts):
+            M_.write(buf + 8 * i, struct.pack("<ii", int(round(x)), int(round(y))))
+        return GP_OK
+
+    @reg("GdipGetPathTypes", "ppi")
+    def _gpt(c, h, buf, n):
+        path = PT(h)
+        if path is None or not buf:
+            return GP_INVALID
+        t = path_types(path)
+        if n < len(t):
+            return GP_INVALID
+        M_.write(buf, t)
+        return GP_OK
+
+    @reg("GdipGetPathData", "pp")
+    def _gpd(c, h, pd):
+        path = PT(h)
+        if path is None or not pd:
+            return GP_INVALID
+        pts = all_pts(path)
+        ptsb = rd_ptr(pd + P())
+        typb = rd_ptr(pd + 2 * P())
+        for i, (x, y) in enumerate(pts):
+            put_f(ptsb + 8 * i, x, y)
+        M_.write(typb, path_types(path))
+        M_.write32(pd, len(pts))
+        return GP_OK
+
+    @reg("GdipGetPathLastPoint", "pp")
+    def _gplp(c, h, pt):
+        path = PT(h)
+        pts = all_pts(path) if path is not None else []
+        if not pts:
+            return GP_INVALID
+        put_f(pt, *pts[-1])
+        return GP_OK
+
+    def path_bounds(path, m=None, pen=None):
+        pts = all_pts(path)
+        if m is not None:
+            pts = [_gp_apply(m, x, y) for (x, y) in pts]
+        if not pts:
+            return (0.0, 0.0, 0.0, 0.0)
+        xs = [q[0] for q in pts]
+        ys = [q[1] for q in pts]
+        hw = (pen.width / 2.0) if pen is not None else 0.0
+        return (min(xs) - hw, min(ys) - hw, max(xs) - min(xs) + 2 * hw,
+                max(ys) - min(ys) + 2 * hw)
+
+    @reg("GdipGetPathWorldBounds", "pppp")
+    def _gpwb(c, h, pr, hm, hp):
+        path = PT(h)
+        if path is None or not pr:
+            return GP_INVALID
+        m = mat(hm)
+        put_f(pr, *path_bounds(path, m.m if m else None, PN(hp)))
+        return GP_OK
+
+    @reg("GdipGetPathWorldBoundsI", "pppp")
+    def _gpwbi(c, h, pr, hm, hp):
+        path = PT(h)
+        if path is None or not pr:
+            return GP_INVALID
+        m = mat(hm)
+        b = path_bounds(path, m.m if m else None, PN(hp))
+        M_.write(pr, struct.pack("<4i", *[int(math.floor(v + 0.5)) for v in b]))
+        return GP_OK
+
+    @reg("GdipTransformPath", "pp")
+    def _tpath(c, h, hm):
+        path = PT(h)
+        if path is None:
+            return GP_INVALID
+        m = mat(hm)
+        if m is not None:
+            for f in path.figs:
+                f["pts"] = [_gp_apply(m.m, x, y) for (x, y) in f["pts"]]
+        return GP_OK
+
+    @reg("GdipFlattenPath", "ppf")
+    def _flp(c, h, hm, flat):
+        return _tpath(c, h, hm)
+
+    @reg("GdipWidenPath", "pppf")
+    def _wp(c, h, hp, hm, flat):
+        path = PT(h)
+        pen = PN(hp)
+        if path is None or pen is None:
+            return GP_INVALID
+        hw = pen.width / 2.0
+        out = []
+        for f in path.figs:
+            pts = f["pts"] + ([f["pts"][0]] if f["closed"] and f["pts"] else [])
+            for i in range(1, len(pts)):
+                (x0, y0), (x1, y1) = pts[i - 1], pts[i]
+                ln = math.hypot(x1 - x0, y1 - y0)
+                if ln < 1e-9:
+                    continue
+                nx, ny = -(y1 - y0) / ln * hw, (x1 - x0) / ln * hw
+                out.append({"pts": [(x0 + nx, y0 + ny), (x1 + nx, y1 + ny), (x1 - nx, y1 - ny),
+                                    (x0 - nx, y0 - ny)], "closed": True})
+        path.figs = out
+        path.fill = 1
+        path.new_fig = True
+        return _tpath(c, h, hm)
+
+    @reg("GdipReversePath", "p")
+    def _revp(c, h):
+        path = PT(h)
+        if path is None:
+            return GP_INVALID
+        path.figs = [{"pts": f["pts"][::-1], "closed": f["closed"]} for f in path.figs[::-1]]
+        return GP_OK
+
+    def pt_in(path, x, y):
+        wn = 0
+        cnt = 0
+        for f in path.figs:
+            pts = f["pts"]
+            n = len(pts)
+            for i in range(n):
+                (xa, ya), (xb, yb) = pts[i], pts[(i + 1) % n]
+                if (ya <= y < yb) or (yb <= y < ya):
+                    xi = xa + (y - ya) * (xb - xa) / (yb - ya)
+                    if xi > x:
+                        cnt += 1
+                        wn += 1 if yb > ya else -1
+        return bool(wn) if path.fill == 1 else bool(cnt & 1)
+
+    @reg("GdipIsVisiblePathPoint", "pffpp")
+    def _ivpp(c, h, x, y, hg, pb):
+        path = PT(h)
+        if path is None or not pb:
+            return GP_INVALID
+        put_u(pb, 1 if pt_in(path, x, y) else 0)
+        return GP_OK
+
+    reg("GdipIsVisiblePathPointI", "piipp")(
+        lambda c, h, x, y, hg, pb: _ivpp(c, h, float(x), float(y), hg, pb))
+
+    def seg_dist(px_, py_, a, b):
+        (x0, y0), (x1, y1) = a, b
+        dx, dy = x1 - x0, y1 - y0
+        dd = dx * dx + dy * dy
+        t = 0.0 if dd == 0 else max(0.0, min(1.0, ((px_ - x0) * dx + (py_ - y0) * dy) / dd))
+        return math.hypot(px_ - (x0 + t * dx), py_ - (y0 + t * dy))
+
+    @reg("GdipIsOutlineVisiblePathPoint", "pffppp")
+    def _iovpp(c, h, x, y, hp, hg, pb):
+        path, pen = PT(h), PN(hp)
+        if path is None or pen is None or not pb:
+            return GP_INVALID
+        hw = max(0.5, pen.width / 2.0)
+        hit = False
+        for f in path.figs:
+            pts = f["pts"] + ([f["pts"][0]] if f["closed"] and f["pts"] else [])
+            for i in range(1, len(pts)):
+                if seg_dist(x, y, pts[i - 1], pts[i]) <= hw:
+                    hit = True
+                    break
+        put_u(pb, 1 if hit else 0)
+        return GP_OK
+
+    reg("GdipIsOutlineVisiblePathPointI", "piippp")(
+        lambda c, h, x, y, hp, hg, pb: _iovpp(c, h, float(x), float(y), hp, hg, pb))
+
+    # ---- regions ------------------------------------------------------------------------------
+    def RG(h):
+        return get(h, "region")
+
+    def new_region(rects=None):
+        return new_handle(_Obj("region", rects=rects))
+
+    def rf_rect(r):
+        x, y, w, h = r
+        return (int(math.floor(x + 0.5)), int(math.floor(y + 0.5)),
+                int(math.floor(x + w + 0.5)), int(math.floor(y + h + 0.5)))
+
+    def path_rects(path):
+        return _spans_to_rects(_gp_scan([f["pts"] for f in path.figs], path.fill == 1))
+
+    @reg("GdipCreateRegion", "p")
+    def _crg(c, pp):
+        put_ptr(pp, new_region(None))
+        return GP_OK
+
+    reg("GdipCreateRegionRect", "pp")(lambda c, pr, pp: (put_ptr(pp, new_region(
+        [rf_rect(rd_f(pr, 4))])), GP_OK)[1] if pr else GP_INVALID)
+    reg("GdipCreateRegionRectI", "pp")(lambda c, pr, pp: (put_ptr(pp, new_region(
+        [rf_rect(rd_i(pr, 4))])), GP_OK)[1] if pr else GP_INVALID)
+
+    @reg("GdipCreateRegionPath", "pp")
+    def _crgp(c, hp, pp):
+        path = PT(hp)
+        if path is None:
+            return GP_INVALID
+        put_ptr(pp, new_region(path_rects(path)))
+        return GP_OK
+
+    @reg("GdipCreateRegionHrgn", "pp")
+    def _crgh(c, hrgn, pp):
+        r = gdi.get(hrgn, "region")
+        if r is None:
+            return GP_INVALID
+        put_ptr(pp, new_region(list(r.rects)))
+        return GP_OK
+
+    @reg("GdipCreateRegionRgnData", "pip")
+    def _crgd(c, data, size, pp):
+        if not data or size < 32:
+            return GP_INVALID
+        n = M_.read32(data + 8)
+        rects = [rd_i(data + 32 + 16 * i, 4) for i in range(n)]
+        put_ptr(pp, new_region([tuple(r) for r in rects]))
+        return GP_OK
+
+    @reg("GdipCloneRegion", "pp")
+    def _clrg(c, h, pp):
+        rg = RG(h)
+        if rg is None:
+            return GP_INVALID
+        put_ptr(pp, new_region(None if rg.rects is None else list(rg.rects)))
+        return GP_OK
+
+    reg("GdipDeleteRegion", "p")(lambda c, h: free_handle(h) if RG(h) else GP_INVALID)
+    reg("GdipSetInfinite", "p")(lambda c, h: (setattr(RG(h), "rects", None), GP_OK)[1]
+                                if RG(h) else GP_INVALID)
+    reg("GdipSetEmpty", "p")(lambda c, h: (setattr(RG(h), "rects", []), GP_OK)[1]
+                             if RG(h) else GP_INVALID)
+
+    def combine(h, rects, mode):
+        rg = RG(h)
+        if rg is None:
+            return GP_INVALID
+        rg.rects = _gp_rect_ops(rg.rects, rects, mode)
+        return GP_OK
+
+    reg("GdipCombineRegionRect", "ppi")(lambda c, h, pr, m: combine(h, [rf_rect(rd_f(pr, 4))],
+                                                                     m) if pr else GP_INVALID)
+    reg("GdipCombineRegionRectI", "ppi")(lambda c, h, pr, m: combine(
+        h, [rf_rect(rd_i(pr, 4))], m) if pr else GP_INVALID)
+    reg("GdipCombineRegionPath", "ppi")(lambda c, h, hp, m: combine(h, path_rects(PT(hp)), m)
+                                        if PT(hp) else GP_INVALID)
+    reg("GdipCombineRegionRegion", "ppi")(
+        lambda c, h, h2, m: combine(h, None if RG(h2).rects is None else list(RG(h2).rects), m)
+        if RG(h2) else GP_INVALID)
+
+    @reg("GdipTranslateRegion", "pff")
+    def _trg(c, h, dx, dy):
+        rg = RG(h)
+        if rg is None:
+            return GP_INVALID
+        if rg.rects is not None:
+            ix, iy = int(round(dx)), int(round(dy))
+            rg.rects = [(l + ix, t + iy, r + ix, b + iy) for (l, t, r, b) in rg.rects]
+        return GP_OK
+
+    reg("GdipTranslateRegionI", "pii")(lambda c, h, dx, dy: _trg(c, h, float(dx), float(dy)))
+    reg("GdipTransformRegion", "pp")(lambda c, h, hm: GP_OK if RG(h) else GP_INVALID)
+
+    def rg_bounds(rg):
+        if rg.rects is None:
+            return (-4194304.0, -4194304.0, 8388608.0, 8388608.0)
+        if not rg.rects:
+            return (0.0, 0.0, 0.0, 0.0)
+        l = min(r[0] for r in rg.rects)
+        t = min(r[1] for r in rg.rects)
+        return (float(l), float(t), float(max(r[2] for r in rg.rects) - l),
+                float(max(r[3] for r in rg.rects) - t))
+
+    @reg("GdipGetRegionBounds", "ppp")
+    def _grb(c, h, hg, pr):
+        rg = RG(h)
+        if rg is None or not pr:
+            return GP_INVALID
+        put_f(pr, *rg_bounds(rg))
+        return GP_OK
+
+    @reg("GdipGetRegionBoundsI", "ppp")
+    def _grbi(c, h, hg, pr):
+        rg = RG(h)
+        if rg is None or not pr:
+            return GP_INVALID
+        M_.write(pr, struct.pack("<4i", *[int(v) for v in rg_bounds(rg)]))
+        return GP_OK
+
+    @reg("GdipIsEmptyRegion", "ppp")
+    def _ier(c, h, hg, pb):
+        rg = RG(h)
+        if rg is None:
+            return GP_INVALID
+        put_u(pb, 1 if rg.rects is not None and not any(r[2] > r[0] and r[3] > r[1]
+                                                        for r in rg.rects) else 0)
+        return GP_OK
+
+    @reg("GdipIsInfiniteRegion", "ppp")
+    def _iir(c, h, hg, pb):
+        rg = RG(h)
+        if rg is None:
+            return GP_INVALID
+        put_u(pb, 1 if rg.rects is None else 0)
+        return GP_OK
+
+    @reg("GdipIsEqualRegion", "pppp")
+    def _ieqr(c, h, h2, hg, pb):
+        a, b = RG(h), RG(h2)
+        if a is None or b is None:
+            return GP_INVALID
+        if a.rects is None or b.rects is None:
+            eq = a.rects is None and b.rects is None
+        else:
+            eq = not _gp_rect_ops(a.rects, b.rects, 3)
+        put_u(pb, 1 if eq else 0)
+        return GP_OK
+
+    @reg("GdipIsVisibleRegionPoint", "pffpp")
+    def _ivrp(c, h, x, y, hg, pb):
+        rg = RG(h)
+        if rg is None:
+            return GP_INVALID
+        vis = rg.rects is None or any(l <= x < r and t <= y < b for (l, t, r, b) in rg.rects)
+        put_u(pb, 1 if vis else 0)
+        return GP_OK
+
+    reg("GdipIsVisibleRegionPointI", "piipp")(
+        lambda c, h, x, y, hg, pb: _ivrp(c, h, float(x), float(y), hg, pb))
+
+    @reg("GdipIsVisibleRegionRect", "pffffpp")
+    def _ivrr(c, h, x, y, w, hh, hg, pb):
+        rg = RG(h)
+        if rg is None:
+            return GP_INVALID
+        vis = rg.rects is None or bool(_rects_and(rg.rects, [rf_rect((x, y, w, hh))]))
+        put_u(pb, 1 if vis else 0)
+        return GP_OK
+
+    reg("GdipIsVisibleRegionRectI", "piiiipp")(
+        lambda c, h, x, y, w, hh, hg, pb: _ivrr(c, h, float(x), float(y), float(w), float(hh),
+                                                hg, pb))
+
+    @reg("GdipGetRegionHRgn", "ppp")
+    def _grh(c, h, hg, phrgn):
+        rg = RG(h)
+        if rg is None or not phrgn:
+            return GP_INVALID
+        put_ptr(phrgn, 0 if rg.rects is None else gdi.add(_GRgn(rg.rects)))
+        return GP_OK
+
+    @reg("GdipGetRegionScansCount", "ppp")
+    def _grsc(c, h, pn, hm):
+        rg = RG(h)
+        if rg is None:
+            return GP_INVALID
+        put_u(pn, len(rg.rects) if rg.rects is not None else 1)
+        return GP_OK
+
+    for nm, ints in (("GdipGetRegionScans", False), ("GdipGetRegionScansI", True)):
+        def _grs(c, h, buf, pn, hm, _i=ints):
+            rg = RG(h)
+            if rg is None:
+                return GP_INVALID
+            rects = rg.rects if rg.rects is not None else [(-4194304, -4194304, 4194304,
+                                                            4194304)]
+            for i, (l, t, r, b) in enumerate(rects):
+                if _i:
+                    M_.write(buf + 16 * i, struct.pack("<4i", l, t, r - l, b - t))
+                else:
+                    put_f(buf + 16 * i, l, t, r - l, b - t)
+            put_u(pn, len(rects))
+            return GP_OK
+        reg(nm, "pppp")(_grs)
+
+    # ---- font families / collections ------------------------------------------------------------
+    def FF(h):
+        return get(h, "family")
+
+    def FN(h):
+        return get(h, "font")
+
+    def new_family(name):
+        return new_handle(_Obj("family", name=name))
+
+    @reg("GdipCreateFontFamilyFromName", "ppp")
+    def _cffn(c, name, coll, pp):
+        if not name or not pp:
+            return GP_INVALID
+        n = k.ws_(name).strip()
+        if not n:
+            return GP_FAMILYNOTFOUND
+        put_ptr(pp, new_family(n))
+        return GP_OK
+
+    for nm, fam in (("GdipGetGenericFontFamilySansSerif", "sans"),
+                    ("GdipGetGenericFontFamilySerif", "serif"),
+                    ("GdipGetGenericFontFamilyMonospace", "mono")):
+        reg(nm, "p")(lambda c, pp, _f=fam: (put_ptr(pp, new_family(_GP_FAMILIES[_f])), GP_OK)[1])
+
+    @reg("GdipCloneFontFamily", "pp")
+    def _clff(c, h, pp):
+        f = FF(h)
+        if f is None:
+            return GP_INVALID
+        put_ptr(pp, new_family(f.name))
+        return GP_OK
+
+    reg("GdipDeleteFontFamily", "p")(lambda c, h: free_handle(h) if FF(h) else GP_INVALID)
+
+    @reg("GdipGetFamilyName", "ppu")
+    def _gfn(c, h, buf, lang):
+        f = FF(h)
+        if f is None or not buf:
+            return GP_INVALID
+        M_.write(buf, f.name[:31].encode("utf-16-le") + b"\0\0")
+        return GP_OK
+
+    @reg("GdipIsStyleAvailable", "pip")
+    def _isa(c, h, style, pb):
+        if FF(h) is None:
+            return GP_INVALID
+        put_u(pb, 1)
+        return GP_OK
+
+    def is_mono(name):
+        n = name.lower()
+        return any(x in n for x in ("courier", "consol", "mono", "lucida console", "fixedsys",
+                                    "terminal"))
+
+    for nm, val in (("GdipGetEmHeight", 2048), ("GdipGetCellAscent", 1854),
+                    ("GdipGetCellDescent", 434), ("GdipGetLineSpacing", 2355)):
+        def _gm(c, h, style, pv, _v=val):
+            if FF(h) is None or not pv:
+                return GP_INVALID
+            M_.write(pv, struct.pack("<H", _v))
+            return GP_OK
+        reg(nm, "pip")(_gm)
+
+    @reg("GdipNewInstalledFontCollection", "p")
+    def _nifc(c, pp):
+        put_ptr(pp, new_handle(_Obj("fontcoll", fams=list(_GP_FAMILIES.values()) +
+                                    ["Arial", "Segoe UI", "Tahoma", "Consolas"])))
+        return GP_OK
+
+    @reg("GdipNewPrivateFontCollection", "p")
+    def _npfc(c, pp):
+        put_ptr(pp, new_handle(_Obj("fontcoll", fams=[])))
+        return GP_OK
+
+    @reg("GdipDeletePrivateFontCollection", "p")
+    def _dpfc(c, pp):
+        if pp:
+            free_handle(rd_ptr(pp))
+            put_ptr(pp, 0)
+        return GP_OK
+
+    @reg("GdipPrivateAddFontFile", "pp")
+    def _pafe(c, h, path):
+        fc = get(h, "fontcoll")
+        if fc is None:
+            return GP_INVALID
+        name = k.ws_(path).rpartition("\\")[2].rpartition(".")[0] or "Private"
+        fc.fams.append(name)
+        return GP_OK
+
+    @reg("GdipPrivateAddMemoryFont", "ppi")
+    def _pamf(c, h, mem, n):
+        fc = get(h, "fontcoll")
+        if fc is None:
+            return GP_INVALID
+        fc.fams.append("Private Font %d" % (len(fc.fams) + 1))
+        return GP_OK
+
+    @reg("GdipGetFontCollectionFamilyCount", "pp")
+    def _gfcfc(c, h, pn):
+        fc = get(h, "fontcoll")
+        if fc is None:
+            return GP_INVALID
+        put_u(pn, len(fc.fams))
+        return GP_OK
+
+    @reg("GdipGetFontCollectionFamilyList", "pipp")
+    def _gfcfl(c, h, n, buf, pfound):
+        fc = get(h, "fontcoll")
+        if fc is None or not buf:
+            return GP_INVALID
+        lst = fc.fams[:max(0, n)]
+        for i, name in enumerate(lst):
+            put_ptr(buf + i * P(), new_family(name))
+        put_u(pfound, len(lst))
+        return GP_OK
+
+    # ---- fonts --------------------------------------------------------------------------------
+    def new_font(family, size, style, unit):
+        return new_handle(_Obj("font", family=family, size=float(size), style=style, unit=unit))
+
+    @reg("GdipCreateFont", "pfiip")
+    def _cf(c, hf, size, style, unit, pp):
+        f = FF(hf)
+        if f is None or size <= 0 or not pp or unit == 1:
+            return GP_INVALID
+        put_ptr(pp, new_font(f.name, size, style, unit))
+        return GP_OK
+
+    def font_from_lf(lf_vals, face):
+        height, weight, italic, underline, strike = lf_vals
+        size = abs(height) if height < 0 else (height * 0.85 if height > 0 else 12.0)
+        style = (1 if weight >= 600 else 0) | (2 if italic else 0) | (4 if underline else 0) | \
+            (8 if strike else 0)
+        return new_font(face or "Microsoft Sans Serif", float(size), style, 0)
+
+    @reg("GdipCreateFontFromDC", "pp")
+    def _cffdc(c, hdc, pp):
+        dc = gdi.get(hdc, "dc")
+        if dc is None or not pp:
+            return GP_INVALID
+        fo = dc.font_obj()
+        lf = fo.lf if fo is not None else [0, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, ""]
+        face = lf[13] or (fo.face if fo is not None else "")
+        h = lf[0] or -11
+        put_ptr(pp, font_from_lf((h, lf[4], lf[5], lf[6], lf[7]), face))
+        return GP_OK
+
+    for nm, wide in (("GdipCreateFontFromLogfontW", True), ("GdipCreateFontFromLogfontA", False)):
+        def _cfflf(c, hdc, plf, pp, _w=wide):
+            if not plf or not pp:
+                return GP_INVALID
+            height, _wd, _e, _o, weight = struct.unpack("<iiiii", M_.read(plf, 20))
+            italic, underline, strike = M_.read(plf + 20, 3)
+            if _w:
+                face = M_.read(plf + 28, 64).decode("utf-16-le", "replace").split("\0")[0]
+            else:
+                face = bytes(M_.read(plf + 28, 32)).split(b"\0")[0].decode("latin-1")
+            put_ptr(pp, font_from_lf((height or -11, weight, italic, underline, strike), face))
+            return GP_OK
+        reg(nm, "ppp")(_cfflf)
+
+    @reg("GdipCloneFont", "pp")
+    def _clf(c, h, pp):
+        f = FN(h)
+        if f is None:
+            return GP_INVALID
+        put_ptr(pp, new_font(f.family, f.size, f.style, f.unit))
+        return GP_OK
+
+    reg("GdipDeleteFont", "p")(lambda c, h: free_handle(h) if FN(h) else GP_INVALID)
+
+    @reg("GdipGetFamily", "pp")
+    def _gfam(c, h, pp):
+        f = FN(h)
+        if f is None:
+            return GP_INVALID
+        put_ptr(pp, new_family(f.family))
+        return GP_OK
+
+    reg("GdipGetFontSize", "pp")(lambda c, h, pv: (put_f(pv, FN(h).size), GP_OK)[1]
+                                 if FN(h) else GP_INVALID)
+    reg("GdipGetFontStyle", "pp")(lambda c, h, pv: (put_u(pv, FN(h).style), GP_OK)[1]
+                                  if FN(h) else GP_INVALID)
+    reg("GdipGetFontUnit", "pp")(lambda c, h, pv: (put_u(pv, FN(h).unit), GP_OK)[1]
+                                 if FN(h) else GP_INVALID)
+
+    def em_px(f, g=None):
+        """Font em size in device pixels."""
+        if f.unit in (0, 2):                                    # World / Pixel
+            e = f.size * (page_factor(g) if (g is not None and f.unit == 0) else 1.0)
+        else:
+            e = f.size * _GP_UNIT.get(f.unit, 1.0)
+        if g is not None:
+            m = g.m
+            e *= math.sqrt(abs(m[0] * m[3] - m[1] * m[2])) or 1.0
+        return max(1.0, e)
+
+    def realize(f, g=None):
+        e = int(round(em_px(f, g)))
+        return _font_from_logfont(-e, 700 if f.style & 1 else 400, f.style & 2, f.style & 4,
+                                  f.style & 8, 1 if is_mono(f.family) else 0, f.family)
+
+    @reg("GdipGetFontHeight", "ppp")
+    def _gfh(c, h, hg, pv):
+        f = FN(h)
+        if f is None or not pv:
+            return GP_INVALID
+        g = G_(hg) if hg else None
+        e = em_px(f, None)
+        if g is not None:
+            e /= page_factor(g)
+        put_f(pv, e * 2355.0 / 2048.0)
+        return GP_OK
+
+    @reg("GdipGetFontHeightGivenDPI", "pfp")
+    def _gfhd(c, h, dpi, pv):
+        f = FN(h)
+        if f is None or not pv:
+            return GP_INVALID
+        e = em_px(f) * dpi / 96.0
+        put_f(pv, e * 2355.0 / 2048.0)
+        return GP_OK
+
+    for nm, wide in (("GdipGetLogFontW", True), ("GdipGetLogFontA", False)):
+        def _glf(c, h, hg, plf, _w=wide):
+            f = FN(h)
+            if f is None or not plf:
+                return GP_INVALID
+            g = G_(hg) if hg else None
+            e = int(round(em_px(f, g)))
+            M_.write(plf, struct.pack("<iiiii", -e, 0, 0, 0, 700 if f.style & 1 else 400) +
+                     bytes((1 if f.style & 2 else 0, 1 if f.style & 4 else 0,
+                            1 if f.style & 8 else 0, 1, 0, 0, 0, 0)))
+            if _w:
+                M_.write(plf + 28, (f.family[:31].encode("utf-16-le") + b"\0\0").ljust(64, b"\0"))
+            else:
+                M_.write(plf + 28, (f.family[:31].encode("latin-1", "replace") + b"\0")
+                         .ljust(32, b"\0"))
+            return GP_OK
+        reg(nm, "ppp")(_glf)
+
+    # ---- string formats -----------------------------------------------------------------------
+    def SF(h):
+        return get(h, "strfmt")
+
+    def new_sf(flags=0, lang=0, typo=False):
+        return new_handle(_Obj("strfmt", flags=flags, lang=lang, align=0, line_align=0,
+                               trimming=1 if not typo else 0, hotkey=0, tabs=(0.0, []),
+                               ranges=[], typo=typo, digit=(0, 0)))
+
+    @reg("GdipCreateStringFormat", "iup")
+    def _csf2(c, flags, lang, pp):
+        if not pp:
+            return GP_INVALID
+        put_ptr(pp, new_sf(flags, lang))
+        return GP_OK
+
+    @reg("GdipStringFormatGetGenericDefault", "p")
+    def _sfgd(c, pp):
+        put_ptr(pp, new_sf())
+        return GP_OK
+
+    @reg("GdipStringFormatGetGenericTypographic", "p")
+    def _sfgt(c, pp):
+        put_ptr(pp, new_sf(0x6004, 0, True))
+        return GP_OK
+
+    @reg("GdipCloneStringFormat", "pp")
+    def _clsf(c, h, pp):
+        s = SF(h)
+        if s is None:
+            return GP_INVALID
+        n = _Obj("strfmt")
+        n.__dict__.update(s.__dict__)
+        n.ranges = list(s.ranges)
+        put_ptr(pp, new_handle(n))
+        return GP_OK
+
+    reg("GdipDeleteStringFormat", "p")(lambda c, h: free_handle(h) if SF(h) else GP_INVALID)
+
+    for attr, setn, getn in (("flags", "GdipSetStringFormatFlags", "GdipGetStringFormatFlags"),
+                             ("align", "GdipSetStringFormatAlign", "GdipGetStringFormatAlign"),
+                             ("line_align", "GdipSetStringFormatLineAlign",
+                              "GdipGetStringFormatLineAlign"),
+                             ("trimming", "GdipSetStringFormatTrimming",
+                              "GdipGetStringFormatTrimming"),
+                             ("hotkey", "GdipSetStringFormatHotkeyPrefix",
+                              "GdipGetStringFormatHotkeyPrefix")):
+        def _ssfa(c, h, v, _a=attr):
+            s = SF(h)
+            if s is None:
+                return GP_INVALID
+            setattr(s, _a, v)
+            return GP_OK
+
+        def _gsfa(c, h, pv, _a=attr):
+            s = SF(h)
+            if s is None:
+                return GP_INVALID
+            put_u(pv, getattr(s, _a))
+            return GP_OK
+        reg(setn, "pi")(_ssfa)
+        reg(getn, "pp")(_gsfa)
+
+    @reg("GdipSetStringFormatTabStops", "pfip")
+    def _ssfts(c, h, first, n, tabs):
+        s = SF(h)
+        if s is None:
+            return GP_INVALID
+        s.tabs = (first, list(rd_f(tabs, n)) if tabs and n > 0 else [])
+        return GP_OK
+
+    @reg("GdipGetStringFormatTabStopCount", "pp")
+    def _gsftc(c, h, pn):
+        s = SF(h)
+        if s is None:
+            return GP_INVALID
+        put_u(pn, len(s.tabs[1]))
+        return GP_OK
+
+    reg("GdipSetStringFormatDigitSubstitution", "pui")(lambda c, h, l, m: GP_OK
+                                                      if SF(h) else GP_INVALID)
+
+    @reg("GdipSetStringFormatMeasurableCharacterRanges", "pip")
+    def _ssfmcr(c, h, n, ranges):
+        s = SF(h)
+        if s is None or n > 32:
+            return GP_INVALID
+        s.ranges = [tuple(rd_i(ranges + 8 * i, 2)) for i in range(n)]
+        return GP_OK
+
+    @reg("GdipGetStringFormatMeasurableCharacterRangeCount", "pp")
+    def _gsfmcrc(c, h, pn):
+        s = SF(h)
+        if s is None:
+            return GP_INVALID
+        put_u(pn, len(s.ranges))
+        return GP_OK
+
+    # ---- text layout --------------------------------------------------------------------------
+    def expand_tabs(line, font, sf):
+        if "\t" not in line:
+            return line
+        tw = max(1, font.advance(" ") * 8)
+        if sf is not None and sf.tabs[1]:
+            tw = max(1, int(sf.tabs[1][0]))
+        out = ""
+        x = 0
+        for ch in line:
+            if ch == "\t":
+                nxt = (x // tw + 1) * tw
+                while x < nxt:
+                    out += " "
+                    x += font.advance(" ") or 1
+                continue
+            out += ch
+            x += font.advance(ch)
+        return out
+
+    def layout(text, font, sf, box_w, box_h, em):
+        """-> list of (line_text, start_index); box sizes in device px (0 = unbounded)."""
+        flags = sf.flags if sf is not None else 0
+        hot = sf.hotkey if sf is not None else 0
+        if hot:
+            out = ""
+            i = 0
+            while i < len(text):
+                ch = text[i]
+                if ch == "&" and i + 1 < len(text):
+                    out += text[i + 1]
+                    i += 2
+                    continue
+                out += ch
+                i += 1
+            text = out
+        pad = 0.0 if (sf is not None and sf.typo) else em / 6.0
+        wrap_w = box_w - 2 * pad if box_w > 0 and not flags & 0x1000 else 0
+        lines = []
+        pos = 0
+        for raw in text.replace("\r\n", "\n").split("\n"):
+            raw_t = expand_tabs(raw, font, sf)
+            if wrap_w > 0:
+                parts = _wrap_line(font, raw_t, int(wrap_w))
+            else:
+                parts = [raw_t]
+            for part in parts:
+                lines.append((part, pos))
+                pos += len(part)
+            pos += 1
+        trim = sf.trimming if sf is not None else 1
+        if box_w > 0 and trim in (3, 4, 5):
+            mode = {3: "char", 4: "word", 5: "path"}[trim]
+            lines = [(_ellipsize(font, ln, int(box_w - 2 * pad), mode), st) for (ln, st) in lines]
+        lh = max(font.height, int(round(em * 2355.0 / 2048.0)))
+        if box_h > 0 and not (flags & 0x4000):
+            fit = max(1, int((box_h + (0 if flags & 0x2000 else lh - 1)) // lh))
+            lines = lines[:fit]
+        return lines, lh, pad
+
+    def draw_string(h, text, hfont, rect, hsf, hb, measure=None):
+        g = G_(h)
+        f = FN(hfont)
+        if g is None or f is None:
+            return GP_INVALID
+        sf = SF(hsf) if hsf else None
+        font = realize(f, g)
+        em = em_px(f, g)
+        x, y, w, hh = rect
+        M0 = dev_matrix(g)
+        sx = math.hypot(M0[0], M0[1]) or 1.0
+        sy = math.hypot(M0[2], M0[3]) or 1.0
+        bw, bh = w * sx, hh * sy
+        lines, lh, pad = layout(text, font, sf, bw, bh, em)
+        widths = [font.width(ln) for (ln, _st) in lines]
+        total_h = lh * len(lines)
+        align = sf.align if sf is not None else 0
+        lalign = sf.line_align if sf is not None else 0
+        flags = sf.flags if sf is not None else 0
+        if flags & 1:                                          # DirectionRightToLeft
+            align = 2 - align
+        ox_, oy_ = _gp_apply(M0, x, y)
+
+        def line_x(wd):
+            if bw <= 0:
+                if align == 1:
+                    return ox_ - wd / 2.0
+                if align == 2:
+                    return ox_ - wd - pad
+                return ox_ + pad
+            if align == 1:
+                return ox_ + (bw - wd) / 2.0
+            if align == 2:
+                return ox_ + bw - pad - wd
+            return ox_ + pad
+
+        if bh <= 0:
+            top = oy_ - (total_h / 2.0 if lalign == 1 else total_h if lalign == 2 else 0)
+        else:
+            top = oy_ + ((bh - total_h) / 2.0 if lalign == 1 else
+                         (bh - total_h) if lalign == 2 else 0)
+        if measure is not None:
+            mw = max(widths) if widths else 0
+            lx = min(line_x(wd) for wd in widths) - pad if widths else ox_
+            inv = 1.0 / sx, 1.0 / sy
+            measure["rect"] = (x + (lx - ox_) * inv[0], y + (top - oy_) * inv[1],
+                               (mw + 2 * pad) * inv[0] if mw else 0.0, total_h * inv[1])
+            measure["chars"] = sum(len(ln) for ln, _s in lines) + max(0, len(lines) - 1)
+            measure["lines"] = len(lines)
+            ranges = []
+            for (first, length) in (sf.ranges if sf is not None else []):
+                rr = None
+                for i, (ln, st) in enumerate(lines):
+                    a0, a1 = max(first, st), min(first + length, st + len(ln))
+                    if a0 >= a1 and not (length == 0 and st <= first <= st + len(ln)):
+                        continue
+                    xa = line_x(widths[i]) + font.width(ln[:a0 - st])
+                    xb = xa + font.width(ln[a0 - st:a1 - st])
+                    ya = top + i * lh
+                    r = (xa, ya, xb, ya + lh)
+                    rr = r if rr is None else (min(rr[0], r[0]), min(rr[1], r[1]),
+                                               max(rr[2], r[2]), max(rr[3], r[3]))
+                if rr is None:
+                    ranges.append(None)
+                else:
+                    ranges.append((x + (rr[0] - ox_) * inv[0], y + (rr[1] - oy_) * inv[1],
+                                   (rr[2] - rr[0]) * inv[0], (rr[3] - rr[1]) * inv[1]))
+            measure["ranges"] = ranges
+            return GP_OK
+        br = B(hb)
+        if br is None:
+            return GP_INVALID
+        clip_box = None
+        if bw > 0 and bh > 0 and not flags & 0x4000:
+            clip_box = (int(math.floor(ox_)), int(math.floor(oy_)), int(math.ceil(ox_ + bw)),
+                        int(math.ceil(oy_ + bh)))
+
+        def go(g_, T, M):
+            if clip_box is not None:
+                T.clip = _rects_and(T.clip, [(clip_box[0] + T.ox, clip_box[1] + T.oy,
+                                              clip_box[2] + T.ox, clip_box[3] + T.oy)])
+            paint = brush_paint(br, _gp_mat_inv(M), T)
+            spans = {}
+            for i, (ln, _st) in enumerate(lines):
+                cx = int(round(line_x(widths[i]))) + T.ox
+                cy = int(round(top + i * lh)) + T.oy
+                for ch in ln:
+                    for (dy, x0, x1) in font.runs(ch):
+                        spans.setdefault(cy + dy, []).append((cx + x0, cx + x1))
+                    cx += font.advance(ch)
+                x_end = int(round(line_x(widths[i]))) + T.ox + widths[i]
+                x_beg = int(round(line_x(widths[i]))) + T.ox
+                if f.style & 4:
+                    uy = cy + font.ascent + 1
+                    spans.setdefault(uy, []).append((x_beg, x_end))
+                if f.style & 8:
+                    sy_ = cy + font.ascent * 2 // 3
+                    spans.setdefault(sy_, []).append((x_beg, x_end))
+            fill_spans(T, env["merge_spans"](spans), paint)
+        return with_target(h, go)
+
+    def rd_text(ps, n):
+        if not ps:
+            return ""
+        if n < 0:
+            return k.ws_(ps)
+        return M_.read(ps, 2 * n).decode("utf-16-le", "replace").split("\0")[0] if n else ""
+
+    @reg("GdipDrawString", "ppipppp")
+    def _ds(c, h, ps, n, hfont, prect, hsf, hb):
+        if not prect:
+            return GP_INVALID
+        return draw_string(h, rd_text(ps, n), hfont, rd_f(prect, 4), hsf, hb)
+
+    @reg("GdipMeasureString", "ppipppppp")
+    def _ms(c, h, ps, n, hfont, prect, hsf, pbox, pchars, plines):
+        if not prect or not pbox:
+            return GP_INVALID
+        m = {}
+        r = draw_string(h, rd_text(ps, n), hfont, rd_f(prect, 4), hsf, 0, measure=m)
+        if r != GP_OK:
+            return r
+        put_f(pbox, *m["rect"])
+        put_u(pchars, m["chars"])
+        put_u(plines, m["lines"])
+        return GP_OK
+
+    @reg("GdipMeasureCharacterRanges", "ppipppip")
+    def _mcr(c, h, ps, n, hfont, prect, hsf, count, regions):
+        if not prect or not hsf:
+            return GP_INVALID
+        m = {}
+        r = draw_string(h, rd_text(ps, n), hfont, rd_f(prect, 4), hsf, 0, measure=m)
+        if r != GP_OK:
+            return r
+        rngs = m.get("ranges", [])
+        if count < len(rngs):
+            return GP_INVALID
+        for i, rr in enumerate(rngs):
+            rg = get(rd_ptr(regions + i * P()), "region")
+            if rg is None:
+                continue
+            rg.rects = [] if rr is None else [(int(math.floor(rr[0])), int(math.floor(rr[1])),
+                                               int(math.ceil(rr[0] + rr[2])),
+                                               int(math.ceil(rr[1] + rr[3])))]
+        return GP_OK
+
+    @reg("GdipDrawDriverString", "ppipppip")
+    def _dds(c, h, ps, n, hfont, hb, pts, flags, hm):
+        if not pts:
+            return GP_INVALID
+        text = rd_text(ps, n)
+        x, y = rd_f(pts, 2)
+        f = FN(hfont)
+        if f is None:
+            return GP_INVALID
+        font = realize(f, G_(h))
+        return draw_string(h, text, hfont, (x, y - font.ascent, 0.0, 0.0), 0, hb)
+
+    reg("GdipMeasureDriverString", "ppipppip")(lambda c, *a: GP_NOTIMPL)
+
+    @reg("GdipAddPathString", "ppipifpp")
+    def _aps(c, hp, ps, n, hfam, style, em, prect, hsf, ints=False):
+        path = PT(hp)
+        fam = FF(hfam)
+        if path is None or fam is None or not prect:
+            return GP_INVALID
+        text = rd_text(ps, n)
+        x, y, w, hh = [float(v) for v in (rd_i(prect, 4) if ints else rd_f(prect, 4))]
+        font = _font_from_logfont(-int(round(em)), 700 if style & 1 else 400, style & 2, 0, 0,
+                                  1 if is_mono(fam.name) else 0, fam.name)
+        sf = SF(hsf) if hsf else None
+        lines, lh, pad = layout(text, font, sf, w, hh, em)
+        for i, (ln, _st) in enumerate(lines):
+            cx = x + pad
+            cy = y + i * lh
+            for ch in ln:
+                for (dy, x0, x1) in font.runs(ch):
+                    add_closed(path, rect_pts(cx + x0, cy + dy, x1 - x0, 1))
+                cx += font.advance(ch)
+        return GP_OK
+
+    reg("GdipAddPathStringI", "ppipifpp")(
+        lambda c, hp, ps, n, hfam, style, em, prect, hsf: _aps(c, hp, ps, n, hfam, style, em,
+                                                               prect, hsf, True))
+
+
 # Bitmap glyphs rasterized from the DejaVu fonts (c) Bitstream / DejaVu
 # authors (Bitstream Vera / DejaVu license); regenerate with tools/mkfonts.py
 _NOO_FONT_B64 = (
@@ -54845,6 +60243,12 @@ _ORDINAL_EXPORTS["shell32.dll"].update({
     16: "ILFindLastID", 18: "ILClone", 21: "ILIsEqual", 152: "ILGetSize", 153: "ILGetNext",
     155: "ILFree", 157: "ILCreateFromPathW", 165: "SHCreateDirectory",
     189: "ILCreateFromPathA"})
+_ORDINAL_EXPORTS["shlwapi.dll"] = {
+    1: "ParseURLA", 2: "ParseURLW", 7: "SHAllocShared", 8: "SHLockShared", 9: "SHUnlockShared",
+    10: "SHFreeShared", 12: "SHCreateMemStream", 16: "SHCreateThread", 158: "StrCmpNIW",
+    184: "IStream_Read", 212: "IStream_Write", 213: "IStream_Reset", 214: "IStream_Size",
+    219: "QISearch", 437: "IsOS"}
+_ORDINAL_EXPORTS["oleaut32.dll"].update({111: "VarBstrFromR4", 114: "VarBstrFromDate"})
 _ORDINAL_EXPORTS["uxtheme.dll"] = {                  # undocumented dark-mode entry points
     49: "GetImmersiveUserColorSetPreference", 104: "RefreshImmersiveColorPolicyState",
     106: "GetIsImmersiveColorUsingHighContrast", 132: "ShouldAppsUseDarkMode",
