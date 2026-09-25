@@ -31932,6 +31932,11 @@ class _WM:
         return info
 
     def show(self, w, cmd):
+        if w.exstyle & 0x40 and w.py.get("mdichild") and \
+                self.__dict__.get("mdi_show") is not None:
+            r = self.mdi_show(w, cmd)
+            if r is not None:
+                return r
         was = bool(w.style & WS_VISIBLE)
         SW_HIDE, SW_SHOWNORMAL, SW_SHOWMINIMIZED, SW_MAXIMIZE, SW_SHOWNOACTIVATE = 0, 1, 2, 3, 4
         if cmd == SW_HIDE:
@@ -32086,15 +32091,6 @@ class _WM:
             self.ensure_display()
         visible = style & WS_VISIBLE
         w.style &= ~WS_VISIBLE
-        # link into the tree (children go on top)
-        if style & WS_CHILD:
-            par.children.append(w)              # children link at the bottom (tab order)
-        else:
-            idx = 0
-            if not (exstyle & WS_EX_TOPMOST):
-                while idx < len(par.children) and par.children[idx].exstyle & WS_EX_TOPMOST:
-                    idx += 1
-            par.children.insert(idx, w)
         self.changed()
         if self.is_top(w):
             w.surf = _Surf(max(1, w.w), max(1, w.h), _cr_pix(0xFFFFFF))
@@ -32134,6 +32130,19 @@ class _WM:
                 return 0
             if w.dead:
                 return 0
+            # like Windows, the window joins its parent's z-order only after WM_NCCREATE:
+            # until then GetWindow/GetDlgItem/EnumChildWindows on the parent don't see it
+            if w not in par.children:
+                if style & WS_CHILD:
+                    par.children.append(w)      # children link at the bottom (tab order)
+                else:
+                    idx = 0
+                    if not (exstyle & WS_EX_TOPMOST):
+                        while idx < len(par.children) and \
+                                par.children[idx].exstyle & WS_EX_TOPMOST:
+                            idx += 1
+                    par.children.insert(idx, w)
+                self.changed()
             self.nc_calc(w)
             r = self.send(h, 0x0001, 0, csa, wide)                   # WM_CREATE
             if _s32(r & 0xFFFFFFFF) == -1 or w.dead:
@@ -33163,8 +33172,8 @@ def _nc_paint(wm, w, pt=None):
         W, H = w.w, w.h
         style, ex = w.style, w.exstyle
         active = wm.active == wm.top(w).hwnd if not (style & WS_CHILD) else True
-        if w.py.get("ncactive") is not None and not (style & WS_CHILD):
-            active = w.py["ncactive"]
+        if w.py.get("ncactive") is not None and (not (style & WS_CHILD) or ex & 0x40):
+            active = w.py["ncactive"]                    # top-level or MDI child caption
         # outer frame
         if b >= 3 or (style & WS_THICKFRAME):
             r = _draw_edge(pt, (0, 0, W, H), 5, 15)            # EDGE_RAISED
@@ -33707,7 +33716,7 @@ def _def_window_proc(wm, hwnd, msg, wp, lp, wide):
         return 0
     if msg == WM_NCACTIVATE:
         w.py["ncactive"] = bool(wp)
-        if not (w.style & WS_CHILD):
+        if not (w.style & WS_CHILD) or w.exstyle & 0x40:     # WS_EX_MDICHILD
             _nc_paint(wm, w)
         return 1
     if msg == 0x000F:                                     # WM_PAINT
@@ -42515,6 +42524,7 @@ def _gui_install(k):
     _shell_install(k)
     _comdlg_install(k)
     _sysmore_install(k)
+    _mdi_install(k)
 
 
 # -- displays: headless (PNG dump / scripted input), Tk, AetherOS web sessions ----------------------
@@ -47513,6 +47523,7 @@ def _cc_install_bars(k, notify, NMHDR_SZ, hfont, gfont, paint, IL, py_class):
                 ch = W(b["child"])
                 bh = b["minh"] or (ch.h if ch is not None else 0)
                 h = max(h, bh)
+            s["rowh"] = h + 4 if vis else 0
             for b in vis:
                 ch = W(b["child"])
                 if ch is None:
@@ -47571,6 +47582,8 @@ def _cc_install_bars(k, notify, NMHDR_SZ, hfont, gfont, paint, IL, py_class):
         if msg in (0x401, 0x40A, 0x406, 0x40B):                   # RB_INSERTBAND(A/W)/SETBANDINFO
             wide_ = msg in (0x40A, 0x40B)
             mask = M_.read32(lp + 4)
+            if M_.read32(lp) < RBO["ideal"] + 4:        # pre-IE4 struct: no ideal/lParam
+                mask &= ~0x600
             b = new_band()
             if msg in (0x406, 0x40B):
                 if not 0 <= wp < len(s["bands"]):
@@ -47606,11 +47619,14 @@ def _cc_install_bars(k, notify, NMHDR_SZ, hfont, gfont, paint, IL, py_class):
             layout()
             wm.invalidate(w, None, True)
             return 1
-        if msg in (0x405, 0x41C):                                 # RB_GETBANDINFO(A/W)
+        if msg in (0x405, 0x41C, 0x41D):                          # RB_GETBANDINFO(old/W/A)
             if not 0 <= wp < len(s["bands"]):
                 return 0
             b = s["bands"][wp]
             mask = M_.read32(lp + 4)
+            cb = M_.read32(lp)
+            if cb < RBO["ideal"] + 4:                   # pre-IE4 struct: no ideal/lParam
+                mask &= ~0x600
             if mask & 1:
                 M_.write32(lp + RBO["style"], b["style"])
             if mask & 8:
@@ -47651,16 +47667,22 @@ def _cc_install_bars(k, notify, NMHDR_SZ, hfont, gfont, paint, IL, py_class):
         if msg == 0x409:                                          # RB_GETRECT
             if not 0 <= wp < len(s["bands"]) or not lp:
                 return 0
-            ch = W(s["bands"][wp]["child"])
-            r = (ch.x - 6, 0, ch.x + ch.w, w.h) if ch is not None else (0, 0, 0, 0)
+            if "rowh" not in s:
+                layout()
+            b = s["bands"][wp]
+            ch = W(b["child"])
+            r = (ch.x - 6, 0, ch.x + ch.w, s.get("rowh", 0)) \
+                if ch is not None and not b["style"] & 8 else (0, 0, 0, 0)
             M_.write(lp, struct.pack("<iiii", *r))
             return 1
         if msg == 0x40C:                                          # RB_GETBANDCOUNT
             return len(s["bands"])
         if msg == 0x40D:                                          # RB_GETROWCOUNT
             return 1 if s["bands"] else 0
-        if msg in (0x40E, 0x41D):                                 # RB_GETROWHEIGHT / BARHEIGHT
-            return w.h
+        if msg in (0x40E, 0x41B):                                 # RB_GETROWHEIGHT / BARHEIGHT
+            if "rowh" not in s:
+                layout()
+            return s.get("rowh", 0)
         if msg == 0x0005:
             layout()
             return 0
@@ -49569,6 +49591,22 @@ def _shell_install(k):
         if s_.startswith("\\\\?\\") and s_[5:6] == ":":
             return put_w(path, cch, s_[4:])
         return S_FALSE_
+
+    # ---- more shlwapi string comparisons ---------------------------------------------------
+    def _intl_eq(w_, case, a, b, n):
+        s1, s2 = gs(a, w_), gs(b, w_)
+        if n >= 0:
+            s1, s2 = s1[:n], s2[:n]
+        return int(s1 == s2 if case else s1.lower() == s2.lower())
+    R("StrIsIntlEqualA", "ippi", dlls=SHL)(lambda c, cs, a, b, n: _intl_eq(False, cs, a, b, n))
+    R("StrIsIntlEqualW", "ippi", dlls=SHL)(lambda c, cs, a, b, n: _intl_eq(True, cs, a, b, n))
+    reg_str("StrCmpC", "pp", lambda w_, a, b: cmp(gs(a, w_), gs(b, w_)) & 0xFFFFFFFF)
+    reg_str("StrCmpIC", "pp", lambda w_, a, b: cmp(gs(a, w_).lower(), gs(b, w_).lower()) & 0xFFFFFFFF)
+    reg_str("StrCmpNC", "ppi", lambda w_, a, b, n: cmp(gs(a, w_)[:n], gs(b, w_)[:n]) & 0xFFFFFFFF)
+    reg_str("StrCmpNIC", "ppi", lambda w_, a, b, n: cmp(gs(a, w_)[:n].lower(),
+                                                        gs(b, w_)[:n].lower()) & 0xFFFFFFFF)
+    R("IntlStrEqWorkerA", "ippi", dlls=SHL)(lambda c, cs, a, b, n: _intl_eq(False, cs, a, b, n))
+    R("IntlStrEqWorkerW", "ippi", dlls=SHL)(lambda c, cs, a, b, n: _intl_eq(True, cs, a, b, n))
 
 
 # ==========================================================================================
@@ -51849,6 +51887,577 @@ def _sysmore_install(k):
     R("BufferedPaintRenderAnimation", "pp", dlls=("uxtheme.dll",))(lambda c, h, dc: 0)
     R("BeginBufferedAnimation", "pppppppp", "p", dlls=("uxtheme.dll",))(lambda c, *a: 0)
     R("EndBufferedAnimation", "pi", dlls=("uxtheme.dll",))(lambda c, *a: 0)
+
+
+# ==========================================================================================
+# 10r. MDI: the MDICLIENT class, DefFrameProc, DefMDIChildProc, TranslateMDISysAccel,
+#      CreateMDIWindow, Cascade/TileWindows
+# ==========================================================================================
+WS_EX_MDICHILD = 0x40
+WM_MDICREATE, WM_MDIDESTROY, WM_MDIACTIVATE, WM_MDIRESTORE = 0x220, 0x221, 0x222, 0x223
+WM_MDINEXT, WM_MDIMAXIMIZE, WM_MDITILE, WM_MDICASCADE = 0x224, 0x225, 0x226, 0x227
+WM_MDIICONARRANGE, WM_MDIGETACTIVE, WM_MDISETMENU, WM_MDIREFRESHMENU = 0x228, 0x229, 0x230, 0x234
+SC_MINIMIZE_, SC_MAXIMIZE_, SC_RESTORE_, SC_CLOSE_, SC_NEXTWINDOW_, SC_PREVWINDOW_ = \
+    0xF020, 0xF030, 0xF120, 0xF060, 0xF040, 0xF050
+
+
+def _mdi_install(k):
+    p = k.p
+    wm = p.wm
+    M_ = p.mem
+
+    def reg(names, sig, ret="i"):
+        return k.reg(names, sig, ret, dlls=("user32.dll",))
+
+    def W(h):
+        return wm.wnd(h & 0xFFFFFFFF) if h else None
+
+    def st(client):
+        return client.py.setdefault("mdi", {"active": 0, "first": 0xFF00, "winmenu": 0,
+                                           "maxed": False, "order": [], "n": 0})
+
+    def client_of(child):
+        par = child.parent
+        return par if par is not None and par.py.get("mdi") is not None else None
+
+    def children(client):
+        s = st(client)
+        s["order"] = [h for h in s["order"] if W(h) is not None and not W(h).dead]
+        return s["order"]
+
+    def frame_of(client):
+        par = client.parent
+        return par if par is not None and par is not wm.desktop else None
+
+    def client_size(client):
+        return client.cl[2] - client.cl[0], client.cl[3] - client.cl[1]
+
+    # ---- title of the frame while a child is maximized: "App - [Doc]" ------------------------
+    def update_frame_title(client):
+        fr = frame_of(client)
+        s = st(client)
+        if fr is None:
+            return
+        base = fr.py.get("mdi_title")
+        if base is None:
+            base = fr.py["mdi_title"] = fr.text
+        a = W(s["active"])
+        new = "%s - [%s]" % (base, a.text) if (s["maxed"] and a is not None and a.text) else base
+        if fr.text != new:
+            fr.text = new
+            wm.title_changed(fr) if hasattr(wm, "title_changed") else None
+            fr.ncdirty = True
+            wm.changed()
+
+    # ---- the window menu lists the children ------------------------------------------------
+    def refresh_window_menu(client):
+        s = st(client)
+        menu = _menu_obj(wm, s["winmenu"])
+        if menu is None:
+            return
+        first = s["first"]
+        # drop our previous entries (ids in [first, first+ 0x100) and the separator we added)
+        keep = []
+        for it in menu.items:
+            if first <= it.id < first + 0x100 or getattr(it, "data", 0) == 0x4D444953:
+                continue
+            keep.append(it)
+        menu.items = keep
+        kids = [W(h) for h in children(client)]
+        kids = [c for c in kids if c is not None and c.style & WS_VISIBLE]
+        if not kids:
+            return
+        sep = _MItem(MF_SEPARATOR, 0, 0, 0, "", 0x4D444953)
+        menu.items.append(sep)
+        for i, c in enumerate(kids[:9]):
+            it = _MItem(0, MF_CHECKED if c.hwnd == s["active"] else 0, first + i, 0,
+                        "&%d %s" % (i + 1, c.text), 0)
+            c.py["mdi_id"] = first + i
+            menu.items.append(it)
+
+    # ---- activation ---------------------------------------------------------------------------
+    def activate(client, hwnd, focus=True):
+        s = st(client)
+        old = s["active"]
+        new = W(hwnd)
+        if new is None or old == hwnd:
+            if new is not None and focus:
+                wm.set_focus(hwnd)
+            return
+        s["active"] = hwnd
+        o = W(old)
+        if o is not None:
+            wm.send(old, 0x0086, 0, 0)                           # WM_NCACTIVATE(FALSE)
+            wm.send(old, WM_MDIACTIVATE, old, hwnd)
+        # bring to the top of the client's z-order
+        wm.set_pos(new, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        wm.send(hwnd, 0x0086, 1, 0)                              # WM_NCACTIVATE(TRUE)
+        wm.send(hwnd, WM_MDIACTIVATE, old, hwnd)
+        if s["maxed"] and o is not None and new is not None:
+            restore(client, o, keep=True)
+            maximize(client, new)
+        if focus:
+            wm.set_focus(hwnd)
+        refresh_window_menu(client)
+        update_frame_title(client)
+
+    def next_child(client, cur, prev=False):
+        """The child after (or before) cur in z-order, as WM_MDINEXT / SC_NEXTWINDOW pick it."""
+        kids = set(children(client))
+        vis = [c.hwnd for c in client.children
+               if c.hwnd in kids and not c.dead and c.style & WS_VISIBLE]       # top first
+        if not vis:
+            return 0
+        if cur not in vis:
+            return vis[0]
+        if prev:
+            return vis[-1]
+        i = vis.index(cur)
+        return vis[(i + 1) % len(vis)]
+
+    def switch_next(client, cur, prev=False):
+        nxt = next_child(client, cur, prev)
+        if not nxt or nxt == cur:
+            return
+        activate(client, nxt)
+        o = W(cur)
+        if o is not None and not prev:                    # the old one goes to the bottom
+            wm.set_pos(o, 1, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+
+    # ---- maximize / restore inside the client -------------------------------------------------
+    def maximize(client, c):
+        s = st(client)
+        if c.py.get("mdi_max"):
+            return
+        c.py["mdi_restore"] = (c.x, c.y, c.w, c.h)
+        c.py["mdi_max"] = True
+        s["maxed"] = True
+        cw, ch = client_size(client)
+        # the child's caption and borders sit just outside the client area, as on Windows
+        l_, t_ = c.cl[0], c.cl[1]
+        r_ = c.w - c.cl[2]
+        b_ = c.h - c.cl[3]
+        c.style |= WS_MAXIMIZE
+        wm.set_pos(c, 0, -l_, -t_, cw + l_ + r_, ch + t_ + b_, SWP_NOZORDER | SWP_NOACTIVATE)
+        wm.send(c.hwnd, 0x0005, 2, _lparam_xy(c.cl[2] - c.cl[0], c.cl[3] - c.cl[1]))
+        update_frame_title(client)
+
+    def restore(client, c, keep=False):
+        s = st(client)
+        if not c.py.get("mdi_max"):
+            return
+        c.py["mdi_max"] = False
+        c.style &= ~WS_MAXIMIZE
+        x, y, w_, h_ = c.py.get("mdi_restore", (0, 0, 300, 200))
+        wm.set_pos(c, 0, x, y, w_, h_, SWP_NOZORDER | SWP_NOACTIVATE)
+        wm.send(c.hwnd, 0x0005, 0, _lparam_xy(c.cl[2] - c.cl[0], c.cl[3] - c.cl[1]))
+        if not keep:
+            s["maxed"] = False
+        update_frame_title(client)
+
+    def relayout_max(client):
+        s = st(client)
+        a = W(s["active"])
+        if s["maxed"] and a is not None and a.py.get("mdi_max"):
+            a.py["mdi_max"] = False
+            s["maxed"] = False
+            saved = a.py.get("mdi_restore")
+            maximize(client, a)
+            if saved:
+                a.py["mdi_restore"] = saved
+
+    # ---- creation / destruction ---------------------------------------------------------------
+    def cascade_pos(client):
+        s = st(client)
+        cw, ch = client_size(client)
+        step = 22
+        i = s["n"] % 8
+        s["n"] += 1
+        return i * step, i * step, max(160, cw * 3 // 4), max(100, ch * 3 // 4)
+
+    def mdi_create(client, cls_name, title, inst, x, y, cx, cy, style, lparam, mcs_ptr, wide):
+        s = st(client)
+        cls = wm.find_class(cls_name) if isinstance(cls_name, str) else wm.find_class(cls_name)
+        if cls is None:
+            p.last_error = 1407
+            return 0
+        CW = 0x80000000
+        dx, dy, dw, dh = cascade_pos(client)
+        if x == CW or x == -0x80000000:
+            x, y = dx, dy
+        if cx == CW or cx == -0x80000000 or cx == 0:
+            cx, cy = dw, dh
+        if client.style & 1:                                         # MDIS_ALLCHILDSTYLES
+            style = (style | WS_CHILD | 0x04000000) & ~WS_POPUP
+            visible = bool(style & WS_VISIBLE)
+        else:
+            style = (style | WS_CHILD | 0x04000000 | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME |
+                     0x00020000 | 0x00010000) & ~WS_POPUP            # CLIPSIBLINGS, MIN/MAXBOX
+            visible = True
+        maxed = bool(style & WS_MAXIMIZE) or s["maxed"]
+        style &= ~(WS_MAXIMIZE | 0x20000000 | WS_VISIBLE)
+        # a hidden child (MDIS_ALLCHILDSTYLES without WS_VISIBLE) is neither shown nor
+        # activated: MFC frames check MDIGetActive() before their first ShowWindow
+        style |= WS_VISIBLE if visible else 0
+        cid = s["first"] + len(children(client))
+        h = wm.create(WS_EX_MDICHILD | 0x100, cls, title, style, x, y, cx, cy, client.hwnd,
+                      cid, inst, mcs_ptr, wide)
+        c = W(h)
+        if c is None:
+            return 0
+        c.py["mdichild"] = True
+        s["order"].append(h)
+        if visible:
+            activate(client, h)
+            if maxed:
+                maximize(client, c)
+        refresh_window_menu(client)
+        return h
+
+    def mdi_show(c, cmd):
+        """ShowWindow on an MDI child: activation and maximize stay inside the client."""
+        client = client_of(c)
+        if client is None:
+            return None
+        was = bool(c.style & WS_VISIBLE)
+        if cmd == 0:
+            if not was:
+                return 0
+            wm.send(c.hwnd, 0x0018, 0, 0)                        # WM_SHOWWINDOW
+            wm.set_pos(c, 0, 0, 0, 0, 0, 0x80 | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                       SWP_NOACTIVATE)
+            s = st(client)
+            if s["active"] == c.hwnd:
+                nxt = next_child(client, c.hwnd)
+                if nxt and nxt != c.hwnd:
+                    activate(client, nxt)
+                else:
+                    s["active"] = 0
+                    if c.py.get("mdi_max"):
+                        restore(client, c)
+                    update_frame_title(client)
+            refresh_window_menu(client)
+            return 1
+        if not was:
+            wm.send(c.hwnd, 0x0018, 1, 0)
+            wm.set_pos(c, 0, 0, 0, 0, 0, 0x40 | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                       SWP_NOACTIVATE)
+        if cmd in (4, 7, 8):                                     # no activation
+            refresh_window_menu(client)
+            return 1 if was else 0
+        activate(client, c.hwnd)
+        if cmd == 3:
+            maximize(client, c)
+        elif cmd in (1, 9) and c.py.get("mdi_max") and not st(client)["maxed"]:
+            restore(client, c)
+        refresh_window_menu(client)
+        return 1 if was else 0
+
+    wm.mdi_show = mdi_show
+
+    def mdi_destroy(client, h):
+        s = st(client)
+        c = W(h)
+        if c is None:
+            return 0
+        was_active = s["active"] == h
+        was_max = bool(c.py.get("mdi_max"))
+        nxt = next_child(client, h) if was_active else 0
+        if was_active:
+            wm.send(h, WM_MDIACTIVATE, h, nxt if nxt != h else 0)
+            s["active"] = 0
+        if h in s["order"]:
+            s["order"].remove(h)
+        wm.destroy(c)
+        if was_max:
+            s["maxed"] = bool(children(client))
+        if nxt and nxt != h and W(nxt) is not None:
+            activate(client, nxt)
+            if was_max:
+                maximize(client, W(nxt))
+        else:
+            s["maxed"] = False
+            fr = frame_of(client)
+            if fr is not None:
+                wm.set_focus(client.hwnd)
+        refresh_window_menu(client)
+        update_frame_title(client)
+        return 0
+
+    # ---- MDICLIENT window procedure ---------------------------------------------------------------
+    def client_proc(hwnd, msg, wp, lp, wide):
+        w = W(hwnd)
+        if w is None:
+            return 0
+        s = st(w)
+        if msg == 0x0001:                                        # WM_CREATE: CLIENTCREATESTRUCT
+            ps = wm.ps
+            ccs = wm.rp(lp + 0) if lp else 0                     # CREATESTRUCT.lpCreateParams
+            if ccs:
+                s["winmenu"] = wm.rp(ccs) & 0xFFFFFFFF
+                s["first"] = M_.read32(ccs + ps) or 0xFF00
+            w.exstyle |= 0
+            return 0
+        if msg == 0x0014:                                        # WM_ERASEBKGND
+            dc = wm.gdi.get(wp, "dc")
+            if dc is not None:
+                pt = _Painter(wm, w, dc=dc)
+                try:
+                    pt.fill(0, 0, w.cl[2] - w.cl[0], w.cl[3] - w.cl[1],
+                            wm.gdi.sys_color(12))                # COLOR_APPWORKSPACE
+                finally:
+                    pt.done()
+            return 1
+        if msg == WM_MDICREATE:
+            if not lp:
+                return 0
+            ps = wm.ps
+            vals = [wm.rp(lp + i * ps) for i in range(3)]
+            x, y, cx, cy, style = struct.unpack("<iiiiI", M_.read(lp + 3 * ps, 20))
+            lparam = wm.rp(lp + 3 * ps + 20 + (4 if ps == 8 else 0))
+            cls_p, title_p, inst = vals
+            cls_name = wm.gstr(cls_p, wide) if cls_p > 0xFFFF else (cls_p & 0xFFFF)
+            title = wm.gstr(title_p, wide) if title_p else ""
+            return mdi_create(w, cls_name, title, inst, x & 0xFFFFFFFF, y, cx & 0xFFFFFFFF, cy,
+                              style, lparam, lp, wide)
+        if msg == WM_MDIDESTROY:
+            return mdi_destroy(w, wp & 0xFFFFFFFF)
+        if msg == WM_MDIACTIVATE:
+            activate(w, wp & 0xFFFFFFFF)
+            return 0
+        if msg == WM_MDIGETACTIVE:
+            if lp:
+                M_.write32(lp, 1 if s["maxed"] else 0)
+            return s["active"]
+        if msg == WM_MDINEXT:
+            switch_next(w, (wp & 0xFFFFFFFF) or s["active"], prev=bool(lp))
+            return 0
+        if msg == WM_MDIMAXIMIZE:
+            c = W(wp)
+            if c is not None:
+                activate(w, c.hwnd)
+                maximize(w, c)
+            return 0
+        if msg == WM_MDIRESTORE:
+            c = W(wp)
+            if c is not None:
+                restore(w, c)
+            return 0
+        if msg == WM_MDICASCADE:
+            cascade(w)
+            return 1
+        if msg == WM_MDITILE:
+            tile(w, bool(wp & 1))                                # MDITILE_HORIZONTAL = 1
+            return 1
+        if msg == WM_MDIICONARRANGE:
+            return 0
+        if msg == WM_MDISETMENU:
+            fr = frame_of(w)
+            old = fr.menu if fr is not None else 0
+            if fr is not None and wp:
+                fr.menu = wp & 0xFFFFFFFF
+                wm.set_pos(fr, 0, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER |
+                           SWP_NOACTIVATE | SWP_FRAMECHANGED)
+            if lp:
+                s["winmenu"] = lp & 0xFFFFFFFF
+                refresh_window_menu(w)
+            return old
+        if msg == WM_MDIREFRESHMENU:
+            refresh_window_menu(w)
+            fr = frame_of(w)
+            return fr.menu if fr is not None else 0
+        if msg == 0x0005:                                        # WM_SIZE: keep a max child full
+            relayout_max(w)
+            return 0
+        if msg == 0x0007:                                        # WM_SETFOCUS -> active child
+            if s["active"] and W(s["active"]) is not None:
+                wm.set_focus(s["active"])
+            return 0
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+
+    wm.py_class("MDIClient", client_proc, style=0)
+
+    def cascade(client):
+        cw, ch = client_size(client)
+        i = 0
+        for h in children(client):
+            c = W(h)
+            if c is None or not c.style & WS_VISIBLE:
+                continue
+            if c.py.get("mdi_max"):
+                restore(client, c)
+            wm.set_pos(c, 0, i * 22, i * 22, max(160, cw * 3 // 4), max(100, ch * 3 // 4),
+                       SWP_NOACTIVATE)
+            i += 1
+
+    def tile(client, horizontal):
+        vis = [W(h) for h in children(client)]
+        vis = [c for c in vis if c is not None and c.style & WS_VISIBLE]
+        if not vis:
+            return
+        cw, ch = client_size(client)
+        n = len(vis)
+        for i, c in enumerate(vis):
+            if c.py.get("mdi_max"):
+                restore(client, c)
+            if horizontal:
+                wm.set_pos(c, 0, 0, i * ch // n, cw, ch // n, SWP_NOZORDER | SWP_NOACTIVATE)
+            else:
+                wm.set_pos(c, 0, i * cw // n, 0, cw // n, ch, SWP_NOZORDER | SWP_NOACTIVATE)
+
+    # ---- DefFrameProc / DefMDIChildProc -------------------------------------------------------------
+    def def_frame(hwnd, client_h, msg, wp, lp, wide):
+        client = W(client_h)
+        if client is not None and client.py.get("mdi") is not None:
+            s = st(client)
+            if msg == 0x0111:                                    # WM_COMMAND: window menu picks
+                cid = wp & 0xFFFF
+                if s["first"] <= cid < s["first"] + 0x100:
+                    for h in children(client):
+                        if W(h) is not None and W(h).py.get("mdi_id") == cid:
+                            activate(client, h)
+                            return 0
+            if msg == 0x0086:                                    # WM_NCACTIVATE
+                if s["active"]:
+                    wm.send(s["active"], msg, wp, lp)
+            if msg == 0x0007:                                    # WM_SETFOCUS
+                wm.set_focus(client_h)
+                return 0
+            if msg == 0x0005:                                    # WM_SIZE: client fills frame
+                fr = W(hwnd)
+                if fr is not None:
+                    wm.set_pos(client, 0, 0, 0, fr.cl[2] - fr.cl[0], fr.cl[3] - fr.cl[1],
+                               SWP_NOZORDER | SWP_NOACTIVATE)
+                return 0
+            if msg == 0x000C:                                    # WM_SETTEXT: remember base
+                fr = W(hwnd)
+                r = _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+                if fr is not None:
+                    fr.py["mdi_title"] = fr.text
+                    update_frame_title(client)
+                return r
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+
+    def def_child(hwnd, msg, wp, lp, wide):
+        c = W(hwnd)
+        if c is None:
+            return 0
+        client = client_of(c)
+        if client is None:
+            return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+        s = st(client)
+        if msg == 0x0022 or (msg == 0x0021):                     # WM_CHILDACTIVATE / MOUSEACTIVATE
+            if s["active"] != hwnd:
+                activate(client, hwnd)
+            return 1 if msg == 0x0021 else 0                     # MA_ACTIVATE
+        if msg == 0x0007:                                        # WM_SETFOCUS
+            if s["active"] != hwnd:
+                activate(client, hwnd, focus=False)
+            return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+        if msg == 0x0010:                                        # WM_CLOSE
+            wm.send(client.hwnd, WM_MDIDESTROY, hwnd, 0)
+            return 0
+        if msg == 0x0112:                                        # WM_SYSCOMMAND
+            sc = wp & 0xFFF0
+            if sc == SC_MAXIMIZE_:
+                activate(client, hwnd)
+                maximize(client, c)
+                return 0
+            if sc == SC_RESTORE_:
+                restore(client, c)
+                return 0
+            if sc == SC_MINIMIZE_:
+                return 0
+            if sc == SC_CLOSE_:
+                wm.send(hwnd, 0x0010, 0, 0)
+                return 0
+            if sc in (SC_NEXTWINDOW_, SC_PREVWINDOW_):
+                wm.send(client.hwnd, WM_MDINEXT, hwnd, 1 if sc == SC_PREVWINDOW_ else 0)
+                return 0
+        if msg == 0x000C:                                        # WM_SETTEXT
+            r = _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+            refresh_window_menu(client)
+            update_frame_title(client)
+            return r
+        if msg == 0x0024:                                        # WM_GETMINMAXINFO
+            r = _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+            return r
+        if msg == 0x0201 or msg == 0x00A1:                       # clicks activate
+            if s["active"] != hwnd:
+                activate(client, hwnd)
+        return _def_window_proc(wm, hwnd, msg, wp, lp, wide)
+
+    reg("DefFrameProcA", "pppup", "p")(lambda c, h, cl, m, wp, lp: def_frame(h, cl, m, wp, lp, False))
+    reg("DefFrameProcW", "pppup", "p")(lambda c, h, cl, m, wp, lp: def_frame(h, cl, m, wp, lp, True))
+    reg("DefMDIChildProcA", "pupp", "p")(lambda c, h, m, wp, lp: def_child(h, m, wp, lp, False))
+    reg("DefMDIChildProcW", "pupp", "p")(lambda c, h, m, wp, lp: def_child(h, m, wp, lp, True))
+
+    @reg("TranslateMDISysAccel", "pp")
+    def _TranslateMDISysAccel(c, client_h, pmsg):
+        client = W(client_h)
+        if client is None or client.py.get("mdi") is None or not pmsg:
+            return 0
+        m = _read_msg_rec(wm, pmsg)
+        if m["msg"] not in (0x100, 0x104):                       # WM_(SYS)KEYDOWN
+            return 0
+        vk = m["w"] & 0xFF
+        ctrl = bool(wm.keys[0x11] & 0x80)
+        s = st(client)
+        if not ctrl or not s["active"]:
+            return 0
+        if vk == 0x73:                                           # Ctrl+F4: close child
+            wm.post(s["active"], 0x0112, SC_CLOSE_, 0)
+            return 1
+        if vk in (0x75, 0x09):                                   # Ctrl+F6 / Ctrl+Tab: next
+            shift = bool(wm.keys[0x10] & 0x80)
+            wm.post(s["active"], 0x0112, SC_PREVWINDOW_ if shift else SC_NEXTWINDOW_, 0)
+            return 1
+        return 0
+
+    def _create_mdi_window(c, cls_p, title_p, style, x, y, cx, cy, parent, inst, lparam, wide):
+        client = W(parent)
+        if client is None or client.py.get("mdi") is None:
+            return k.err(1400)
+        cls_name = wm.gstr(cls_p, wide) if cls_p > 0xFFFF else (cls_p & 0xFFFF)
+        title = wm.gstr(title_p, wide) if title_p else ""
+        ps = wm.ps
+        mark = wm.scratch_mark()
+        try:
+            mcs = wm.scratch(bytes(3 * ps) + struct.pack("<iiiiI", x, y, cx, cy, style) +
+                             bytes(4 if ps == 8 else 0) + bytes(ps))
+            wm.wp(mcs, cls_p)
+            wm.wp(mcs + ps, title_p)
+            wm.wp(mcs + 2 * ps, inst)
+            wm.wp(mcs + 3 * ps + 20 + (4 if ps == 8 else 0), lparam)
+            return mdi_create(client, cls_name, title, inst, x & 0xFFFFFFFF, y, cx & 0xFFFFFFFF,
+                              cy, style, lparam, mcs, wide)
+        finally:
+            wm.scratch_release(mark)
+
+    reg("CreateMDIWindowA", "ppuiiiippp", "p")(
+        lambda c, cl, t, st_, x, y, cx, cy, par, inst, lp: _create_mdi_window(
+            c, cl, t, st_, x, y, cx, cy, par, inst, lp, False))
+    reg("CreateMDIWindowW", "ppuiiiippp", "p")(
+        lambda c, cl, t, st_, x, y, cx, cy, par, inst, lp: _create_mdi_window(
+            c, cl, t, st_, x, y, cx, cy, par, inst, lp, True))
+
+    @reg("CascadeWindows", "pupup", "u")
+    def _CascadeWindows(c, parent, how, rect, n, kids):
+        pw = W(parent) or wm.desktop
+        if pw.py.get("mdi") is not None:
+            cascade(pw)
+            return len(children(pw))
+        return 0
+
+    @reg("TileWindows", "pupup", "u")
+    def _TileWindows(c, parent, how, rect, n, kids):
+        pw = W(parent) or wm.desktop
+        if pw.py.get("mdi") is not None:
+            tile(pw, bool(how & 1))
+            return len(children(pw))
+        return 0
+
+    reg("ArrangeIconicWindows", "p", "u")(lambda c, h: 0)
 
 
 # Bitmap glyphs rasterized from the DejaVu fonts (c) Bitstream / DejaVu
@@ -55042,7 +55651,8 @@ class NOOProcess:
                     # A blocking call inside a callback: wait for it right here
                     # (other threads keep running) and then complete the call.
                     if t.state in ("blocked", "guiwait") and t.waiting_on is not None:
-                        self.py_wait(lambda: self._wake_check(t))
+                        self.py_wait(lambda: self._wake_check(t),
+                                     yield_first=t.waiting_on[0] == "sleep")
                     t.state = "running"
                     t.waiting_on = None
                     cpu.finish_yield()
@@ -56255,12 +56865,17 @@ class NOOProcess:
                 self.current_thread = me
         return ran
 
-    def py_wait(self, cond, deadline=None):
+    def py_wait(self, cond, deadline=None, yield_first=False):
         """Block the current guest thread inside Python (modal loops, a blocking
-        call made from a callback) while every other thread keeps running."""
+        call made from a callback) while every other thread keeps running.
+        yield_first gives every other thread one round even when cond() already
+        holds (Sleep(0) / SwitchToThread spin-waits inside a window procedure)."""
         me = self.current_thread
         me.nested = me.__dict__.get("nested", 0) + 1
         try:
+            if yield_first:
+                self._run_others(me)
+                self.current_thread = me
             while True:
                 if self.__dict__.get("terminate_code") is not None:
                     raise NOOExitProcess(self.terminate_code)
