@@ -11118,6 +11118,43 @@ def _crt_install(crt):
             p.env.pop(k.upper(), None)
         return 0
 
+    @R("_wputenv_s", "pp")
+    def _wputenv_s(c, k, v):
+        key = crt.ws(k).upper()
+        val = crt.ws(v)
+        if val:
+            p.env[key] = val
+        else:
+            p.env.pop(key, None)
+        return 0
+
+    R("__fpe_flt_rounds", "")(lambda c: 1)                     # round to nearest
+
+    def _errlist():
+        """msvcrt-style (_sys_nerr, _sys_errlist): count cell and char* table."""
+        a = crt.static_bufs.get("sys_errlist")
+        if a is None:
+            ps = 8 if p.cpu_mode == 64 else 4
+            n = 43
+            tbl = crt.alloc(ps * n + 8)
+            for i in range(n):
+                txt = _ERRNO_TEXT.get(i, "Unknown error").encode() + b"\0"
+                sa = crt.alloc(len(txt))
+                c_mem = p.mem
+                c_mem.write(sa, txt)
+                crt.wptr(tbl + ps * i, sa)
+            cnt = crt.alloc(8)
+            p.mem.write32(cnt, n)
+            crt.static_bufs["sys_errlist"] = tbl
+            crt.static_bufs["sys_nerr"] = cnt
+        return crt.static_bufs["sys_nerr"], crt.static_bufs["sys_errlist"]
+
+    R("__sys_nerr", "", "p")(lambda c: _errlist()[0])
+    R("__sys_errlist", "", "p")(lambda c: _errlist()[1])
+
+    # the CRT's main/DllMain exception filters: nothing special to handle here
+    R("_seh_filter_exe _seh_filter_dll", "ip")(lambda c, code, ptrs: 0)
+
     @R("system _wsystem", "p")
     def _system(c, cmd):
         if not cmd:
@@ -12921,17 +12958,49 @@ def _crt_install(crt):
     def __tzset(c):
         return None
 
-    @R("__p__timezone", "", "p")
-    def __p_timezone(c):
-        return crt.data_addrs.get(("msvcrt.dll", "_timezone"), 0)
+    def _tz_cell(name, init):
+        a = crt.data_addrs.get(("msvcrt.dll", name), 0)
+        if not a:                                   # UCRT-only programs: own cells
+            a = crt.static_bufs.get(name)
+            if a is None:
+                a = crt.alloc(max(8, len(init)))
+                p.mem.write(a, init)
+                crt.static_bufs[name] = a
+        return a
 
-    @R("__p__daylight", "", "p")
-    def __p_daylight(c):
-        return crt.data_addrs.get(("msvcrt.dll", "_daylight"), 0)
+    R("__p__timezone __timezone", "", "p")(lambda c: _tz_cell("_timezone", struct.pack("<i", 0)))
+    R("__p__daylight __daylight", "", "p")(lambda c: _tz_cell("_daylight", struct.pack("<i", 0)))
+    R("__p__dstbias __dstbias", "", "p")(lambda c: _tz_cell("_dstbias", struct.pack("<i", -3600)))
 
-    @R("__p__tzname", "", "p")
+    @R("__p__tzname __tzname", "", "p")
     def __p_tzname(c):
-        return crt.data_addrs.get(("msvcrt.dll", "_tzname"), 0)
+        a = crt.data_addrs.get(("msvcrt.dll", "_tzname"), 0)
+        if a:
+            return a
+        a = crt.static_bufs.get("_tzname")
+        if a is None:
+            ps = 8 if p.cpu_mode == 64 else 4
+            strs = crt.alloc(32)
+            p.mem.write(strs, b"UTC\0" + bytes(12) + b"UTC\0" + bytes(12))
+            a = crt.alloc(2 * ps)
+            crt.wptr(a, strs)
+            crt.wptr(a + ps, strs + 16)
+            crt.static_bufs["_tzname"] = a
+        return a
+
+    @R("_get_dstbias", "p")
+    def __get_dstbias(c, out):
+        c.mem.write32(out, (-3600) & 0xFFFFFFFF)
+        return 0
+
+    @R("_get_tzname", "ppzi")
+    def __get_tzname(c, pret, buf, n, idx):
+        t = b"UTC"
+        if pret:
+            crt.wptr(pret, len(t) + 1)
+        if buf and n > len(t):
+            p.mem.write(buf, t + b"\0")
+        return 0
 
     @R("_get_timezone", "p")
     def __get_timezone(c, out):
@@ -14861,9 +14930,43 @@ def _k32_install(k):
     def _dtlc(c, h):
         return 1
 
-    @R("SetDllDirectoryA SetDllDirectoryW SetDefaultDllDirectories AddDllDirectory", "p", "p")
-    def _sdd(c, x):
+    def _dll_dirs():
+        return p.__dict__.setdefault("dll_dirs", [])
+
+    @R("SetDllDirectoryA", "p")
+    def _sdda(c, x):
+        d = k.cs_(x) if x else ""
+        dirs = _dll_dirs()
+        dirs[:] = [d] if d else []
         return 1
+
+    @R("SetDllDirectoryW", "p")
+    def _sddw(c, x):
+        d = k.ws_(x) if x else ""
+        dirs = _dll_dirs()
+        dirs[:] = [d] if d else []
+        return 1
+
+    @R("AddDllDirectory", "p", "p")
+    def _adddd(c, x):
+        d = k.ws_(x)
+        if not d:
+            return k.err(ERROR_INVALID_PARAMETER)
+        dirs = _dll_dirs()
+        if d not in dirs:
+            dirs.append(d)
+        return 0x1000 + dirs.index(d)                   # DLL_DIRECTORY_COOKIE
+
+    @R("RemoveDllDirectory", "p")
+    def _rmdd(c, cookie):
+        dirs = _dll_dirs()
+        i = cookie - 0x1000
+        if 0 <= i < len(dirs):
+            dirs[i] = ""
+            return 1
+        return k.err(ERROR_INVALID_PARAMETER)
+
+    R("SetDefaultDllDirectories", "u")(lambda c, f: 1)
 
     # =====================================================================
     # environment
@@ -16613,6 +16716,13 @@ def _k32_install(k):
             return False                            # redirected to a pipe / file
         return h in STD or p.handles.kind(h) in ("conin", "conout")
 
+    def is_console_input(h):
+        """Console *input* handles only (programs such as CPython tell input from output
+        consoles by whether GetNumberOfConsoleInputEvents succeeds)."""
+        if not is_console(h):
+            return False
+        return h == HandleTable.STDIN_HANDLE or p.handles.kind(h) == "conin"
+
     def create_file(c, path, access, share, disp, flags):
         if _TRACE:
             p.log.info("[trace] CreateFile(%r, acc=%#x, disp=%d, flags=%#x)" % (path, access, disp, flags))
@@ -16998,7 +17108,12 @@ def _k32_install(k):
     def _hstat(h):
         kind = p.handles.kind(h)
         if kind == "file":
-            return os.fstat(p.handles.get(h).fileno()), k.file_meta.get(h, {}).get("host")
+            f = p.handles.get(h)
+            host = k.file_meta.get(h, {}).get("host")
+            if host is None:                        # opened through the CRT fd layer
+                nm = getattr(f, "name", None)
+                host = nm if isinstance(nm, str) else None
+            return os.fstat(f.fileno()), host
         if kind == "dir":
             d = p.handles.get(h)
             return os.stat(d.host), d.host
@@ -17035,9 +17150,12 @@ def _k32_install(k):
         if st is None:
             return 0
         ct, at, mt = times_of(st)
-        size = 0 if os.path.isdir(host) else st.st_size
+        import stat as _stat
+        size = 0 if _stat.S_ISDIR(st.st_mode) else st.st_size
         ino = st.st_ino & M64
-        p.mem.write(out, struct.pack("<IQQQIIIIII", attrs_of(host, st), ct, at, mt, 0x4E4F4F21,
+        attrs = (attrs_of(host, st) if host else None) or \
+            (FA_DIR if _stat.S_ISDIR(st.st_mode) else FA_ARCH)
+        p.mem.write(out, struct.pack("<IQQQIIIIII", attrs, ct, at, mt, 0x4E4F4F21,
                                      size >> 32, size & 0xFFFFFFFF, st.st_nlink,
                                      ino >> 32, ino & 0xFFFFFFFF))
         return 1
@@ -18208,14 +18326,14 @@ def _k32_install(k):
 
     @R("GetNumberOfConsoleInputEvents", "pp")
     def _gncie(c, h, pn):
-        if not is_console(h):
+        if not is_console_input(h):
             return k.err(ERROR_INVALID_HANDLE)
         w32(pn, 0)
         return 1
 
     @R("FlushConsoleInputBuffer", "p")
     def _fcib(c, h):
-        return 1
+        return 1 if is_console_input(h) else k.err(ERROR_INVALID_HANDLE)
 
     @R("GetConsoleMode", "pp")
     def _gcm(c, h, pm):
@@ -49242,6 +49360,192 @@ def _shell_install(k):
     R("PathCchCombine", "pupp", dlls=("api-ms-win-core-path-l1-1-0.dll", "kernelbase.dll"))(
         lambda c, out, cch, a, b: (_combine(True, out, a, b), 0)[1] if cch else 0x80070057)
 
+    # ---- PathCch* (Windows 8+ path API: wide strings, HRESULTs, explicit buffer sizes) -----
+    PCC = ("api-ms-win-core-path-l1-1-0.dll", "kernelbase.dll")
+    S_OK_, S_FALSE_, E_INVALIDARG_ = 0, 1, 0x80070057
+    E_OUTOFBUF = 0x8007007A                                        # STRSAFE_E_INSUFFICIENT_BUFFER
+
+    def root_len(s_):
+        if s_.startswith("\\\\?\\UNC\\"):
+            parts = s_[8:].split("\\", 2)
+            return min(len(s_), 8 + sum(len(x) + 1 for x in parts[:2]))
+        if s_.startswith("\\\\?\\") and s_[5:6] == ":":
+            return 7 if s_[6:7] == "\\" else 6
+        if s_.startswith("\\\\"):
+            parts = s_[2:].split("\\", 2)
+            return min(len(s_), 2 + sum(len(x) + 1 for x in parts[:2]))
+        if s_[1:2] == ":":
+            return 3 if s_[2:3] == "\\" else 2
+        if s_.startswith("\\"):
+            return 1
+        return -1
+
+    def put_w(buf, cch, text):
+        if cch <= len(text):
+            return E_OUTOFBUF
+        M_.write(buf, text.encode("utf-16-le") + b"\0\0")
+        return S_OK_
+
+    @R("PathCchSkipRoot", "pp", dlls=PCC)
+    def _PathCchSkipRoot(c, path, pend):
+        s_ = gs(path, True)
+        n = root_len(s_)
+        if n < 0:
+            return E_INVALIDARG_
+        put_ptr(pend, ptr_at(path, s_, n, True))
+        return S_OK_
+
+    @R("PathCchStripToRoot", "pu", dlls=PCC)
+    def _PathCchStripToRoot(c, path, cch):
+        s_ = gs(path, True)
+        n = root_len(s_)
+        if n < 0:
+            return E_INVALIDARG_
+        if n >= len(s_):
+            return S_FALSE_
+        M_.write(path + 2 * n, b"\0\0")
+        return S_OK_
+
+    @R("PathCchIsRoot", "p", dlls=PCC)
+    def _PathCchIsRoot(c, path):
+        s_ = gs(path, True)
+        n = root_len(s_)
+        return int(n >= 0 and n == len(s_) and (n != 2 or not s_[1:2] == ":"))
+
+    @R("PathCchRemoveFileSpec", "pu", dlls=PCC)
+    def _PathCchRemoveFileSpec(c, path, cch):
+        s_ = gs(path, True)
+        n = max(root_len(s_), 0)
+        i = s_.rfind("\\")
+        if i < n:
+            if len(s_) > n:
+                M_.write(path + 2 * n, b"\0\0")
+                return S_OK_
+            return S_FALSE_
+        M_.write(path + 2 * (i if i >= n else n), b"\0\0")
+        return S_OK_
+
+    def _add_bs(path, cch, pend, prem):
+        s_ = gs(path, True)
+        if s_.endswith("\\"):
+            r = S_FALSE_
+        else:
+            if cch <= len(s_) + 1:
+                return E_OUTOFBUF
+            s_ += "\\"
+            M_.write(path, s_.encode("utf-16-le") + b"\0\0")
+            r = S_OK_
+        if pend:
+            put_ptr(pend, path + 2 * len(s_))
+        if prem:
+            M_.write(prem, struct.pack("<Q" if ps() == 8 else "<I", cch - len(s_)))
+        return r
+    R("PathCchAddBackslash", "pu", dlls=PCC)(lambda c, p_, n: _add_bs(p_, n, 0, 0))
+    R("PathCchAddBackslashEx", "pupp", dlls=PCC)(lambda c, p_, n, e, r: _add_bs(p_, n, e, r))
+
+    def _rm_bs(path, cch, pend, prem):
+        s_ = gs(path, True)
+        r = S_FALSE_
+        if s_.endswith("\\") and len(s_) > max(root_len(s_), 1):
+            s_ = s_[:-1]
+            M_.write(path + 2 * len(s_), b"\0\0")
+            r = S_OK_
+        if pend:
+            put_ptr(pend, path + 2 * len(s_))
+        if prem:
+            M_.write(prem, struct.pack("<Q" if ps() == 8 else "<I", cch - len(s_)))
+        return r
+    R("PathCchRemoveBackslash", "pu", dlls=PCC)(lambda c, p_, n: _rm_bs(p_, n, 0, 0))
+    R("PathCchRemoveBackslashEx", "pupp", dlls=PCC)(lambda c, p_, n, e, r: _rm_bs(p_, n, e, r))
+
+    def _join(a_, b_):
+        if not b_:
+            return canon(a_) if a_ else ""
+        if b_[1:2] == ":" or b_.startswith("\\\\"):
+            return canon(b_)
+        if b_.startswith("\\"):
+            return canon(_ntp.splitdrive(a_)[0] + b_)
+        return canon((a_.rstrip("\\") + "\\" + b_) if a_ else b_)
+
+    @R("PathCchAppend", "pup", dlls=PCC)
+    def _PathCchAppend(c, path, cch, more):
+        return put_w(path, cch, _join(gs(path, True), gs(more, True)))
+
+    @R("PathCchAppendEx", "pupu", dlls=PCC)
+    def _PathCchAppendEx(c, path, cch, more, flags):
+        return put_w(path, cch, _join(gs(path, True), gs(more, True)))
+
+    @R("PathCchCombineEx", "puppu", dlls=PCC)
+    def _PathCchCombineEx(c, out, cch, a_, b_, flags):
+        return put_w(out, cch, _join(gs(a_, True), gs(b_, True)))
+
+    @R("PathCchCanonicalizeEx", "pupu", dlls=PCC)
+    def _PathCchCanonicalizeEx(c, out, cch, src, flags):
+        return put_w(out, cch, canon(gs(src, True)))
+
+    def _alloc_w(text, pp):
+        data = text.encode("utf-16-le") + b"\0\0"
+        a = p.heap_alloc(p.process_heap_handle, len(data))       # LocalFree-compatible
+        M_.write(a, data)
+        put_ptr(pp, a)
+        return S_OK_
+
+    R("PathAllocCombine", "ppup", dlls=PCC)(
+        lambda c, a_, b_, f, pp: _alloc_w(_join(gs(a_, True), gs(b_, True)), pp))
+    R("PathAllocCanonicalize", "pup", dlls=PCC)(
+        lambda c, s_, f, pp: _alloc_w(canon(gs(s_, True)), pp))
+
+    @R("PathCchFindExtension", "pup", dlls=PCC)
+    def _PathCchFindExtension(c, path, cch, pext):
+        s_ = gs(path, True)
+        put_ptr(pext, ptr_at(path, s_, ext_idx(s_), True))
+        return S_OK_
+
+    @R("PathCchAddExtension", "pup", dlls=PCC)
+    def _PathCchAddExtension(c, path, cch, ext):
+        s_ = gs(path, True)
+        if ext_idx(s_) != len(s_):
+            return S_FALSE_
+        e = gs(ext, True)
+        e = e if e.startswith(".") or not e else "." + e
+        return put_w(path, cch, s_ + e)
+
+    @R("PathCchRemoveExtension", "pu", dlls=PCC)
+    def _PathCchRemoveExtension(c, path, cch):
+        s_ = gs(path, True)
+        i = ext_idx(s_)
+        if i == len(s_):
+            return S_FALSE_
+        M_.write(path + 2 * i, b"\0\0")
+        return S_OK_
+
+    @R("PathCchRenameExtension", "pup", dlls=PCC)
+    def _PathCchRenameExtension(c, path, cch, ext):
+        s_ = gs(path, True)
+        e = gs(ext, True)
+        e = e if e.startswith(".") or not e else "." + e
+        return put_w(path, cch, s_[:ext_idx(s_)] + e)
+
+    @R("PathIsUNCEx", "pp", dlls=PCC)
+    def _PathIsUNCEx(c, path, pserver):
+        s_ = gs(path, True)
+        off = 8 if s_.startswith("\\\\?\\UNC\\") else (2 if s_.startswith("\\\\") and
+                                                         not s_.startswith("\\\\?\\") else -1)
+        if off < 0:
+            put_ptr(pserver, 0)
+            return 0
+        put_ptr(pserver, ptr_at(path, s_, off, True))
+        return 1
+
+    @R("PathCchStripPrefix", "pu", dlls=PCC)
+    def _PathCchStripPrefix(c, path, cch):
+        s_ = gs(path, True)
+        if s_.startswith("\\\\?\\UNC\\"):
+            return put_w(path, cch, "\\" + s_[7:])
+        if s_.startswith("\\\\?\\") and s_[5:6] == ":":
+            return put_w(path, cch, s_[4:])
+        return S_FALSE_
+
 
 # ==========================================================================================
 # 10p. comdlg32 + SHBrowseForFolder: common dialogs built from real windows (so they render
@@ -53964,6 +54268,14 @@ class ModuleManager:
         if not base_name.lower().endswith(".dll") and "." not in base_name:
             base_name += ".dll"
         exe_dir = (self.p.exe_win_path or "C:\\app\\x").rsplit("\\", 1)[0]
+        # a DLL's dependencies are found next to it first (as with LoadLibraryEx's
+        # LOAD_WITH_ALTERED_SEARCH_PATH / LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR), then in
+        # directories added with SetDllDirectory / AddDllDirectory
+        for d in reversed(self.__dict__.setdefault("load_dirs", [])):
+            cands.append(d + "\\" + base_name)
+        for d in self.p.__dict__.get("dll_dirs", []):
+            if d:
+                cands.append(d.rstrip("\\") + "\\" + base_name)
         cands += [exe_dir + "\\" + base_name, "C:\\app\\" + base_name,
                   self.p.vfs.getcwd() + "\\" + base_name,
                   "C:\\Windows\\System32\\" + base_name, "C:\\Windows\\" + base_name]
@@ -53980,7 +54292,13 @@ class ModuleManager:
             m = self.by_name.get(os.path.basename(host).lower())
             if m:
                 return m.base
-            m = self._load_pe_dll(host, base_name)
+            gdir = cand.replace("/", "\\").rsplit("\\", 1)[0] if "\\" in cand.replace("/", "\\") \
+                else self.p.vfs.getcwd()
+            self.__dict__.setdefault("load_dirs", []).append(gdir)
+            try:
+                m = self._load_pe_dll(host, base_name)
+            finally:
+                self.load_dirs.pop()
             if not getattr(self.p, "_startup_pending", True) and \
                     getattr(self.p, "current_thread", None) is not None:
                 pend = self.p.__dict__.get("pending_dll_inits", [])
@@ -54535,6 +54853,10 @@ class NOOProcess:
 
     def _api_convention_uncached(self, api_id):
         dll, name = self._thunk_ids.get(api_id, ("", ""))
+        if dll in self._CDECL_DLLS or dll.startswith(("api-ms-win-crt", "vcruntime", "msvcr",
+                                                      "msvcp", "ucrtbase", "concrt")):
+            # every C/C++ runtime export is __cdecl except _CxxThrowException
+            return "stdcall" if name.lower() == "_cxxthrowexception" else "cdecl"
         fn = self.api.lookup_any(dll, name) if dll not in ("!missing!", "!com!") else None
         cc = getattr(fn, "_noo_cc", None)
         if cc:
