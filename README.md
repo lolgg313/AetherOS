@@ -223,8 +223,8 @@ per-thread message queues, standard and **common controls** (ListView, TreeView,
 Toolbar, ReBar, StatusBar, Tab, Trackbar, UpDown, Progress, Tooltips, image
 lists), **MDI** frames and children, **RichEdit** (with RTF streaming), in-guest
 **Open/Save, Color, Font, Find/Replace and Browse-for-Folder** dialogs (classic
-and Vista `IFileDialog`), a **GDI+** flat API (PNG/BMP/ICO/GIF images, lock bits,
-brushes, pens, paths, regions, text, transforms), **WIC** (`windowscodecs`: PNG/BMP/ICO/GIF
+and Vista `IFileDialog`), a **GDI+** flat API (PNG/BMP/ICO/GIF/JPEG images, lock bits,
+brushes, pens, paths, regions, text, transforms), **WIC** (`windowscodecs`: PNG/BMP/ICO/GIF/JPEG
 decoders, PNG/BMP encoders, format converter, scaler, clipper, flip/rotate, lockable
 bitmaps), uxtheme buffered painting, COM `IStream`s, shell folders
 and PIDLs, shlwapi path/string helpers, crypt32, setupapi,

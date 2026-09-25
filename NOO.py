@@ -56520,6 +56520,15 @@ def _gdiplus_install(k):
                 if im.fmt == PF_8I:
                     im.fmt = PF_32ARGB                      # keep pixels exact
             return im
+        if data[:2] == b"\xff\xd8":
+            r = _jpeg_decode(data)
+            if r is None:
+                return None
+            w, h, bgra, dpi = r
+            im = _GpImage(w, h, PF_24RGB, IMGFMT_JPEG)
+            im.surf.px[:] = bgra
+            im.dpi = dpi
+            return im
         if data[:2] == b"BM" and len(data) > 54:
             bm = _bitmap_from_packed(p, data[14:])
             if bm is None:
@@ -61471,6 +61480,7 @@ CLSID_WIC_PNG_DEC2 = _guid_from_str("{e018945b-aa86-4008-9bd4-6777a1e40c11}")
 CLSID_WIC_BMP_DEC = _guid_from_str("{6b462062-7cbf-400d-9fdb-813dd10f2778}")
 CLSID_WIC_ICO_DEC = _guid_from_str("{c61bfcdf-2e0f-4aad-a8d7-e06bafebcdfe}")
 CLSID_WIC_GIF_DEC = _guid_from_str("{381dda3c-9ce9-4834-a23e-1f98f8fc52be}")
+CLSID_WIC_JPEG_DEC = _guid_from_str("{9456a480-e88b-43ea-9e73-0b2d9b71b1ca}")
 CLSID_WIC_PNG_ENC = _guid_from_str("{27949969-876a-41d7-9447-568f6a35a4dc}")
 CLSID_WIC_BMP_ENC = _guid_from_str("{69be8bb4-d66d-47c8-865a-ed1589433782}")
 
@@ -62032,7 +62042,8 @@ def _wic_install(k):
         im = p._gdip["decode"](data)
         if im is None:
             return None
-        cf = {b"\x89P": WIC_CF_PNG, b"BM": WIC_CF_BMP, b"GI": WIC_CF_GIF}.get(data[:2], WIC_CF_PNG)
+        cf = {b"\x89P": WIC_CF_PNG, b"BM": WIC_CF_BMP, b"GI": WIC_CF_GIF,
+              b"\xff\xd8": WIC_CF_JPEG}.get(data[:2], WIC_CF_PNG)
         dpi = im.dpi
         if cf == WIC_CF_GIF and im.frames:
             return cf, [(im.w, im.h, WIC_PF_32BGRA, bytes(f[0]), dpi) for f in im.frames]
@@ -62075,7 +62086,7 @@ def _wic_install(k):
             return WINCODEC_ERR_UNKNOWNIMAGEFORMAT if cf is None else WINCODEC_ERR_BADIMAGE
         r = decode(data)
         if r is None:
-            return WINCODEC_ERR_BADIMAGE if cf != WIC_CF_JPEG else WINCODEC_ERR_COMPONENTNOTFOUND
+            return WINCODEC_ERR_BADIMAGE
         d["cf"], d["frames"] = r
         return S_OK
 
@@ -62757,7 +62768,7 @@ def _wic_install(k):
         if not pcf or not pp:
             return E_INVALIDARG
         cf = guid_at(pcf)
-        if cf not in (WIC_CF_PNG, WIC_CF_BMP, WIC_CF_ICO, WIC_CF_GIF):
+        if cf not in (WIC_CF_PNG, WIC_CF_BMP, WIC_CF_ICO, WIC_CF_GIF, WIC_CF_JPEG):
             put_ptr(pp, 0)
             return WINCODEC_ERR_COMPONENTNOTFOUND
         put_ptr(pp, new_decoder(cf))
@@ -62918,7 +62929,7 @@ def _wic_install(k):
 
     for cl, cf in ((CLSID_WIC_PNG_DEC, WIC_CF_PNG), (CLSID_WIC_PNG_DEC2, WIC_CF_PNG),
                    (CLSID_WIC_BMP_DEC, WIC_CF_BMP), (CLSID_WIC_ICO_DEC, WIC_CF_ICO),
-                   (CLSID_WIC_GIF_DEC, WIC_CF_GIF)):
+                   (CLSID_WIC_GIF_DEC, WIC_CF_GIF), (CLSID_WIC_JPEG_DEC, WIC_CF_JPEG)):
         p.com_classes[cl] = dict(DEC_CLS, name="WIC decoder",
                                  on_create=on_create({"cf": cf, "frames": None}))
     for cl, cf in ((CLSID_WIC_PNG_ENC, WIC_CF_PNG), (CLSID_WIC_BMP_ENC, WIC_CF_BMP)):
@@ -62977,6 +62988,646 @@ def _wic_install(k):
         return out_new(pp, new_bitmap(w, h, fmt, raw))
 
     p.wic = {"new_bitmap": new_bitmap, "src_bgra": src_bgra, "decode": decode}
+
+
+# ==========================================================================================
+# 10v. JPEG decoder (baseline, extended and progressive Huffman; any sampling factors;
+#      restart markers; grayscale, YCbCr, RGB, CMYK/YCCK). Used by GDI+, WIC, OLE pictures.
+# ==========================================================================================
+_JPEG_ZIGZAG = (0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48,
+                41, 34, 27, 20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15,
+                23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62,
+                63)
+_JPEG_AAN = (1.0, 1.387039845, 1.306562965, 1.175875602, 1.0, 0.785694958, 0.541196100,
+             0.275899379)
+
+
+class _JpegError(Exception):
+    pass
+
+
+class _JpegBits:
+    """Entropy-coded segment reader: byte stuffing, markers and restart intervals."""
+    __slots__ = ("d", "pos", "acc", "n", "marker")
+
+    def __init__(self, data, pos):
+        self.d = data
+        self.pos = pos
+        self.acc = 0
+        self.n = 0
+        self.marker = None
+
+    def fill(self, need):
+        d = self.d
+        while self.n < need:
+            b = 0
+            if self.marker is None and self.pos < len(d):
+                b = d[self.pos]
+                if b == 0xFF:
+                    nb = d[self.pos + 1] if self.pos + 1 < len(d) else 0xD9
+                    if nb == 0:
+                        self.pos += 2
+                    elif 0xD0 <= nb <= 0xD7 or nb != 0xFF:
+                        self.marker = nb                  # stop: feed zeros from here
+                        b = 0
+                    else:
+                        self.pos += 1
+                        continue
+                else:
+                    self.pos += 1
+            self.acc = ((self.acc << 8) | b) & 0xFFFFFFFFFFFF
+            self.n += 8
+
+    def bits(self, k):
+        if not k:
+            return 0
+        if self.n < k:
+            self.fill(k)
+        self.n -= k
+        return (self.acc >> self.n) & ((1 << k) - 1)
+
+    def bit(self):
+        if not self.n:
+            self.fill(1)
+        self.n -= 1
+        return (self.acc >> self.n) & 1
+
+    def extend(self, s):
+        """RECEIVE + EXTEND of an s-bit magnitude."""
+        if not s:
+            return 0
+        v = self.bits(s)
+        return v if v >= 1 << (s - 1) else v - (1 << s) + 1
+
+    def huff(self, tab):
+        look, maxcode, valptr, mincode, vals = tab
+        if self.n < 9:
+            self.fill(9)
+        e = look[(self.acc >> (self.n - 9)) & 0x1FF]
+        if e >= 0:
+            self.n -= e >> 8
+            return e & 0xFF
+        code = self.bits(9)
+        ln = 9
+        while ln < 16:
+            ln += 1
+            code = (code << 1) | self.bit()
+            if code <= maxcode[ln]:
+                return vals[valptr[ln] + code - mincode[ln]]
+        raise _JpegError("bad huffman code")
+
+    def restart(self):
+        """Skip to after the next RSTn marker."""
+        self.n = 0
+        self.acc = 0
+        d = self.d
+        if self.marker is None:
+            while self.pos + 1 < len(d) and not (d[self.pos] == 0xFF and 0xD0 <= d[self.pos + 1] <= 0xD7):
+                self.pos += 1
+        if self.pos + 1 < len(d) and d[self.pos] == 0xFF and 0xD0 <= d[self.pos + 1] <= 0xD7:
+            self.pos += 2
+        self.marker = None
+
+
+def _jpeg_huff_table(counts, vals):
+    look = [-1] * 512
+    maxcode = [-1] * 18
+    valptr = [0] * 17
+    mincode = [0] * 17
+    code = 0
+    k = 0
+    for ln in range(1, 17):
+        n = counts[ln - 1]
+        valptr[ln] = k
+        mincode[ln] = code
+        for _ in range(n):
+            if ln <= 9:
+                base = code << (9 - ln)
+                for j in range(1 << (9 - ln)):
+                    look[base + j] = (ln << 8) | vals[k]
+            code += 1
+            k += 1
+        maxcode[ln] = code - 1 if n else -1
+        code <<= 1
+    maxcode[17] = 0x7FFFFFFF
+    return look, maxcode, valptr, mincode, list(vals)
+
+
+def _jpeg_idct(blk, q, out, off, stride):
+    """Dequantize + AAN float IDCT of one 8x8 block (natural order) into out[off...]."""
+    ws = [0.0] * 64
+    for c in range(8):
+        i0 = blk[c] * q[c]
+        if not (blk[8 + c] or blk[16 + c] or blk[24 + c] or blk[32 + c] or blk[40 + c] or
+                blk[48 + c] or blk[56 + c]):
+            for r in range(0, 64, 8):
+                ws[r + c] = i0
+            continue
+        t0, t1, t2, t3 = i0, blk[16 + c] * q[16 + c], blk[32 + c] * q[32 + c], blk[48 + c] * q[48 + c]
+        t10 = t0 + t2
+        t11 = t0 - t2
+        t13 = t1 + t3
+        t12 = (t1 - t3) * 1.414213562 - t13
+        t0 = t10 + t13
+        t3 = t10 - t13
+        t1 = t11 + t12
+        t2 = t11 - t12
+        t4, t5, t6, t7 = blk[8 + c] * q[8 + c], blk[24 + c] * q[24 + c], blk[40 + c] * q[40 + c], \
+            blk[56 + c] * q[56 + c]
+        z13 = t6 + t5
+        z10 = t6 - t5
+        z11 = t4 + t7
+        z12 = t4 - t7
+        t7 = z11 + z13
+        t11 = (z11 - z13) * 1.414213562
+        z5 = (z10 + z12) * 1.847759065
+        t10 = 1.082392200 * z12 - z5
+        t12 = -2.613125930 * z10 + z5
+        t6 = t12 - t7
+        t5 = t11 - t6
+        t4 = t10 + t5
+        ws[c] = t0 + t7
+        ws[56 + c] = t0 - t7
+        ws[8 + c] = t1 + t6
+        ws[48 + c] = t1 - t6
+        ws[16 + c] = t2 + t5
+        ws[40 + c] = t2 - t5
+        ws[32 + c] = t3 + t4
+        ws[24 + c] = t3 - t4
+    for r in range(0, 64, 8):
+        w0, w1, w2, w3, w4, w5, w6, w7 = ws[r:r + 8]
+        t10 = w0 + w4
+        t11 = w0 - w4
+        t13 = w2 + w6
+        t12 = (w2 - w6) * 1.414213562 - t13
+        t0 = t10 + t13
+        t3 = t10 - t13
+        t1 = t11 + t12
+        t2 = t11 - t12
+        z13 = w5 + w3
+        z10 = w5 - w3
+        z11 = w1 + w7
+        z12 = w1 - w7
+        t7 = z11 + z13
+        t11 = (z11 - z13) * 1.414213562
+        z5 = (z10 + z12) * 1.847759065
+        t10 = 1.082392200 * z12 - z5
+        t12 = -2.613125930 * z10 + z5
+        t6 = t12 - t7
+        t5 = t11 - t6
+        t4 = t10 + t5
+        o = off + (r >> 3) * stride
+        for i, v in enumerate((t0 + t7, t1 + t6, t2 + t5, t3 - t4, t3 + t4, t2 - t5, t1 - t6,
+                               t0 - t7)):
+            v = int(v * 0.125 + 128.5)
+            out[o + i] = 0 if v < 0 else 255 if v > 255 else v
+
+
+def _jpeg_decode(data):
+    """JPEG bytes -> (w, h, BGRA bytearray, (dpi_x, dpi_y)), or None."""
+    try:
+        return _jpeg_decode2(bytes(data))
+    except (_JpegError, IndexError, ValueError, ZeroDivisionError, struct.error):
+        return None
+
+
+def _jpeg_decode2(d):
+    if d[:2] != b"\xff\xd8":
+        return None
+    qt = [None] * 4
+    hts = {}
+    frame = None
+    progressive = False
+    restart = 0
+    adobe = None
+    jfif = False
+    dpi = (96.0, 96.0)
+    pos = 2
+    while pos < len(d):
+        if d[pos] != 0xFF:
+            pos += 1
+            continue
+        m = d[pos + 1]
+        pos += 2
+        if m in (0xD8, 0x01) or 0xD0 <= m <= 0xD7 or m == 0xFF:
+            if m == 0xFF:
+                pos -= 1
+            continue
+        if m == 0xD9:
+            break
+        ln = struct.unpack(">H", d[pos:pos + 2])[0]
+        seg = d[pos + 2:pos + ln]
+        pos += ln
+        if m == 0xDB:                                           # DQT
+            i = 0
+            while i < len(seg):
+                pq, tq = seg[i] >> 4, seg[i] & 15
+                i += 1
+                if pq:
+                    vals = struct.unpack(">64H", seg[i:i + 128])
+                    i += 128
+                else:
+                    vals = seg[i:i + 64]
+                    i += 64
+                tab = [0.0] * 64
+                for z in range(64):
+                    n = _JPEG_ZIGZAG[z]
+                    tab[n] = vals[z] * _JPEG_AAN[n >> 3] * _JPEG_AAN[n & 7]
+                qt[tq & 3] = tab
+        elif m == 0xC4:                                         # DHT
+            i = 0
+            while i < len(seg):
+                tc_th = seg[i]
+                counts = seg[i + 1:i + 17]
+                n = sum(counts)
+                hts[tc_th] = _jpeg_huff_table(counts, seg[i + 17:i + 17 + n])
+                i += 17 + n
+        elif m in (0xC0, 0xC1, 0xC2):                           # SOF0/1/2
+            progressive = m == 0xC2
+            prec, h, w, nc = struct.unpack(">BHHB", seg[:6])
+            if prec != 8:
+                raise _JpegError("precision")
+            comps = []
+            for i in range(nc):
+                cid, hv, tq = seg[6 + i * 3:9 + i * 3]
+                comps.append({"id": cid, "h": hv >> 4, "v": hv & 15, "tq": tq})
+            frame = {"w": w, "h": h, "comps": comps}
+            hmax = max(c["h"] for c in comps)
+            vmax = max(c["v"] for c in comps)
+            mcux = (w + 8 * hmax - 1) // (8 * hmax)
+            mcuy = (h + 8 * vmax - 1) // (8 * vmax)
+            frame.update(hmax=hmax, vmax=vmax, mcux=mcux, mcuy=mcuy)
+            for c in comps:
+                c["bpl"] = mcux * c["h"]                         # blocks per line (padded)
+                c["bpc"] = mcuy * c["v"]
+                c["bw"] = (((w * c["h"] + hmax - 1) // hmax) + 7) // 8
+                c["bh"] = (((h * c["v"] + vmax - 1) // vmax) + 7) // 8
+                c["blocks"] = [[0] * 64 for _ in range(c["bpl"] * c["bpc"])]
+        elif 0xC3 <= m <= 0xCF and m not in (0xC4, 0xC8, 0xCC):
+            raise _JpegError("unsupported coding")
+        elif m == 0xDD:                                         # DRI
+            restart = struct.unpack(">H", seg[:2])[0]
+        elif m == 0xE0 and seg[:5] == b"JFIF\0":
+            jfif = True
+            unit, xd, yd = seg[7], *struct.unpack(">HH", seg[8:12])
+            if unit == 1 and xd and yd:
+                dpi = (float(xd), float(yd))
+            elif unit == 2 and xd and yd:
+                dpi = (xd * 2.54, yd * 2.54)
+        elif m == 0xEE and seg[:5] == b"Adobe":
+            adobe = seg[11] if len(seg) > 11 else 0
+        elif m == 0xDA:                                         # SOS
+            if frame is None:
+                raise _JpegError("scan before frame")
+            ns = seg[0]
+            scomps = []
+            for i in range(ns):
+                cid, t = seg[1 + i * 2], seg[2 + i * 2]
+                c = next(cc for cc in frame["comps"] if cc["id"] == cid)
+                scomps.append((c, hts.get(t >> 4), hts.get(0x10 | (t & 15))))
+            ss, se, ahl = seg[1 + ns * 2], seg[2 + ns * 2], seg[3 + ns * 2]
+            pos = _jpeg_scan(d, pos, frame, scomps, ss, se, ahl >> 4, ahl & 15, progressive,
+                             restart)
+    if frame is None:
+        return None
+    return _jpeg_output(frame, qt, adobe, jfif) + (dpi,)
+
+
+def _jpeg_scan(d, pos, frame, scomps, ss, se, ah, al, progressive, restart):
+    br = _JpegBits(d, pos)
+    eobrun = [0]
+    state = [0, 0]                                              # AC refine: (state, next value)
+    preds = {}
+
+    def dec_baseline(c, dc, ac, blk):
+        t = br.huff(dc)
+        diff = br.extend(t)
+        p = preds.get(c["id"], 0) + diff
+        preds[c["id"]] = p
+        blk[0] = p
+        k = 1
+        while k < 64:
+            rs = br.huff(ac)
+            s, r = rs & 15, rs >> 4
+            if not s:
+                if r < 15:
+                    break
+                k += 16
+                continue
+            k += r
+            if k > 63:
+                break
+            blk[_JPEG_ZIGZAG[k]] = br.extend(s)
+            k += 1
+
+    def dec_dc_first(c, dc, ac, blk):
+        t = br.huff(dc)
+        p = preds.get(c["id"], 0) + br.extend(t)
+        preds[c["id"]] = p
+        blk[0] = p << al
+
+    def dec_dc_refine(c, dc, ac, blk):
+        if br.bit():
+            blk[0] |= 1 << al
+
+    def dec_ac_first(c, dc, ac, blk):
+        if eobrun[0]:
+            eobrun[0] -= 1
+            return
+        k = ss
+        while k <= se:
+            rs = br.huff(ac)
+            s, r = rs & 15, rs >> 4
+            if not s:
+                if r < 15:
+                    eobrun[0] = br.bits(r) + (1 << r) - 1
+                    break
+                k += 16
+                continue
+            k += r
+            if k > 63:
+                break
+            blk[_JPEG_ZIGZAG[k]] = br.extend(s) * (1 << al)
+            k += 1
+
+    def dec_ac_refine(c, dc, ac, blk):
+        k = ss
+        r = 0
+        st = state[0]
+        while k <= se:
+            z = _JPEG_ZIGZAG[k]
+            cur = blk[z]
+            if st == 0:
+                rs = br.huff(ac)
+                s, r = rs & 15, rs >> 4
+                if not s:
+                    if r < 15:
+                        eobrun[0] = br.bits(r) + (1 << r)
+                        st = 4
+                    else:
+                        r = 16
+                        st = 1
+                else:
+                    state[1] = br.extend(s)
+                    st = 2 if r else 3
+                continue
+            if st in (1, 2):
+                if cur:
+                    if br.bit():
+                        blk[z] = cur + ((1 << al) if cur > 0 else -(1 << al))
+                else:
+                    r -= 1
+                    if not r:
+                        st = 3 if st == 2 else 0
+            elif st == 3:
+                if cur:
+                    if br.bit():
+                        blk[z] = cur + ((1 << al) if cur > 0 else -(1 << al))
+                else:
+                    blk[z] = state[1] << al
+                    st = 0
+            else:                                               # 4: inside an EOB run
+                if cur and br.bit():
+                    blk[z] = cur + ((1 << al) if cur > 0 else -(1 << al))
+            k += 1
+        if st == 4:
+            eobrun[0] -= 1
+            if not eobrun[0]:
+                st = 0
+        state[0] = st
+
+    if not progressive:
+        fn = dec_baseline
+    elif ss == 0:
+        fn = dec_dc_first if ah == 0 else dec_dc_refine
+    else:
+        fn = dec_ac_first if ah == 0 else dec_ac_refine
+
+    def reset():
+        preds.clear()
+        eobrun[0] = 0
+        state[0] = 0
+
+    if len(scomps) == 1:
+        c, dc, ac = scomps[0]
+        bw, bh, bpl = c["bw"], c["bh"], c["bpl"]
+        blocks = c["blocks"]
+        total = bw * bh
+        for n in range(total):
+            if restart and n and n % restart == 0:
+                br.restart()
+                reset()
+            by, bx = divmod(n, bw)
+            fn(c, dc, ac, blocks[by * bpl + bx])
+    else:
+        mcux, mcuy = frame["mcux"], frame["mcuy"]
+        for n in range(mcux * mcuy):
+            if restart and n and n % restart == 0:
+                br.restart()
+                reset()
+            my, mx = divmod(n, mcux)
+            for c, dc, ac in scomps:
+                bpl, blocks = c["bpl"], c["blocks"]
+                for v in range(c["v"]):
+                    row = (my * c["v"] + v) * bpl + mx * c["h"]
+                    for h in range(c["h"]):
+                        fn(c, dc, ac, blocks[row + h])
+    # continue after the entropy-coded data: find the next marker that is not RSTn
+    p = br.pos
+    while p + 1 < len(d):
+        if d[p] == 0xFF and d[p + 1] not in (0, 0xFF) and not 0xD0 <= d[p + 1] <= 0xD7:
+            break
+        p += 1
+    return p
+
+
+def _jpeg_output(frame, qt, adobe, jfif):
+    w, h = frame["w"], frame["h"]
+    comps = frame["comps"]
+    hmax, vmax = frame["hmax"], frame["vmax"]
+    planes = []
+    for c in comps:
+        q = qt[c["tq"]]
+        if q is None:
+            raise _JpegError("missing quant table")
+        pw, ph = c["bpl"] * 8, c["bpc"] * 8
+        plane = bytearray(pw * ph)
+        blocks = c["blocks"]
+        for by in range(c["bpc"]):
+            for bx in range(c["bpl"]):
+                blk = blocks[by * c["bpl"] + bx]
+                off = by * 8 * pw + bx * 8
+                if not any(blk[1:]):
+                    v = int(blk[0] * q[0] * 0.125 + 128.5)
+                    v = 0 if v < 0 else 255 if v > 255 else v
+                    row = bytes((v,)) * 8
+                    for r in range(8):
+                        plane[off + r * pw:off + r * pw + 8] = row
+                else:
+                    _jpeg_idct(blk, q, plane, off, pw)
+        sx, sy = hmax // c["h"], vmax // c["v"]
+        if sx != 1 or sy != 1:
+            cw = min(pw, (w * c["h"] + hmax - 1) // hmax)
+            chh = min(ph, (h * c["v"] + vmax - 1) // vmax)
+            plane, pw = _jpeg_upsample(plane, pw, cw, chh, sx, sy)
+        planes.append((plane, pw))
+    n = w * h
+    out = bytearray(n * 4)
+    out[3::4] = b"\xff" * n
+
+    def crop(i):
+        plane, pw = planes[i]
+        if pw == w:
+            return plane[:n]
+        return b"".join(plane[y * pw:y * pw + w] for y in range(h))
+
+    if len(comps) == 1:
+        g = crop(0)
+        out[0::4] = g
+        out[1::4] = g
+        out[2::4] = g
+        return w, h, out
+    if len(comps) == 3:
+        ycc = adobe != 0 if adobe is not None else not (
+            comps[0]["id"] == 82 and comps[1]["id"] == 71 and comps[2]["id"] == 66)
+        a, b, c = crop(0), crop(1), crop(2)
+        if not ycc:
+            out[2::4], out[1::4], out[0::4] = a, b, c
+            return w, h, out
+        rl, gl, bl = _jpeg_ycc_tables()
+        R_ = bytearray(n)
+        G_ = bytearray(n)
+        B_ = bytearray(n)
+        crr, cbg, crg, cbb = rl
+        for i in range(n):
+            y_ = a[i]
+            cb = b[i]
+            cr = c[i]
+            v = y_ + crr[cr]
+            R_[i] = 0 if v < 0 else 255 if v > 255 else v
+            v = y_ + ((cbg[cb] + crg[cr]) >> 16)
+            G_[i] = 0 if v < 0 else 255 if v > 255 else v
+            v = y_ + cbb[cb]
+            B_[i] = 0 if v < 0 else 255 if v > 255 else v
+        out[0::4] = B_
+        out[1::4] = G_
+        out[2::4] = R_
+        return w, h, out
+    if len(comps) == 4:
+        a, b, c, k4 = crop(0), crop(1), crop(2), crop(3)
+        transform = adobe if adobe is not None else 0
+        R_ = bytearray(n)
+        G_ = bytearray(n)
+        B_ = bytearray(n)
+        rl = _jpeg_ycc_tables()[0]
+        crr, cbg, crg, cbb = rl
+        for i in range(n):
+            if transform == 2:                                  # YCCK
+                y_, cb, cr = a[i], b[i], c[i]
+                cc = y_ + crr[cr]
+                mm = y_ + ((cbg[cb] + crg[cr]) >> 16)
+                yy = y_ + cbb[cb]
+                cc = 255 - (0 if cc < 0 else 255 if cc > 255 else cc)
+                mm = 255 - (0 if mm < 0 else 255 if mm > 255 else mm)
+                yy = 255 - (0 if yy < 0 else 255 if yy > 255 else yy)
+            else:
+                cc, mm, yy = a[i], b[i], c[i]
+            kk = k4[i]
+            if adobe is not None:                               # Adobe stores inverted CMYK
+                R_[i] = cc * kk // 255
+                G_[i] = mm * kk // 255
+                B_[i] = yy * kk // 255
+            else:
+                R_[i] = (255 - cc) * (255 - kk) // 255
+                G_[i] = (255 - mm) * (255 - kk) // 255
+                B_[i] = (255 - yy) * (255 - kk) // 255
+        out[0::4] = B_
+        out[1::4] = G_
+        out[2::4] = R_
+        return w, h, out
+    raise _JpegError("component count")
+
+
+def _jpeg_fancy_h2(row):
+    """libjpeg triangle filter doubling one row horizontally (row: list of ints or colsums)."""
+    n = len(row)
+    if n == 1:
+        return [row[0], row[0]]
+    out = [0] * (2 * n)
+    out[0] = row[0]
+    out[1] = (3 * row[0] + row[1] + 2) >> 2
+    for i in range(1, n - 1):
+        t = 3 * row[i]
+        out[2 * i] = (t + row[i - 1] + 1) >> 2
+        out[2 * i + 1] = (t + row[i + 1] + 2) >> 2
+    out[2 * n - 2] = (3 * row[n - 1] + row[n - 2] + 1) >> 2
+    out[2 * n - 1] = row[n - 1]
+    return out
+
+
+def _jpeg_fancy_h2v2(cs):
+    n = len(cs)
+    if n == 1:
+        v = (cs[0] * 4 + 8) >> 4
+        return [v, (cs[0] * 4 + 7) >> 4]
+    out = [0] * (2 * n)
+    out[0] = (cs[0] * 4 + 8) >> 4
+    out[1] = (cs[0] * 3 + cs[1] + 7) >> 4
+    for i in range(1, n - 1):
+        t = cs[i] * 3
+        out[2 * i] = (t + cs[i - 1] + 8) >> 4
+        out[2 * i + 1] = (t + cs[i + 1] + 7) >> 4
+    out[2 * n - 2] = (cs[n - 1] * 3 + cs[n - 2] + 8) >> 4
+    out[2 * n - 1] = (cs[n - 1] * 4 + 7) >> 4
+    return out
+
+
+def _jpeg_upsample(plane, pw, cw, ch, sx, sy):
+    """Upsample a component plane (valid area cw x ch) by (sx, sy) -> (plane, width).
+    2x1, 2x2 and 1x2 use libjpeg's fancy (triangle) filter, other ratios replicate."""
+    ow, oh = cw * sx, ch * sy
+    out = bytearray(ow * oh)
+    rows = [list(plane[y * pw:y * pw + cw]) for y in range(ch)]
+    if (sx, sy) == (2, 1):
+        for y in range(ch):
+            out[y * ow:(y + 1) * ow] = bytes(_jpeg_fancy_h2(rows[y]))
+    elif (sx, sy) == (2, 2):
+        for y in range(ch):
+            cur = rows[y]
+            for k_, near in ((0, rows[max(0, y - 1)]), (1, rows[min(ch - 1, y + 1)])):
+                cs = [3 * a + b for a, b in zip(cur, near)]
+                o = (2 * y + k_) * ow
+                out[o:o + ow] = bytes(_jpeg_fancy_h2v2(cs))
+    elif (sx, sy) == (1, 2):
+        for y in range(ch):
+            cur = rows[y]
+            up, dn = rows[max(0, y - 1)], rows[min(ch - 1, y + 1)]
+            out[2 * y * ow:(2 * y + 1) * ow] = bytes((3 * a + b + 1) >> 2 for a, b in zip(cur, up))
+            out[(2 * y + 1) * ow:(2 * y + 2) * ow] = bytes((3 * a + b + 2) >> 2
+                                                            for a, b in zip(cur, dn))
+    else:
+        for y in range(ch):
+            src = rows[y]
+            line = bytes(b for b in src for _ in range(sx)) if sx != 1 else bytes(src)
+            for k_ in range(sy):
+                o = (y * sy + k_) * ow
+                out[o:o + ow] = line
+    return out, ow
+
+
+_JPEG_YCC = []
+
+
+def _jpeg_ycc_tables():
+    if not _JPEG_YCC:
+        crr = [int(1.402 * (i - 128) + 0.5 if i >= 128 else 1.402 * (i - 128) - 0.5)
+               for i in range(256)]
+        cbb = [int(1.772 * (i - 128) + 0.5 if i >= 128 else 1.772 * (i - 128) - 0.5)
+               for i in range(256)]
+        cbg = [int(-0.344136 * 65536 * (i - 128)) for i in range(256)]
+        crg = [int(-0.714136 * 65536 * (i - 128)) + 32768 for i in range(256)]
+        _JPEG_YCC.append(((crr, cbg, crg, cbb), None, None))
+    return _JPEG_YCC[0]
 
 
 # Bitmap glyphs rasterized from the DejaVu fonts (c) Bitstream / DejaVu
