@@ -207,6 +207,7 @@ python3 NOO.py --max-instructions N prog.exe   # optional runaway guard (default
 | **Notepad++ 8.6.9** (x86, C++) | starts, menus, toolbar, tabs, Scintilla editing with syntax/brace highlighting, status bar, session save, clean exit |
 | **Rufus 4.5** (x64, UPX-packed) | unpacks itself, full main window, clean shutdown |
 | **AutoHotkey v1.1 (x86) and v2.0 (x64)** | scripts with GUIs (Edit, Checkbox, DropDownList, Slider, Progress, ListView, TreeView), MsgBox, FileSelect / DirSelect, error dialogs, regex, files, registry, timers, DllCall |
+| **CPython 3.12** (MSVC build, x86 and x64) | the interpreter with its stdlib (json, re, datetime, OpenSSL `hashlib` via `libcrypto`) and **tkinter GUIs** |
 | **7-Zip** `7zr` / `7za` (x86, x64) | extracting, creating and testing `.7z` archives (LZMA + BCJ2, CRCs verified) |
 | **ripgrep 14** (Rust, x64) | parallel recursive search, `.gitignore` handling |
 | **jq 1.7** (x86, x64) | JSON processing with colored console output |
