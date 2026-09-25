@@ -11596,6 +11596,9 @@ const OS = {
     desktop.addEventListener('contextmenu', (e) => {
       if (e.target.closest('.window')) return;
       e.preventDefault();
+      // an app icon shows only its own menu (handled by DesktopIcons)
+      if (e.target.closest('.desktop-icon')) return;
+      document.querySelectorAll('.desktop-icon-menu').forEach(m => m.remove());
       ctx.style.display = 'block';
       ctx.style.left = `${Math.min(e.clientX, window.innerWidth - 200)}px`;
       ctx.style.top = `${Math.min(e.clientY, window.innerHeight - 180)}px`;
@@ -15308,12 +15311,13 @@ const DesktopIcons = {
     container.addEventListener('contextmenu', (e) => {
       const icon = e.target.closest('.desktop-icon');
       if (!icon || !container.contains(icon)) return;
+      // right-clicking an app shows ONLY the app's menu, never the desktop menu
+      e.preventDefault();
+      e.stopPropagation();
+      const ctx = document.getElementById('desktop-ctx');
+      if (ctx) ctx.style.display = 'none';
       const id = icon.dataset.iconId;
-      // Only user-made apps are deletable — built-ins are protected.
-      if (id && (id.indexOf('uapp:') === 0 || id.indexOf('pyapp:') === 0)) {
-        e.preventDefault();
-        this.showIconMenu(e.clientX, e.clientY, id, icon);
-      }
+      if (id) this.showIconMenu(e.clientX, e.clientY, id, icon);
     });
     container.addEventListener('pointerdown', (e) => this._onPointerDown(e));
     window.addEventListener('resize', () => this._clampAll(true));
@@ -15323,7 +15327,7 @@ const DesktopIcons = {
   /* Context menu for a user-made icon: Open / Delete (built-ins can't be deleted). */
   showIconMenu(x, y, id, iconEl) {
     document.querySelectorAll('.desktop-icon-menu').forEach(m => m.remove());
-    const label = (iconEl.querySelector('span:last-child') || {}).textContent || 'this app';
+    const label = (iconEl.querySelector(':scope > span:last-child') || {}).textContent || 'this app';
     const menu = document.createElement('div');
     menu.className = 'desktop-icon-menu';
     menu.style.cssText = 'position:fixed;z-index:99999;left:' + x + 'px;top:' + y + 'px;' +
@@ -15339,7 +15343,8 @@ const DesktopIcons = {
       menu.appendChild(b);
     };
     mk('Open', false, () => OS.launchApp(id));
-    mk('Delete “' + label + '”', true, () => this.deleteUserIcon(id, label));
+    // Only user-made apps are deletable — built-ins are protected.
+    if (id.indexOf('uapp:') === 0 || id.indexOf('pyapp:') === 0) mk('Delete “' + label + '”', true, () => this.deleteUserIcon(id, label));
     document.body.appendChild(menu);
     // reposition if off-screen
     const r = menu.getBoundingClientRect();
@@ -26867,6 +26872,18 @@ const PyStudioHost = {
   _sid(appId) { return String(appId).replace(/[^a-zA-Z0-9]/g, '_'); },
   _esc(s) { return (typeof SecurityUtils !== 'undefined' && SecurityUtils.escapeHTML) ? SecurityUtils.escapeHTML(String(s)) : String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); },
 
+  /* The package behind a runner window. Desktop icons, Start search and the
+     icon menu launch 'pyapp:<VFS path>' directly, so load it from the path
+     when it was not handed over by launchPkg(). */
+  _pkgFor(appId) {
+    let pkg = this._apps['__pending_' + appId];
+    if (!pkg && typeof appId === 'string' && appId.indexOf('pyapp:') === 0) {
+      pkg = PyAppStore.loadFromPath(appId.slice('pyapp:'.length));
+      if (pkg) this._apps['__pending_' + appId] = pkg;
+    }
+    return pkg || null;
+  },
+
   buildConfig(appId) {
     const sid = this._sid(appId);
     const logo = typeof PYTHON_LOGO_URL !== 'undefined' ? PYTHON_LOGO_URL : '';
@@ -26912,7 +26929,7 @@ const PyStudioHost = {
       };
     }
     // pyapp:<path> / pyrun:<path> — a runner window for a saved app
-    const pkg = this._apps['__pending_' + appId];
+    const pkg = this._pkgFor(appId);
     const title = pkg ? pkg.meta.name : 'Python App';
     const color = pkg && PyAppStore.COLOR_RE.test(pkg.meta.color) ? pkg.meta.color : '#306998';
     return {
@@ -27042,11 +27059,15 @@ const PyStudioHost = {
       return;
     }
     // runner window
-    const pkg = this._apps['__pending_' + appId];
-    if (!pkg) return;
+    const pkg = this._pkgFor(appId);
     const view = document.getElementById('pyrun-view-' + sid);
     const out = document.getElementById('pyrun-out-' + sid);
-    if (!view) { setTimeout(() => this.mount(appId), 60); return; }
+    if (!view) { if ((this._mountTries = (this._mountTries || 0) + 1) < 50) setTimeout(() => this.mount(appId), 60); return; }
+    this._mountTries = 0;
+    if (!pkg) {
+      view.innerHTML = '<div style="margin:auto;padding:24px;font:13px system-ui,sans-serif;color:#334155;text-align:center;">This app could not be opened.<br><span style="color:#64748b;font-size:12px;">The .pyapp file is missing or damaged.</span></div>';
+      return;
+    }
     delete this._apps['__pending_' + appId];
     const st = this._apps[appId] = { pkg, program: null };
     const win = OS.windows[appId];
